@@ -51,6 +51,10 @@ pub fn fence(x: i32) -> i32 {
 pub fn raw_ident(r#box: i32) -> i32 {
     r#box + 1
 }
+pub unsafe fn intrinsic(x: i32) -> i32 {
+    ::core::intrinsics::atomic_fence_seqcst();
+    x
+}
 pub fn uses_std(x: i32) -> i32 {
     std::cmp::max(x, 0)
 }
@@ -131,6 +135,7 @@ fn out_of_scope_functions_are_skipped() {
     assert_eq!(category("uses_global"), Err("global".into()));
     assert_eq!(category("prints"), Err("io".into()));
     assert_eq!(category("takes_ptr"), Err("raw pointer".into()));
+    assert_eq!(category("intrinsic"), Err("unstable feature".into()));
 }
 
 #[test]

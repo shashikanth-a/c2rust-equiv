@@ -270,6 +270,7 @@ pub(crate) fn std_path_skip(segs: &[String]) -> Option<Skip> {
     let shown = segs.join("::");
     match module.as_str() {
         "ptr" => Some(Skip::new("raw pointer", format!("uses `{shown}`"))),
+        "intrinsics" => Some(Skip::new("unstable feature", format!("uses `{shown}`"))),
         "os" if rest.first().map(String::as_str) == Some("raw") => None,
         // Fences and atomics on locals; globals are excluded separately.
         "sync" if rest.first().map(String::as_str) == Some("atomic") => None,
