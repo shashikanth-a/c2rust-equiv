@@ -1,0 +1,259 @@
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::time::Duration;
+
+use c2rust_equiv::report::{FunctionReport, Report};
+use c2rust_equiv::{cache, check, extract, CrateIndex, Options, Outcome, Status};
+use clap::Parser;
+use quote::ToTokens;
+
+/// Check that functions in a rewritten crate behave the same as in the original.
+///
+/// Exit codes: 0 if every checked function was proved or tested (or skipped),
+/// 1 if any function has a counterexample, 2 on a tool error.
+#[derive(Parser)]
+#[command(version)]
+struct Cli {
+    /// The original crate's source directory (or a single `.rs` file).
+    #[arg(long)]
+    old: PathBuf,
+    /// The rewritten crate's source directory (or a single `.rs` file).
+    #[arg(long)]
+    new: PathBuf,
+    /// Where to write the JSON report.
+    #[arg(long)]
+    report: PathBuf,
+    /// Where to write the Markdown summary [default: the report path with `.md`].
+    #[arg(long)]
+    markdown: Option<PathBuf>,
+    /// Check this function: an ID like `src/a.rs::f`, or a bare name.
+    /// Repeatable. [default: every function whose code differs]
+    #[arg(long = "function")]
+    functions: Vec<String>,
+    /// A file with one function ID or name per line, as for `--function`.
+    #[arg(long)]
+    functions_file: Option<PathBuf>,
+    /// Directory for scratch crates and build output [default: a directory under the system temp dir].
+    #[arg(long)]
+    work_dir: Option<PathBuf>,
+    /// A JSON file to cache results in, across runs.
+    #[arg(long)]
+    cache: Option<PathBuf>,
+    /// Don't try Kani; only run differential tests.
+    #[arg(long)]
+    no_kani: bool,
+    /// Kani's loop unwinding bound.
+    #[arg(long, default_value_t = 8)]
+    unwind: u32,
+    /// Kani timeout per function, in seconds.
+    #[arg(long, default_value_t = 60)]
+    kani_timeout: u64,
+    /// Kani timeout per function that uses floating point, in seconds.
+    #[arg(long, default_value_t = 20)]
+    float_kani_timeout: u64,
+    /// Differential testing timeout per function, in seconds.
+    #[arg(long, default_value_t = 60)]
+    test_timeout: u64,
+    /// Random inputs per function, after the edge cases.
+    #[arg(long, default_value_t = 10_000)]
+    cases: u64,
+    /// Maximum combinations of per-argument edge cases.
+    #[arg(long, default_value_t = 4096)]
+    edge_limit: usize,
+    /// Seed for random inputs.
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+    /// Rust edition for the scratch crates.
+    #[arg(long, default_value = "2021")]
+    edition: String,
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    match run(&cli) {
+        Ok(code) => ExitCode::from(code),
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn run(cli: &Cli) -> Result<u8, Box<dyn std::error::Error>> {
+    let old = CrateIndex::load(&cli.old)?;
+    let new = CrateIndex::load(&cli.new)?;
+    // Silently missing functions would make a broken rewrite look fine.
+    for (side, index) in [("original", &old), ("rewritten", &new)] {
+        if let Some((file, error)) = index.parse_errors.first() {
+            return Err(format!("{side} crate: {file} doesn't parse: {error}").into());
+        }
+    }
+
+    let work_dir = cli
+        .work_dir
+        .clone()
+        .unwrap_or_else(|| std::env::temp_dir().join("c2rust-equiv"));
+    let opts = Options {
+        work_dir,
+        kani: !cli.no_kani,
+        unwind: cli.unwind,
+        kani_timeout: Duration::from_secs(cli.kani_timeout),
+        float_kani_timeout: Duration::from_secs(cli.float_kani_timeout),
+        test_timeout: Duration::from_secs(cli.test_timeout),
+        cases: cli.cases,
+        edge_limit: cli.edge_limit,
+        seed: cli.seed,
+        edition: cli.edition.clone(),
+    };
+    let mut cache = cli.cache.as_deref().map(cache::Cache::open).transpose()?;
+
+    let mut queries = cli.functions.clone();
+    if let Some(path) = &cli.functions_file {
+        let text = fs::read_to_string(path)?;
+        queries.extend(
+            text.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_owned),
+        );
+    }
+
+    let total_functions = old.functions().count();
+    let eligible_functions = old
+        .functions()
+        .filter(|&e| extract(&old, e).is_ok())
+        .count();
+
+    let selected = select(&old, &new, &queries);
+    let mut results = Vec::new();
+    for (i, id) in selected.iter().enumerate() {
+        let (outcome, cached) = check_one(&old, &new, id, &opts, cache.as_mut());
+        eprintln!(
+            "[{}/{}] {id}: {}{}",
+            i + 1,
+            selected.len(),
+            outcome.status.label(),
+            if cached {
+                " (cached)".to_owned()
+            } else {
+                format!(" ({} ms)", outcome.total_ms)
+            }
+        );
+        results.push(FunctionReport {
+            id: id.clone(),
+            label: outcome.status.label(),
+            cached,
+            outcome,
+        });
+    }
+    if let Some(cache) = &cache {
+        cache.save()?;
+    }
+
+    let report = Report::new(
+        opts.fingerprint(),
+        total_functions,
+        eligible_functions,
+        results,
+    );
+    fs::write(&cli.report, serde_json::to_string_pretty(&report)?)?;
+    let markdown = cli
+        .markdown
+        .clone()
+        .unwrap_or_else(|| cli.report.with_extension("md"));
+    fs::write(markdown, report.markdown())?;
+    Ok(report.exit_code())
+}
+
+/// Function IDs to check: those matching `queries`, or by default every
+/// function in both crates whose code differs.
+fn select(old: &CrateIndex, new: &CrateIndex, queries: &[String]) -> Vec<String> {
+    let mut ids = BTreeSet::new();
+    if queries.is_empty() {
+        for e in old.functions() {
+            let id = old.id(e);
+            if let [n] = new.find_functions(&id).as_slice() {
+                if code(old, e) != code(new, *n) {
+                    ids.insert(id);
+                }
+            }
+        }
+    } else {
+        for q in queries {
+            let found: Vec<usize> = old.find_functions(q);
+            if found.is_empty() {
+                // Reported as an error by `check_one`.
+                ids.insert(q.clone());
+            }
+            ids.extend(found.into_iter().map(|e| old.id(e)));
+        }
+    }
+    ids.into_iter().collect()
+}
+
+/// A function's code, ignoring formatting, comments and doc comments.
+fn code(index: &CrateIndex, entry: usize) -> String {
+    let Some(syn::Item::Fn(f)) = &index.entries[entry].item else {
+        return String::new();
+    };
+    let mut f = f.clone();
+    f.attrs.retain(|a| !a.path().is_ident("doc"));
+    f.to_token_stream().to_string()
+}
+
+fn check_one(
+    old: &CrateIndex,
+    new: &CrateIndex,
+    id: &str,
+    opts: &Options,
+    cache: Option<&mut cache::Cache>,
+) -> (Outcome, bool) {
+    let immediate = |status| {
+        (
+            Outcome {
+                status,
+                kani_ms: None,
+                test_ms: None,
+                total_ms: 0,
+            },
+            false,
+        )
+    };
+    let (Some(&o), Some(&n)) = (
+        old.find_functions(id).first(),
+        new.find_functions(id).first(),
+    ) else {
+        return immediate(Status::Error {
+            reason: format!("`{id}` is not in both crates"),
+        });
+    };
+    let old_unit = match extract(old, o) {
+        Ok(u) => u,
+        Err(skip) => {
+            return immediate(Status::Skipped {
+                category: skip.category,
+                reason: skip.detail,
+            })
+        }
+    };
+    let new_unit = match extract(new, n) {
+        Ok(u) => u,
+        Err(skip) => {
+            return immediate(Status::Skipped {
+                category: skip.category,
+                reason: format!("rewritten version: {}", skip.detail),
+            })
+        }
+    };
+    let key = cache::key(&old_unit, &new_unit, opts);
+    if let Some(hit) = cache.as_ref().and_then(|c| c.get(&key)) {
+        return (hit.clone(), true);
+    }
+    let outcome = check(&old_unit, &new_unit, opts);
+    if let Some(cache) = cache {
+        cache.insert(key, &outcome);
+    }
+    (outcome, false)
+}
