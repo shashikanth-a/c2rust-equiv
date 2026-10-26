@@ -37,6 +37,17 @@ pub unsafe extern "C" fn prints(x: libc::c_int) -> libc::c_int {
 pub unsafe extern "C" fn takes_ptr(p: *mut libc::c_int) -> libc::c_int {
     *p
 }
+pub const EAGAIN: libc::c_int = 35;
+pub fn const_pattern(e: libc::c_int) -> libc::c_int {
+    match e {
+        EAGAIN => 1,
+        other => other,
+    }
+}
+pub fn fence(x: i32) -> i32 {
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    x
+}
 pub fn uses_std(x: i32) -> i32 {
     std::cmp::max(x, 0)
 }
@@ -87,6 +98,17 @@ fn aliases_and_constants_are_included() {
         "{source}"
     );
     assert!(source.contains("pub const LIMIT: size_t = 16;"), "{source}");
+}
+
+#[test]
+fn constants_in_patterns_are_included() {
+    let source = category("const_pattern").unwrap();
+    assert!(source.contains("pub const EAGAIN"), "{source}");
+}
+
+#[test]
+fn atomic_fences_are_allowed() {
+    assert!(category("fence").is_ok());
 }
 
 #[test]

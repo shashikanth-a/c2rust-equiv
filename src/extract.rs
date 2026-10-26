@@ -87,7 +87,7 @@ pub fn extract(index: &CrateIndex, entry: usize) -> Result<FnUnit, Skip> {
         let mut analyzer = Analyzer {
             resolver: &resolver,
             module: index.entries[e].module,
-            locals: locals(item),
+            locals: locals(item, &resolver, index.entries[e].module),
             found: vec![],
             skip: None,
         };
@@ -125,7 +125,7 @@ pub fn extract(index: &CrateIndex, entry: usize) -> Result<FnUnit, Skip> {
         let mut rewriter = Rewriter {
             resolver: &resolver,
             module: index.entries[e].module,
-            locals: locals(&item),
+            locals: locals(&item, &resolver, index.entries[e].module),
         };
         rewriter.visit_item_mut(&mut item);
         match item {
@@ -146,6 +146,15 @@ struct Resolver<'a> {
 }
 
 impl Resolver<'_> {
+    /// Whether `name` resolves to a crate constant in `module`.
+    fn is_const(&self, module: usize, name: &str) -> bool {
+        let path = syn::Path::from(syn::Ident::new(name, Span::call_site()));
+        matches!(
+            self.resolve(module, &HashSet::new(), &path, Ns::Value),
+            Res::Item(e) if self.index.entries[e].kind == Kind::Const
+        )
+    }
+
     fn resolve(&self, module: usize, locals: &HashSet<String>, path: &syn::Path, ns: Ns) -> Res {
         let segs = scalar::idents(path);
         let first = segs[0].as_str();
@@ -298,7 +307,10 @@ fn libc(segs: &[String], ns: Ns) -> Res {
 }
 
 /// Names bound inside an item: arguments, `let`s, closure parameters, nested items.
-fn locals(item: &syn::Item) -> HashSet<String> {
+///
+/// A pattern identifier that names a constant in scope is a constant pattern,
+/// not a binding, so it isn't a local.
+fn locals(item: &syn::Item, resolver: &Resolver, module: usize) -> HashSet<String> {
     struct Locals(HashSet<String>);
     impl<'ast> Visit<'ast> for Locals {
         fn visit_pat_ident(&mut self, p: &'ast syn::PatIdent) {
@@ -316,6 +328,7 @@ fn locals(item: &syn::Item) -> HashSet<String> {
     if let syn::Item::Fn(f) = item {
         l.0.remove(&f.sig.ident.to_string());
     }
+    l.0.retain(|name| !resolver.is_const(module, name));
     l.0
 }
 
@@ -373,6 +386,13 @@ impl<'ast> Visit<'ast> for Analyzer<'_> {
         for elem in &p.elems {
             self.visit_pat(elem);
         }
+    }
+
+    fn visit_pat_ident(&mut self, p: &'ast syn::PatIdent) {
+        if !self.locals.contains(&p.ident.to_string()) {
+            self.path(&p.ident.clone().into(), Ns::Value);
+        }
+        syn::visit::visit_pat_ident(self, p);
     }
 
     fn visit_pat_struct(&mut self, p: &'ast syn::PatStruct) {

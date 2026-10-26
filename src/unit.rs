@@ -271,6 +271,8 @@ pub(crate) fn std_path_skip(segs: &[String]) -> Option<Skip> {
     match module.as_str() {
         "ptr" => Some(Skip::new("raw pointer", format!("uses `{shown}`"))),
         "os" if rest.first().map(String::as_str) == Some("raw") => None,
+        // Fences and atomics on locals; globals are excluded separately.
+        "sync" if rest.first().map(String::as_str) == Some("atomic") => None,
         "io" | "fs" | "net" | "process" | "env" | "thread" | "time" | "sync" | "os" | "alloc"
         | "arch" => Some(Skip::new("io", format!("uses `{shown}`"))),
         _ => None,
