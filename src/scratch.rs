@@ -169,12 +169,16 @@ fn qualify(ty: &syn::Type, module: &str) -> String {
 
 /// Drop attributes such as `#[no_mangle]`, which would clash between the two
 /// versions, and make the item public so the harness can call it.
+///
+/// Functions also get the Rust ABI: a panic in an `extern "C"` function aborts
+/// the process, which the native runner couldn't observe as a panic.
 fn make_standalone(item: &mut syn::Item) {
     let public: syn::Visibility = syn::parse_quote!(pub);
     match item {
         syn::Item::Fn(f) => {
             f.attrs.clear();
             f.vis = public;
+            f.sig.abi = None;
         }
         syn::Item::Const(c) => {
             c.attrs.clear();

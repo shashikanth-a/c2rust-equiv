@@ -124,6 +124,19 @@ fn no_arguments_and_unit_return() {
 }
 
 #[test]
+fn panics_in_extern_c_functions_are_caught() {
+    let status = run(
+        r#"pub unsafe extern "C" fn f(x: i32) -> i32 { x.wrapping_add(1) }"#,
+        r#"pub unsafe extern "C" fn f(x: i32) -> i32 { x + 1 }"#,
+        false,
+    );
+    let Status::Counterexample { new_out, .. } = &status else {
+        panic!("{status}")
+    };
+    assert!(new_out.contains("overflow"), "{new_out}");
+}
+
+#[test]
 fn skipped_raw_pointer() {
     let status = run(PTR, PTR, false);
     let Status::Skipped { category, .. } = status else {
