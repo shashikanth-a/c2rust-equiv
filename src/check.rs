@@ -188,6 +188,11 @@ fn run_check(
         return Ok(skipped("signature".into(), "the signature changed".into()));
     }
 
+    // Cargo resolves a relative `CARGO_TARGET_DIR` against the scratch crate.
+    let opts = &Options {
+        work_dir: std::env::current_dir()?.join(&opts.work_dir),
+        ..opts.clone()
+    };
     let dir = opts.work_dir.join("scratch").join(old.name());
     if dir.exists() {
         fs::remove_dir_all(&dir)?;

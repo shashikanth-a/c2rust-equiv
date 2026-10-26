@@ -98,3 +98,20 @@ fn eligibility_lists_every_function() {
     assert_eq!(read["eligible"], false);
     assert_eq!(read["category"], "raw pointer");
 }
+
+#[test]
+fn relative_work_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let status = Command::new(env!("CARGO_BIN_EXE_c2rust-equiv"))
+        .current_dir(dir.path())
+        .arg("--old")
+        .arg(fixtures.join("old"))
+        .arg("--new")
+        .arg(fixtures.join("new"))
+        .args(["--report", "report.json", "--work-dir", "work", "--no-kani"])
+        .args(["--function", "larger"])
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(0));
+}
