@@ -137,6 +137,16 @@ fn panics_in_extern_c_functions_are_caught() {
 }
 
 #[test]
+fn extern_c_function_pointers_still_compile() {
+    let src = r#"pub unsafe extern "C" fn f(x: u8) -> u8 {
+        let g: unsafe extern "C" fn(u8) -> u8 = f;
+        if x > 0 { g(x - 1) } else { 0 }
+    }"#;
+    let status = run(src, src, false);
+    assert!(matches!(status, Status::Tested { .. }), "{status}");
+}
+
+#[test]
 fn skipped_raw_pointer() {
     let status = run(PTR, PTR, false);
     let Status::Skipped { category, .. } = status else {

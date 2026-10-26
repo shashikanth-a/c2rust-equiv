@@ -171,8 +171,17 @@ fn qualify(ty: &syn::Type, module: &str) -> String {
 /// versions, and make the item public so the harness can call it.
 ///
 /// Functions also get the Rust ABI: a panic in an `extern "C"` function aborts
-/// the process, which the native runner couldn't observe as a panic.
+/// the process, which the native runner couldn't observe as a panic. Function
+/// pointer types change to match.
 fn make_standalone(item: &mut syn::Item) {
+    struct RustAbi;
+    impl VisitMut for RustAbi {
+        fn visit_type_bare_fn_mut(&mut self, f: &mut syn::TypeBareFn) {
+            f.abi = None;
+            syn::visit_mut::visit_type_bare_fn_mut(self, f);
+        }
+    }
+    RustAbi.visit_item_mut(item);
     let public: syn::Visibility = syn::parse_quote!(pub);
     match item {
         syn::Item::Fn(f) => {
