@@ -199,7 +199,7 @@ macro_rules! tuple_inputs {
                 out
             }
             fn describe(&self) -> String {
-                let parts: Vec<String> = vec![$(self.$i.describe()),*];
+                let parts: Vec<String> = vec![$(Scalar::describe(&self.$i)),*];
                 format!("({})", parts.join(", "))
             }
         }
@@ -249,7 +249,8 @@ fn clean(s: &str) -> String {
 #[cfg(not(kani))]
 pub fn run(f: fn(crate::Args) -> crate::Ret, a: crate::Args) -> Outcome {
     match std::panic::catch_unwind(move || f(a)) {
-        Ok(r) => Outcome::Returned(r.bits(), r.describe()),
+        // `()` is both a `Scalar` and an `Inputs`, so name the trait.
+        Ok(r) => Outcome::Returned(Scalar::bits(&r), Scalar::describe(&r)),
         Err(e) => Outcome::Panicked(
             e.downcast_ref::<&str>()
                 .map(|s| s.to_string())
@@ -269,7 +270,7 @@ pub fn run_main() {
     let compare = |a: crate::Args| -> (bool, String) {
         let o = run(crate::call_old, a);
         let n = run(crate::call_new, a);
-        (o.same(&n), format!("{}\t{}\t{}", clean(&a.describe()), o, n))
+        (o.same(&n), format!("{}\t{}\t{}", clean(&Inputs::describe(&a)), o, n))
     };
     match args.get(1).map(String::as_str) {
         Some("test") => {

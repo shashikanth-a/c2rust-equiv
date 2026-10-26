@@ -112,6 +112,18 @@ fn testing_identical_panics() {
 }
 
 #[test]
+fn no_arguments_and_unit_return() {
+    let status = run("fn f() -> i32 { 1 + 1 }", "fn f() -> i32 { 2 }", false);
+    assert!(matches!(status, Status::Tested { .. }), "{status}");
+    let status = run(
+        "fn f(x: u8) { let _ = x; }",
+        "fn f(x: u8) { assert!(x != 7); }",
+        false,
+    );
+    assert_eq!(found_by(&status), Some(Method::Testing), "{status}");
+}
+
+#[test]
 fn skipped_raw_pointer() {
     let status = run(PTR, PTR, false);
     let Status::Skipped { category, .. } = status else {

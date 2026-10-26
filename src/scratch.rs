@@ -128,7 +128,7 @@ mod proofs {{
         let args: Args = kani::any();
         let o = call_old(args);
         let n = call_new(args);
-        assert!(o.bits() == n.bits(), "results differ");
+        assert!(Scalar::bits(&o) == Scalar::bits(&n), "results differ");
     }}
 
     #[kani::proof]
@@ -137,7 +137,7 @@ mod proofs {{
         let args: Args = kani::any();
         let n = call_new(args);
         let o = call_old(args);
-        assert!(o.bits() == n.bits(), "results differ");
+        assert!(Scalar::bits(&o) == Scalar::bits(&n), "results differ");
     }}
 }}
 "#
