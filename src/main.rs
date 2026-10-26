@@ -68,6 +68,10 @@ struct Cli {
     /// Rust edition for the scratch crates.
     #[arg(long, default_value = "2021")]
     edition: String,
+    /// Write whether each function in the original crate is in scope, and why
+    /// not, as JSON lines.
+    #[arg(long)]
+    eligibility: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -121,10 +125,26 @@ fn run(cli: &Cli) -> Result<u8, Box<dyn std::error::Error>> {
     }
 
     let total_functions = old.functions().count();
-    let eligible_functions = old
-        .functions()
-        .filter(|&e| extract(&old, e).is_ok())
-        .count();
+    let mut eligible_functions = 0;
+    let mut eligibility = String::new();
+    for e in old.functions() {
+        let line = match extract(&old, e) {
+            Ok(_) => {
+                eligible_functions += 1;
+                serde_json::json!({ "id": old.id(e), "eligible": true })
+            }
+            Err(skip) => serde_json::json!({
+                "id": old.id(e),
+                "eligible": false,
+                "category": skip.category,
+                "reason": skip.detail,
+            }),
+        };
+        eligibility += &format!("{line}\n");
+    }
+    if let Some(path) = &cli.eligibility {
+        fs::write(path, eligibility)?;
+    }
 
     let selected = select(&old, &new, &queries);
     let mut results = Vec::new();

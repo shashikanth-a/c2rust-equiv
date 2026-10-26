@@ -79,3 +79,22 @@ fn cache_hits_on_rerun() {
     // `read` is skipped before the cache is consulted.
     assert_eq!(second["summary"]["cache_hits"], 2);
 }
+
+#[test]
+fn eligibility_lists_every_function() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("eligibility.jsonl");
+    run(&["--eligibility", path.to_str().unwrap()]);
+    let rows: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 4);
+    let read = rows
+        .iter()
+        .find(|r| r["id"] == "src/math.rs::read")
+        .unwrap();
+    assert_eq!(read["eligible"], false);
+    assert_eq!(read["category"], "raw pointer");
+}
