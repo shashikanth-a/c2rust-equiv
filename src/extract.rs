@@ -148,7 +148,7 @@ struct Resolver<'a> {
 impl Resolver<'_> {
     /// Whether `name` resolves to a crate constant in `module`.
     fn is_const(&self, module: usize, name: &str) -> bool {
-        let path = syn::Path::from(syn::Ident::new(name, Span::call_site()));
+        let path = syn::Path::from(ident(name));
         matches!(
             self.resolve(module, &HashSet::new(), &path, Ns::Value),
             Res::Item(e) if self.index.entries[e].kind == Kind::Const
@@ -306,6 +306,14 @@ fn libc(segs: &[String], ns: Ns) -> Res {
     Res::Skip(Skip::new("foreign call", format!("uses `{shown}`")))
 }
 
+/// An identifier from its string form, which may be raw (`r#box`).
+fn ident(name: &str) -> syn::Ident {
+    match name.strip_prefix("r#") {
+        Some(raw) => syn::Ident::new_raw(raw, Span::call_site()),
+        None => syn::Ident::new(name, Span::call_site()),
+    }
+}
+
 /// Names bound inside an item: arguments, `let`s, closure parameters, nested items.
 ///
 /// A pattern identifier that names a constant in scope is a constant pattern,
@@ -448,7 +456,7 @@ impl Rewriter<'_> {
         match self.resolver.resolve(self.module, &self.locals, path, ns) {
             Res::Item(e) => {
                 let name = &self.resolver.index.entries[e].name;
-                let mut new_path = syn::Path::from(syn::Ident::new(name, Span::call_site()));
+                let mut new_path = syn::Path::from(ident(name));
                 if let (Some(last), Some(old)) =
                     (new_path.segments.last_mut(), path.segments.last())
                 {

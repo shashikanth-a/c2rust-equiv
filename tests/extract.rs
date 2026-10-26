@@ -48,6 +48,9 @@ pub fn fence(x: i32) -> i32 {
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
     x
 }
+pub fn raw_ident(r#box: i32) -> i32 {
+    r#box + 1
+}
 pub fn uses_std(x: i32) -> i32 {
     std::cmp::max(x, 0)
 }
@@ -109,6 +112,11 @@ fn constants_in_patterns_are_included() {
 #[test]
 fn atomic_fences_are_allowed() {
     assert!(category("fence").is_ok());
+}
+
+#[test]
+fn raw_identifiers() {
+    assert!(category("raw_ident").is_ok());
 }
 
 #[test]

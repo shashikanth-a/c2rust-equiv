@@ -76,12 +76,14 @@ struct Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match run(&cli) {
-        Ok(code) => ExitCode::from(code),
-        Err(e) => {
+    // A panic is a tool error too, so it exits with 2 rather than 101.
+    match std::panic::catch_unwind(|| run(&cli)) {
+        Ok(Ok(code)) => ExitCode::from(code),
+        Ok(Err(e)) => {
             eprintln!("error: {e}");
             ExitCode::from(2)
         }
+        Err(_) => ExitCode::from(2),
     }
 }
 
