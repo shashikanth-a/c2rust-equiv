@@ -279,11 +279,17 @@ impl Resolver<'_> {
             [] => {
                 if !prefix.is_empty() {
                     let ty = prefix.last().unwrap();
-                    let is_type = index
+                    let type_entry = index
                         .entries
                         .iter()
-                        .any(|e| e.name == *ty && matches!(e.kind, Kind::Type | Kind::TypeAlias));
-                    if is_type {
+                        .position(|e| e.name == *ty && matches!(e.kind, Kind::Type | Kind::TypeAlias));
+                    if let Some(te) = type_entry {
+                        // `EnumType::VARIANT` (an associated const): on the heap
+                        // path, pull the type in and keep the `Type::const` path;
+                        // the scalar path rejects it.
+                        if self.heap {
+                            return Res::Item(te);
+                        }
                         return Res::Skip(Skip::new("crate type", format!("uses `{shown}`")));
                     }
                 }
@@ -494,9 +500,18 @@ impl Rewriter<'_> {
         }
         match self.resolver.resolve(self.module, &self.locals, path, ns) {
             Res::Item(e) => {
-                let name = &self.resolver.index.entries[e].name;
+                let entry = &self.resolver.index.entries[e];
+                let name = &entry.name;
+                // A path resolving to a type but ending in a different segment
+                // is an associated const (`EnumType::VARIANT`): rewrite the type
+                // prefix to its bare name and keep the final segment.
+                let tail = path.segments.last().filter(|s| {
+                    matches!(entry.kind, Kind::Type | Kind::TypeAlias) && s.ident != name.as_str()
+                });
                 let mut new_path = syn::Path::from(ident(name));
-                if let (Some(last), Some(old)) =
+                if let Some(tail) = tail {
+                    new_path.segments.push(tail.clone());
+                } else if let (Some(last), Some(old)) =
                     (new_path.segments.last_mut(), path.segments.last())
                 {
                     last.arguments = old.arguments.clone();
