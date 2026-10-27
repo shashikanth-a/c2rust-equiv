@@ -49,6 +49,30 @@ pub fn available() -> bool {
 }
 
 pub fn run(dir: &Path, target_dir: &Path, timeout: Duration) -> std::io::Result<Run> {
+    run_with(dir, target_dir, timeout, None, "kani.log")
+}
+
+/// Run one harness checking only `properties`, by their check names. A
+/// failure of a property that isn't selected can't be reported, so the
+/// concrete input Kani prints is one that violates a selected property.
+pub fn run_properties(
+    dir: &Path,
+    target_dir: &Path,
+    timeout: Duration,
+    harness: &str,
+    properties: &[&str],
+) -> std::io::Result<Run> {
+    let log = format!("kani-{}.log", harness.replace("::", "-"));
+    run_with(dir, target_dir, timeout, Some((harness, properties)), &log)
+}
+
+fn run_with(
+    dir: &Path,
+    target_dir: &Path,
+    timeout: Duration,
+    select: Option<(&str, &[&str])>,
+    log: &str,
+) -> std::io::Result<Run> {
     let mut cmd = Command::new("cargo");
     cmd.args([
         "kani",
@@ -60,7 +84,15 @@ pub fn run(dir: &Path, target_dir: &Path, timeout: Duration) -> std::io::Result<
     ])
     .current_dir(dir)
     .env("CARGO_TARGET_DIR", target_dir);
-    let done = process::run(cmd, None, timeout, &dir.join("kani.log"))?;
+    if let Some((harness, properties)) = select {
+        cmd.args(["--harness", harness, "--exact", "-Z", "unstable-options"]);
+        // `--cbmc-args` must come last.
+        cmd.arg("--cbmc-args");
+        for p in properties {
+            cmd.args(["--property", p]);
+        }
+    }
+    let done = process::run(cmd, None, timeout, &dir.join(log))?;
     if done.status.is_none() {
         return Ok(Run::TimedOut);
     }

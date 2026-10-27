@@ -36,6 +36,13 @@ const INDEX_NEW: &str = r#"fn f(i: usize) -> u8 {
     match i { 0 => 10, 1 => 20, 2 => 30, _ => panic!("no such entry") }
 }"#;
 
+/// Both panic below 1000, and they differ at one rare input only. Kani may
+/// print a panicking input for both harnesses; the difference must still be
+/// reported, through a rerun on only the unexplained check.
+const MASKED_OLD: &str = "fn f(x: u32) -> u32 { if x < 1000 { panic!() } x }";
+const MASKED_NEW: &str =
+    "fn f(x: u32) -> u32 { if x < 1000 { panic!() } if x == 123456789 { 0 } else { x } }";
+
 /// Equivalent, but the loop runs up to 255 times, beyond Kani's unwinding bound.
 const SUM_OLD: &str = r#"fn f(n: u8) -> u32 {
     let mut s = 0u32;
@@ -215,6 +222,19 @@ fn kani_off_by_one() {
     assert_eq!(inputs, "(100)");
     assert_eq!(old_out, "returned false");
     assert_eq!(new_out, "returned true");
+}
+
+#[test]
+fn kani_difference_behind_identical_panics() {
+    if !have_kani() {
+        return;
+    }
+    let status = run(MASKED_OLD, MASKED_NEW, true);
+    assert_eq!(found_by(&status), Some(Method::Kani), "{status}");
+    let Status::Counterexample { inputs, .. } = status else {
+        unreachable!()
+    };
+    assert_eq!(inputs, "(123456789)");
 }
 
 #[test]

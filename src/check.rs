@@ -337,19 +337,32 @@ fn kani_decision(
             c.description
         )));
     }
-    // A failure inside the version a harness calls first is a panic of that
-    // version, which cuts the path before the other runs: the other harness
-    // covers that input. CBMC's own floating-point NaN checks aren't Rust
-    // behaviour. Anything else that didn't reproduce natively is unexplained.
-    let unexplained = checks().find(|(h, c)| {
-        let first = if h.name == scratch::OLD_FIRST {
-            scratch::OLD_FILE
-        } else {
-            scratch::NEW_FILE
-        };
-        c.failed() && c.file.as_deref() != Some(first) && !c.description.starts_with("NaN on ")
-    });
-    if let Some((_, c)) = unexplained {
+    if let Some(c) = harnesses
+        .iter()
+        .find_map(|h| unexplained(h).first().copied())
+    {
+        // Kani prints one input per failing harness, which may be a harmless
+        // panic. Rerunning on only the unexplained properties makes it print
+        // an input that violates one of them (specs/Verdict.tla).
+        for h in &harnesses {
+            let properties: Vec<&str> = unexplained(h).iter().map(|c| c.name.as_str()).collect();
+            if properties.is_empty() {
+                continue;
+            }
+            let target = opts.work_dir.join("target-kani");
+            if let kani::Run::Done(rerun) =
+                kani::run_properties(dir, &target, timeout, &h.name, &properties)?
+            {
+                let inputs: Vec<&Vec<Vec<u8>>> = rerun.iter().flat_map(|h| &h.playbacks).collect();
+                if !inputs.is_empty() {
+                    for line in replay(dir, runner, opts, &inputs)? {
+                        if let Some(status) = mismatch(&line, "DIFF", Method::Kani) {
+                            return Ok(Decision::Counterexample(status));
+                        }
+                    }
+                }
+            }
+        }
         return Ok(Decision::Fallback(format!(
             "kani reported `{}` at {}, which did not reproduce natively",
             c.description,
@@ -368,6 +381,26 @@ fn kani_decision(
     }
 
     Ok(Decision::Proved)
+}
+
+/// Failed checks that aren't a panic of the version the harness calls first.
+///
+/// That panic cuts the path before the other version runs, and the other
+/// harness covers the input. CBMC's own floating-point NaN checks aren't Rust
+/// behaviour. Any other failure means both versions returned and differ, or
+/// the first returned and the second panicked: a real difference.
+fn unexplained(h: &kani::Harness) -> Vec<&kani::Check> {
+    let first = if h.name == scratch::OLD_FIRST {
+        scratch::OLD_FILE
+    } else {
+        scratch::NEW_FILE
+    };
+    h.checks
+        .iter()
+        .filter(|c| {
+            c.failed() && c.file.as_deref() != Some(first) && !c.description.starts_with("NaN on ")
+        })
+        .collect()
 }
 
 fn replay(
