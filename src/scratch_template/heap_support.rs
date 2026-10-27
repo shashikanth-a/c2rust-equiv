@@ -123,6 +123,48 @@ pub static mut ORACLE: Oracle = Oracle {
     len: 0,
 };
 
+/// One argument of a variadic external call, recorded into the trace: its bits
+/// and kind (0 scalar/float by value, 1 NUL-terminated string by content).
+/// Implemented only for the types a format call actually passes, so an
+/// unsupported argument type is a compile error (the function is then skipped,
+/// never modelled unsoundly).
+pub trait TraceArg {
+    fn bits(&self) -> u128;
+    fn kind(&self) -> u8;
+}
+
+macro_rules! trace_arg_scalar {
+    ($($t:ty),*) => {$(
+        impl TraceArg for $t {
+            fn bits(&self) -> u128 { *self as u128 }
+            fn kind(&self) -> u8 { 0 }
+        }
+    )*};
+}
+trace_arg_scalar!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize, bool, char);
+
+impl TraceArg for f32 {
+    fn bits(&self) -> u128 { self.to_bits() as u128 }
+    fn kind(&self) -> u8 { 0 }
+}
+impl TraceArg for f64 {
+    fn bits(&self) -> u128 { self.to_bits() as u128 }
+    fn kind(&self) -> u8 { 0 }
+}
+
+// `c_char`/`c_uchar` pointers are strings: recorded by content (kind 1). Other
+// pointer types have no impl on purpose, so a `%p` of some struct pointer makes
+// the shim fail to compile and the function is left unmodelled.
+macro_rules! trace_arg_cstr {
+    ($($t:ty),*) => {$(
+        impl TraceArg for $t {
+            fn bits(&self) -> u128 { *self as usize as u128 }
+            fn kind(&self) -> u8 { 1 }
+        }
+    )*};
+}
+trace_arg_cstr!(*const i8, *mut i8, *const u8, *mut u8);
+
 /// The most external calls a run records. Observable-behaviour equivalence
 /// (VOC / CoVaC): the first version records its external-call trace, the second
 /// must replay it exactly, so both make the same calls in the same order.

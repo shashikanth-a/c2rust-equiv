@@ -1,0 +1,126 @@
+//! Modelling variadic I/O calls (`printf`, `fprintf`, …) on the heap path.
+//!
+//! These can't be given a Rust shim (a variadic function's arguments can't be
+//! read portably on the verifier's toolchain), so instead each *call site* is
+//! rewritten into a sequence of observable trace events: the call records its
+//! arguments (each via the `TraceArg` trait, which resolves the type at compile
+//! time -- strings by content, scalars by value) and takes a shared symbolic
+//! result. Both versions rewrite identically, so they are equivalent exactly
+//! when they make the same formatted calls with the same arguments -- the
+//! observable-behaviour equivalence the literature uses for I/O.
+//!
+//! Only output-to-stream functions are handled (no caller buffer to model);
+//! `sprintf`/`snprintf`, which format into a destination buffer, need that
+//! buffer's output modelled and are not covered here.
+
+use quote::ToTokens;
+use syn::visit_mut::VisitMut;
+
+/// The variadic output functions modelled, with their return type.
+fn variadic_ret(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "printf" | "fprintf" | "vprintf" | "vfprintf" | "dprintf" | "vdprintf" => {
+            "::core::ffi::c_int"
+        }
+        "syslog" | "vsyslog" => "()",
+        _ => return None,
+    })
+}
+
+/// Whether a call to `name` is a modelled variadic external.
+pub fn is_variadic_modelled(name: &str) -> bool {
+    variadic_ret(name).is_some()
+}
+
+/// A stable 64-bit id for a call name (FNV-1a), matching `strmodel::oracle_id`
+/// so a name maps to one trace id everywhere.
+fn id(name: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in name.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Rewrite every call to a modelled variadic external in these items.
+pub fn rewrite(items: &mut [syn::Item]) {
+    for item in items {
+        Rewrite.visit_item_mut(item);
+    }
+}
+
+struct Rewrite;
+
+impl VisitMut for Rewrite {
+    fn visit_expr_mut(&mut self, e: &mut syn::Expr) {
+        // Rewrite inner expressions first (arguments may themselves be calls).
+        syn::visit_mut::visit_expr_mut(self, e);
+        let syn::Expr::Call(call) = e else { return };
+        let syn::Expr::Path(p) = &*call.func else { return };
+        let Some(name) = p.path.segments.last().map(|s| s.ident.to_string()) else {
+            return;
+        };
+        let Some(ret) = variadic_ret(&name) else { return };
+        if p.path.segments.len() != 1 {
+            return;
+        }
+        *e = syn::parse_str(&block(&name, ret, &call.args)).expect("variadic trace block parses");
+    }
+}
+
+/// The replacement block: bind each argument, record it as a trace event, and
+/// yield a shared symbolic result cast to the call's return type.
+fn block(name: &str, ret: &str, args: &syn::punctuated::Punctuated<syn::Expr, syn::token::Comma>) -> String {
+    let call_id = id(name);
+    let mut binds = String::new();
+    let mut steps = String::new();
+    for (i, arg) in args.iter().enumerate() {
+        binds += &format!("let __a{i} = {};\n", arg.to_token_stream());
+        steps += &format!(
+            "(*__t).step({call_id}u64, \
+             [crate::support::TraceArg::bits(&__a{i}), 0, 0], \
+             [crate::support::TraceArg::kind(&__a{i}), 3u8, 3u8]);\n"
+        );
+    }
+    // A final event carries the call's symbolic result (distinct id so it is
+    // never confused with an argument event).
+    let ret_id = call_id.wrapping_add(1);
+    let tail = if ret == "()" {
+        format!("let _ = (*__t).step({ret_id}u64, [0, 0, 0], [3u8, 3u8, 3u8]);")
+    } else {
+        format!("(*__t).step({ret_id}u64, [0, 0, 0], [3u8, 3u8, 3u8]) as {ret}")
+    };
+    format!(
+        "{{ let __t = core::ptr::addr_of_mut!(crate::support::TRACE); {binds} {steps} {tail} }}"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn items(src: &str) -> Vec<syn::Item> {
+        syn::parse_file(src).unwrap().items
+    }
+
+    #[test]
+    fn rewrites_printf_call_into_trace_events() {
+        let mut it = items(
+            "pub unsafe fn f(x: i32) { printf(b\"%d\\0\".as_ptr() as *const i8, x); }",
+        );
+        rewrite(&mut it);
+        let src = it.iter().map(|i| i.to_token_stream().to_string()).collect::<String>();
+        assert!(src.contains("TRACE"), "{src}");
+        assert!(src.contains("TraceArg :: bits"), "{src}");
+        assert!(!src.contains("printf ("), "call should be gone: {src}");
+    }
+
+    #[test]
+    fn leaves_other_calls_alone() {
+        let mut it = items("pub fn f() -> i32 { g(1) }\npub fn g(x: i32) -> i32 { x }");
+        rewrite(&mut it);
+        let src = it.iter().map(|i| i.to_token_stream().to_string()).collect::<String>();
+        assert!(src.contains("g (1)"), "{src}");
+    }
+}

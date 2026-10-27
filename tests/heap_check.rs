@@ -234,6 +234,62 @@ fn tagged_union_path_does_not_prove_a_wrong_rewrite() {
     );
 }
 
+// A variadic `printf` call, rewritten into observable trace events: both
+// versions must print the same format with the same arguments.
+const PRINTF_DECL: &str =
+    "extern \"C\" { fn printf(_: *const core::ffi::c_char, ...) -> core::ffi::c_int; }";
+
+const PF_OLD: &str = r#"
+pub unsafe fn h(p: *const i32) -> i32 {
+    if p.is_null() { return 0; }
+    printf(b"%d\0".as_ptr() as *const core::ffi::c_char, *p);
+    *p
+}
+"#;
+
+const PF_OK: &str = r#"
+pub unsafe fn h(p: *const i32) -> i32 {
+    if p.is_null() { return 0; }
+    let v = *p;
+    printf(b"%d\0".as_ptr() as *const core::ffi::c_char, v);
+    v
+}
+"#;
+
+const PF_BAD: &str = r#"
+pub unsafe fn h(p: *const i32) -> i32 {
+    if p.is_null() { return 0; }
+    printf(b"%d\0".as_ptr() as *const core::ffi::c_char, *p + 1);
+    *p
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn variadic_printf_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(PF_OLD, &[PRINTF_DECL]).unwrap();
+    let new = FnUnit::parse(PF_OK, &[PRINTF_DECL]).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn variadic_printf_catches_different_argument() {
+    let old = FnUnit::parse(PF_OLD, &[PRINTF_DECL]).unwrap();
+    let new = FnUnit::parse(PF_BAD, &[PRINTF_DECL]).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a different printf argument proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 // A string-argument external (`note`) traced by content: both versions must
 // pass the same string bytes, not the same address.
 const NOTE_DECL: &str = "extern \"C\" { fn note(_: *const core::ffi::c_char); }";

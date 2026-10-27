@@ -357,6 +357,12 @@ impl Resolver<'_> {
                     {
                         Res::Item(e)
                     }
+                    // A modelled variadic I/O call (`printf`, …) is kept as a
+                    // bare call and rewritten into trace events later; its
+                    // (variadic) declaration isn't pulled in.
+                    [] if self.heap && crate::varmodel::is_variadic_modelled(&entry.name) => {
+                        Res::External(None)
+                    }
                     [] => Res::Skip(Skip::new(
                         "foreign call",
                         format!("calls foreign function `{shown}`"),

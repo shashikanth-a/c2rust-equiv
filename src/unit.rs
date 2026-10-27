@@ -374,6 +374,7 @@ impl<'ast> Visit<'ast> for BodyChecker {
             let ok = self.allow_pointers
                 && matches!(item, syn::ForeignItem::Fn(f)
                     if is_modelled_c_fn(&f.sig.ident.to_string())
+                        || crate::varmodel::is_variadic_modelled(&f.sig.ident.to_string())
                         || crate::strmodel::is_trace_modellable(&Some(syn::Item::ForeignMod(
                             syn::ItemForeignMod {
                                 attrs: vec![],
