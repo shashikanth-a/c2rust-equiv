@@ -256,6 +256,25 @@ fn skipped(category: String, reason: String) -> Status {
     Status::Skipped { category, reason }
 }
 
+/// Whether the heap path can take this function: its signature passes or
+/// returns a pointer to a struct the generator supports, its body is in scope
+/// for the heap path, and every reachable struct generates. This is the scope
+/// test for one version (the live path additionally requires both versions to
+/// share the same shape).
+pub fn heap_eligible(unit: &FnUnit) -> bool {
+    let Some(index) = index_of(unit) else {
+        return false;
+    };
+    let Ok(shapes) = heapgen::signature_shapes(&index, &unit.function.sig) else {
+        return false;
+    };
+    let has_heap = shapes.args.iter().any(|s| matches!(s, Shape::Heap(_)))
+        || matches!(shapes.ret, Shape::Heap(_));
+    has_heap
+        && unit.heap_body_in_scope().is_ok()
+        && heapgen::generate_all(&index, &shapes.structs, "old", "new").is_ok()
+}
+
 /// A crate index over a unit's own items, so the generator can see its structs.
 fn index_of(unit: &FnUnit) -> Option<CrateIndex> {
     let file = syn::File {

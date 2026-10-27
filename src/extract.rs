@@ -72,7 +72,9 @@ enum Res {
 }
 
 /// Extract the function at `entry` and everything it uses.
-pub fn extract(index: &CrateIndex, entry: usize) -> Result<FnUnit, Skip> {
+/// Resolve a function into a self-contained unit (its callee closure) without
+/// checking whether it is in scope, so either path can apply its own checks.
+pub fn extract_unvalidated(index: &CrateIndex, entry: usize) -> Result<FnUnit, Skip> {
     let resolver = Resolver { index };
     let mut closure = BTreeSet::new();
     let mut queue = VecDeque::from([entry]);
@@ -137,6 +139,14 @@ pub fn extract(index: &CrateIndex, entry: usize) -> Result<FnUnit, Skip> {
         function: function.expect("the function is in its own closure"),
         callees,
     };
+    Ok(unit)
+}
+
+/// Resolve a function into a self-contained unit and check it is in scope for
+/// the scalar path. The heap path uses [`extract_unvalidated`] and its own
+/// scope checks instead.
+pub fn extract(index: &CrateIndex, entry: usize) -> Result<FnUnit, Skip> {
+    let unit = extract_unvalidated(index, entry)?;
     unit.validate()?;
     Ok(unit)
 }

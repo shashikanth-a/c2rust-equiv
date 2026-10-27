@@ -17,7 +17,7 @@ mod scalar;
 mod scratch;
 pub mod unit;
 
-pub use check::{check, Method, Options, Outcome, Status};
+pub use check::{check, heap_eligible, Method, Options, Outcome, Status};
 pub use crate_index::CrateIndex;
-pub use extract::extract;
+pub use extract::{extract, extract_unvalidated};
 pub use unit::{FnUnit, Skip};

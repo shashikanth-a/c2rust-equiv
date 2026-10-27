@@ -129,22 +129,39 @@ fn run(cli: &Cli) -> Result<u8, Box<dyn std::error::Error>> {
 
     let total_functions = old.functions().count();
     let mut eligible_functions = 0;
+    let mut heap_eligible_functions = 0;
     let mut eligibility = String::new();
     for e in old.functions() {
         let line = match extract(&old, e) {
             Ok(_) => {
                 eligible_functions += 1;
-                serde_json::json!({ "id": old.id(e), "eligible": true })
+                serde_json::json!({ "id": old.id(e), "eligible": true, "path": "scalar" })
             }
-            Err(skip) => serde_json::json!({
-                "id": old.id(e),
-                "eligible": false,
-                "category": skip.category,
-                "reason": skip.detail,
-            }),
+            Err(skip) => {
+                // A scalar-ineligible function may still be in scope for the
+                // heap path (it passes or returns a pointer to a struct the
+                // generator supports).
+                let heap = c2rust_equiv::extract_unvalidated(&old, e)
+                    .map(|u| c2rust_equiv::heap_eligible(&u))
+                    .unwrap_or(false);
+                if heap {
+                    heap_eligible_functions += 1;
+                }
+                serde_json::json!({
+                    "id": old.id(e),
+                    "eligible": heap,
+                    "path": if heap { "heap" } else { "none" },
+                    "category": skip.category,
+                    "reason": skip.detail,
+                })
+            }
         };
         eligibility += &format!("{line}\n");
     }
+    eprintln!(
+        "eligibility: {eligible_functions} scalar + {heap_eligible_functions} heap = {} of {total_functions} functions",
+        eligible_functions + heap_eligible_functions
+    );
     if let Some(path) = &cli.eligibility {
         fs::write(path, eligibility)?;
     }
