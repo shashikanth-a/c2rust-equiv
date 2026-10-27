@@ -298,6 +298,23 @@ pub(crate) fn std_path_skip(segs: &[String]) -> Option<Skip> {
 /// The C allocation and memory functions Kani models directly, so the heap
 /// path may call them. Others (e.g. `strlen`, `printf`) need FFI models or
 /// stubs and stay out of scope for now.
+/// Whether a static is a scalar `static mut`, which the heap path models by
+/// giving each version its own identically-initialised copy.
+pub(crate) fn is_scalar_mut_static(s: &syn::ItemStatic) -> bool {
+    if !matches!(s.mutability, syn::StaticMutability::Mut(_)) {
+        return false;
+    }
+    if let syn::Type::Path(p) = &*s.ty {
+        if let Some(seg) = p.path.segments.last() {
+            let n = seg.ident.to_string();
+            return crate::scalar::primitive(&n).is_some()
+                || crate::scalar::c_type(&n).is_some()
+                || crate::scalar::libc_typedef(&n).is_some();
+        }
+    }
+    false
+}
+
 pub(crate) fn is_modelled_c_fn(name: &str) -> bool {
     matches!(
         name,
@@ -337,6 +354,11 @@ impl<'ast> Visit<'ast> for BodyChecker {
     }
 
     fn visit_item_static(&mut self, s: &'ast syn::ItemStatic) {
+        // On the heap path a scalar `static mut` is modelled (each version gets
+        // its own copy, final values compared), so it is kept in scope.
+        if self.allow_pointers && is_scalar_mut_static(s) {
+            return;
+        }
         self.set(Skip::new(
             "global",
             format!("declares static `{}`", s.ident),

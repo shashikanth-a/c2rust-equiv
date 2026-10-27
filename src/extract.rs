@@ -329,6 +329,13 @@ impl Resolver<'_> {
             Kind::ForeignStatic if self.heap && crate::allocmodel::is_alloc_global(&entry.name) => {
                 Res::External(None)
             }
+            // A crate-defined scalar `static mut` with its own initializer is
+            // pulled into the unit: both versions get an identical copy with the
+            // same starting value, and the harness compares the final values, so
+            // a divergent global write is caught. A `static mut` is shared,
+            // mutable state, but in isolation it starts from its initializer --
+            // a real execution state -- which is sound (if incomplete).
+            Kind::Static if self.heap && is_scalar_mut_static(&entry.item) => Res::Item(e),
             Kind::Static | Kind::ForeignStatic => {
                 Res::Skip(Skip::new("global", format!("accesses `{shown}`")))
             }
@@ -356,6 +363,12 @@ impl Resolver<'_> {
             }
         }
     }
+}
+
+/// Whether an item is a scalar `static mut` (a global the heap path can model
+/// by giving each version its own identically-initialised copy).
+fn is_scalar_mut_static(item: &Option<syn::Item>) -> bool {
+    matches!(item, Some(syn::Item::Static(s)) if crate::unit::is_scalar_mut_static(s))
 }
 
 /// Whether two stored items are the same definition, by token text. Used to
@@ -503,6 +516,14 @@ impl<'ast> Visit<'ast> for Analyzer<'_> {
     }
 
     fn visit_item_static(&mut self, s: &'ast syn::ItemStatic) {
+        // A scalar `static mut` is modelled on the heap path (included and
+        // compared); visit its initializer for references but don't reject it.
+        if self.resolver.heap
+            && is_scalar_mut_static(&Some(syn::Item::Static(s.clone())))
+        {
+            syn::visit::visit_item_static(self, s);
+            return;
+        }
         self.skip.get_or_insert(Skip::new(
             "global",
             format!("declares static `{}`", s.ident),

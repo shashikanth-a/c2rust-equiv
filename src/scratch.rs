@@ -289,6 +289,18 @@ fn heap_lib_source(
     for i in &cstr_args {
         arg_cmp += &format!("        assert!(same_cstr(a{i}, b{i}), \"string differs\");\n");
     }
+    // Each modelled scalar `static mut` global: both versions start from the
+    // same initializer, so their final values must agree (a read copies the
+    // value out, avoiding a reference to a `static mut`).
+    for g in old.items().iter().filter_map(|it| match it {
+        syn::Item::Static(s) if crate::unit::is_scalar_mut_static(s) => Some(s.ident.to_string()),
+        _ => None,
+    }) {
+        arg_cmp += &format!(
+            "        {{ let og = old::{g}; let ng = new::{g}; \
+             assert!(Bits::bits(&og) == Bits::bits(&ng), \"global {g} differs\"); }}\n"
+        );
+    }
     // `corr` is used only by struct-pointer comparisons; a C-string-only
     // signature has none, so declaring it unconditionally would warn.
     let needs_corr = matches!(shapes.ret, Shape::Heap(_)) || !heap_args.is_empty();
@@ -401,6 +413,12 @@ fn make_standalone(item: &mut syn::Item) {
         syn::Item::Type(t) => {
             t.attrs.clear();
             t.vis = public;
+        }
+        // Modelled scalar `static mut` globals: public so the harness can read
+        // and compare each version's final value.
+        syn::Item::Static(s) => {
+            s.attrs.clear();
+            s.vis = public;
         }
         _ => {}
     }

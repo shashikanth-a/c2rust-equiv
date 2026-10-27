@@ -234,6 +234,62 @@ fn tagged_union_path_does_not_prove_a_wrong_rewrite() {
     );
 }
 
+// A scalar `static mut` global side effect: both versions start from the same
+// initializer and the harness compares the final value, catching a divergent
+// global write even when the return value matches.
+const GLOBAL_DEF: &str = "static mut COUNTER: i32 = 0;";
+
+const GLOB_OLD: &str = r#"
+pub unsafe fn bump(p: *const i32) -> i32 {
+    if p.is_null() { return -1; }
+    COUNTER += *p;
+    *p
+}
+"#;
+
+const GLOB_OK: &str = r#"
+pub unsafe fn bump(p: *const i32) -> i32 {
+    if p.is_null() { return -1; }
+    COUNTER = COUNTER.wrapping_add(*p);
+    *p
+}
+"#;
+
+const GLOB_BAD: &str = r#"
+pub unsafe fn bump(p: *const i32) -> i32 {
+    if p.is_null() { return -1; }
+    COUNTER += *p + 1;
+    *p
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn scalar_global_side_effect_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(GLOB_OLD, &[GLOBAL_DEF]).unwrap();
+    let new = FnUnit::parse(GLOB_OK, &[GLOBAL_DEF]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn scalar_global_side_effect_catches_divergence() {
+    // Same return value, but a divergent write to the global.
+    let old = FnUnit::parse(GLOB_OLD, &[GLOBAL_DEF]).unwrap();
+    let new = FnUnit::parse(GLOB_BAD, &[GLOBAL_DEF]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent global write was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 // A `*mut c_char` output buffer: uppercase the first byte in place. The heap
 // path compares the buffer's post-state, so a divergent write is caught.
 const OUTBUF_OLD: &str = r#"
