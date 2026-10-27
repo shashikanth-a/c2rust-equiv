@@ -141,9 +141,10 @@ fn run(cli: &Cli) -> Result<u8, Box<dyn std::error::Error>> {
                 // A scalar-ineligible function may still be in scope for the
                 // heap path (it passes or returns a pointer to a struct the
                 // generator supports).
-                let heap = c2rust_equiv::extract_unvalidated(&old, e)
-                    .map(|u| c2rust_equiv::heap_eligible(&u))
-                    .unwrap_or(false);
+                let diag = c2rust_equiv::extract_heap(&old, e)
+                    .map_err(|s| format!("extract:{} ({})", s.category, s.detail))
+                    .and_then(|u| c2rust_equiv::heap_diagnose(&u));
+                let heap = diag.is_ok();
                 if heap {
                     heap_eligible_functions += 1;
                 }
@@ -153,6 +154,9 @@ fn run(cli: &Cli) -> Result<u8, Box<dyn std::error::Error>> {
                     "path": if heap { "heap" } else { "none" },
                     "category": skip.category,
                     "reason": skip.detail,
+                    // Why the heap path can't take it: the failing stage, so a
+                    // scan can see where effort would pay off.
+                    "heap_stage": diag.err(),
                 })
             }
         };
@@ -272,7 +276,15 @@ fn check_one(
             reason: format!("`{id}` is not in both crates"),
         });
     };
-    let old_unit = match extract(old, o) {
+    // Prefer the scalar extraction; if it rejects the function (typically for
+    // raw pointers), fall back to heap extraction, which keeps pointers and
+    // pulls in the structs they point to. `check` then routes to the heap path
+    // or, if that isn't viable, skips with the scalar reason.
+    let extract_either = |idx: &CrateIndex, e: usize| match extract(idx, e) {
+        Ok(u) => Ok(u),
+        Err(scalar_skip) => c2rust_equiv::extract_heap(idx, e).map_err(|_| scalar_skip),
+    };
+    let old_unit = match extract_either(old, o) {
         Ok(u) => u,
         Err(skip) => {
             return immediate(Status::Skipped {
@@ -281,7 +293,7 @@ fn check_one(
             })
         }
     };
-    let new_unit = match extract(new, n) {
+    let new_unit = match extract_either(new, n) {
         Ok(u) => u,
         Err(skip) => {
             return immediate(Status::Skipped {

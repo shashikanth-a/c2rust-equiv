@@ -80,8 +80,9 @@ fn cache_hits_on_rerun() {
     let (_, first) = run(&["--cache", cache]);
     assert_eq!(first["summary"]["cache_hits"], 0);
     let (_, second) = run(&["--cache", cache]);
-    // `read` is skipped before the cache is consulted.
-    assert_eq!(second["summary"]["cache_hits"], 2);
+    // All three checked functions are cached, including `read`, whose skip is
+    // now decided inside the check (its pointer isn't a heap shape) and cached.
+    assert_eq!(second["summary"]["cache_hits"], 3);
 }
 
 #[test]

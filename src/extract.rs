@@ -75,7 +75,20 @@ enum Res {
 /// Resolve a function into a self-contained unit (its callee closure) without
 /// checking whether it is in scope, so either path can apply its own checks.
 pub fn extract_unvalidated(index: &CrateIndex, entry: usize) -> Result<FnUnit, Skip> {
-    let resolver = Resolver { index };
+    extract_in(index, entry, false)
+}
+
+/// Like [`extract_unvalidated`], but in heap mode: raw pointers are allowed and
+/// the crate struct/union/enum types a function uses are pulled into the unit,
+/// so the heap generator can build them. Still rejects IO, globals, and
+/// unresolved or non-modelled foreign references during resolution; the heap
+/// body scope check (`FnUnit::heap_body_in_scope`) applies the rest.
+pub fn extract_heap(index: &CrateIndex, entry: usize) -> Result<FnUnit, Skip> {
+    extract_in(index, entry, true)
+}
+
+fn extract_in(index: &CrateIndex, entry: usize, heap: bool) -> Result<FnUnit, Skip> {
+    let resolver = Resolver { index, heap };
     let mut closure = BTreeSet::new();
     let mut queue = VecDeque::from([entry]);
     while let Some(e) = queue.pop_front() {
@@ -153,6 +166,10 @@ pub fn extract(index: &CrateIndex, entry: usize) -> Result<FnUnit, Skip> {
 
 struct Resolver<'a> {
     index: &'a CrateIndex,
+    /// In heap mode the resolver pulls crate struct/union/enum types into the
+    /// unit (so the generator can build them) instead of rejecting them, and
+    /// the analyzer allows raw pointers. The scalar path leaves this off.
+    heap: bool,
 }
 
 impl Resolver<'_> {
@@ -281,6 +298,9 @@ impl Resolver<'_> {
             Kind::Static | Kind::ForeignStatic => {
                 Res::Skip(Skip::new("global", format!("accesses `{shown}`")))
             }
+            // On the heap path a crate struct/union/enum is pulled into the
+            // unit so the generator can build it; the scalar path rejects it.
+            Kind::Type if self.heap => Res::Item(e),
             Kind::Type => Res::Skip(Skip::new("crate type", format!("uses `{shown}`"))),
             Kind::ForeignFn => {
                 let symbol = entry.symbol.as_deref().unwrap_or(&entry.name);
@@ -420,9 +440,15 @@ impl<'ast> Visit<'ast> for Analyzer<'_> {
         }
     }
 
-    fn visit_type_ptr(&mut self, _: &'ast syn::TypePtr) {
-        self.skip
-            .get_or_insert(Skip::new("raw pointer", "uses raw pointers"));
+    fn visit_type_ptr(&mut self, ptr: &'ast syn::TypePtr) {
+        // The heap path handles raw pointers; recurse so the pointee type is
+        // resolved and pulled into the unit. The scalar path rejects them.
+        if self.resolver.heap {
+            syn::visit::visit_type_ptr(self, ptr);
+        } else {
+            self.skip
+                .get_or_insert(Skip::new("raw pointer", "uses raw pointers"));
+        }
     }
 
     fn visit_item_static(&mut self, s: &'ast syn::ItemStatic) {

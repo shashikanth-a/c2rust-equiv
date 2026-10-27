@@ -139,6 +139,31 @@ fn out_of_scope_functions_are_skipped() {
 }
 
 #[test]
+fn heap_extraction_keeps_pointers_and_pulls_in_structs() {
+    // The scalar path rejects a pointer function; the heap path keeps it and
+    // pulls the pointee struct into the unit so the generator can build it.
+    let src = "pub struct Node { pub v: i32, pub next: *mut Node }\n\
+               pub unsafe fn sum(p: *mut Node) -> i64 {\n\
+               \x20   if p.is_null() { 0 } else { (*p).v as i64 }\n\
+               }";
+    let mut index = CrateIndex::default();
+    index.add_source("src/lib.rs", src).unwrap();
+    let [e] = index.find_functions("sum")[..] else {
+        panic!("sum not found")
+    };
+    // Scalar extraction refuses the raw pointer.
+    assert_eq!(
+        extract(&index, e).map(|_| ()).map_err(|s| s.category),
+        Err("raw pointer".into())
+    );
+    // Heap extraction succeeds and includes the `Node` struct definition.
+    let unit = c2rust_equiv::extract_heap(&index, e).expect("heap extraction");
+    let source = unit.source();
+    assert!(source.contains("pub struct Node"), "{source}");
+    assert!(source.contains("next: *mut Node"), "{source}");
+}
+
+#[test]
 fn ids_name_file_and_function() {
     let index = index();
     let ids: Vec<String> = index.functions().map(|e| index.id(e)).collect();

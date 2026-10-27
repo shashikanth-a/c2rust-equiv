@@ -262,15 +262,27 @@ fn skipped(category: String, reason: String) -> Status {
 /// test for one version (the live path additionally requires both versions to
 /// share the same shape).
 pub fn heap_eligible(unit: &FnUnit) -> bool {
-    let Some(index) = index_of(unit) else {
-        return false;
-    };
-    let Ok(shapes) = heapgen::signature_shapes(&index, &unit.function.sig) else {
-        return false;
-    };
-    shapes.needs_heap()
-        && unit.heap_body_in_scope().is_ok()
-        && heapgen::generate_all(&index, &shapes.structs, "old", "new").is_ok()
+    heap_diagnose(unit).is_ok()
+}
+
+/// Like [`heap_eligible`], but naming the stage that puts the function out of
+/// the heap path's scope, so a scan can see where effort would pay off:
+/// `"signature"` (an argument/return the generator can't shape), `"not-heap"`
+/// (all scalars -- the scalar path handles it), `"body"` (IO, a global, or a
+/// foreign or crate call), or `"generate:<reason>"` (a struct field it can't
+/// build). `Ok(())` means in scope.
+pub fn heap_diagnose(unit: &FnUnit) -> Result<(), String> {
+    let index = index_of(unit).ok_or("index")?;
+    let shapes = heapgen::signature_shapes(&index, &unit.function.sig)
+        .map_err(|u| format!("signature: {}", u.detail))?;
+    if !shapes.needs_heap() {
+        return Err("not-heap".to_owned());
+    }
+    unit.heap_body_in_scope()
+        .map_err(|s| format!("body: {} ({})", s.detail, s.category))?;
+    heapgen::generate_all(&index, &shapes.structs, "old", "new")
+        .map_err(|u| format!("generate: {} field `{}`: {}", u.struct_name, u.field, u.detail))?;
+    Ok(())
 }
 
 /// A crate index over a unit's own items, so the generator can see its structs.
