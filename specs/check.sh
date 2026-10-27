@@ -6,7 +6,7 @@ jar=${1:?path to tla2tools.jar}
 cd "$(dirname "$0")"
 status=0
 for cfg in *.cfg; do
-    spec=$(echo "$cfg" | sed -E 's/(NoGuard|Limits|Targeted)?\.cfg$//').tla
+    spec=$(echo "$cfg" | sed -E 's/(NoGuard|Limits|Targeted|ArgsOnly)?\.cfg$//').tla
     if head -1 "$cfg" | grep -q "Must fail"; then want=fail; else want=pass; fi
     if java -XX:+UseParallelGC -cp "$jar" tlc2.TLC -config "$cfg" -workers auto -deadlock \
         -cleanup -metadir "${TMPDIR:-/tmp}/tlc-$$" "$spec" > "${TMPDIR:-/tmp}/tlc-$$.log" 2>&1; then

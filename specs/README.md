@@ -21,3 +21,13 @@ specs/check.sh path/to/tla2tools.jar   # TLA+ tools 1.7.4
     Kani found can come back as a fallback to testing.
   - `VerdictTargeted.cfg`: with targeted reruns, every difference Kani finds is
     reported as a counterexample.
+- `Oracle.tla`: shared memoized stubs for unchanged callees. A memoized stub
+  is an arbitrary function of its key, so "old and new agree under every
+  stub" implies "they agree under every real callee" only when the key
+  determines everything the callee reads.
+  - `Oracle.cfg`: keyed by the argument and the state the callee reads, the
+    stub is sound.
+  - `OracleArgsOnly.cfg` (must fail): keyed by the argument alone, the stub
+    hides a rewrite that changes state the callee reads and then restores it.
+  - Checked with up to one call per run. Two calls make the program space too
+    large to enumerate.
