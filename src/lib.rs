@@ -8,6 +8,7 @@
 mod allocmodel;
 pub mod cache;
 mod modref;
+mod summary;
 pub mod check;
 pub mod crate_index;
 pub mod extract;

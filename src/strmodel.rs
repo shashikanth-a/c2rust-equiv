@@ -85,7 +85,7 @@ fn is_trace_sig(sig: &syn::Signature) -> bool {
 
 /// How a trace argument is recorded: its bit expression and kind tag
 /// (0 scalar/float, 1 NUL-terminated string, 2 pointer by bijection).
-fn arg_kind_bits(name: &str, ty: &str) -> (String, u8) {
+pub(crate) fn arg_kind_bits(name: &str, ty: &str) -> (String, u8) {
     let t = ty.trim();
     if t.starts_with('*') {
         // A pointer: a `c_char`/`c_uchar` pointee is a string (compared by
@@ -137,7 +137,7 @@ fn trace_body(name: &str, args: &[(String, String)], ret: &str) -> String {
 
 /// A 64-bit id for an oracle function, stable across the two versions (both
 /// hash the same name) and distinct between functions (FNV-1a).
-fn oracle_id(name: &str) -> u64 {
+pub(crate) fn oracle_id(name: &str) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in name.bytes() {
         h ^= b as u64;
@@ -148,7 +148,7 @@ fn oracle_id(name: &str) -> u64 {
 
 /// Classify a scalar type's spelling as float (and width) or integer, for
 /// extracting its bits into an oracle key and rebuilding a result.
-fn float_width(ty: &str) -> Option<u32> {
+pub(crate) fn float_width(ty: &str) -> Option<u32> {
     let last = ty.rsplit("::").next().unwrap_or(ty).trim();
     match last {
         "f64" | "c_double" => Some(64),
