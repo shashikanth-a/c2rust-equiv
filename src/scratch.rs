@@ -226,6 +226,14 @@ fn heap_lib_source(
                 new_args.push(format!("b{i}"));
                 heap_args.push((i, name));
             }
+            // A read-only C string: both versions get identical bytes, and
+            // there's no post-state to compare.
+            Shape::CStr => {
+                build += &format!("        let a{i} = gen_cstr();\n");
+                clone += &format!("        let b{i} = clone_cstr(a{i});\n");
+                old_args.push(format!("a{i}"));
+                new_args.push(format!("b{i}"));
+            }
         }
     }
     let old_call = format!("old::{old_name}({})", old_args.join(", "));
@@ -240,12 +248,29 @@ fn heap_lib_source(
         Shape::Heap(name) => {
             format!("        assert!(same_{name}(o, n, &mut corr), \"results differ\");\n")
         }
+        // `signature_shapes` rejects a `*const c_char` return, so this can't arise.
+        Shape::CStr => unreachable!("a C string return is not a supported shape"),
     };
     let mut arg_cmp = String::new();
     for (i, name) in &heap_args {
         arg_cmp +=
             &format!("        assert!(same_{name}(a{i}, b{i}, &mut corr), \"heaps differ\");\n");
     }
+    // `corr` is used only by struct-pointer comparisons; a C-string-only
+    // signature has none, so declaring it unconditionally would warn.
+    let needs_corr = matches!(shapes.ret, Shape::Heap(_)) || !heap_args.is_empty();
+    let corr_decl = if needs_corr {
+        "        let mut corr = Corr::default();\n"
+    } else {
+        ""
+    };
+    // The clone map preserves aliasing between struct-pointer arguments; C
+    // strings are cloned without it, so a C-string-only signature needs none.
+    let map_decl = if heap_args.is_empty() {
+        ""
+    } else {
+        "        let mut map = CloneMap::default();\n"
+    };
 
     let harness = |name: &str, first_new: bool| {
         let calls = if first_new {
@@ -258,10 +283,10 @@ fn heap_lib_source(
              \x20   #[kani::unwind({unwind})]\n\
              \x20   fn {name}() {{ unsafe {{\n\
              {build}\
-             \x20       let mut map = CloneMap::default();\n\
+             {map_decl}\
              {clone}\
              {calls}\
-             \x20       let mut corr = Corr::default();\n\
+             {corr_decl}\
              {ret_cmp}{arg_cmp}\
              \x20   }} }}\n"
         )

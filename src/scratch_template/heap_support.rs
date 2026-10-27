@@ -42,6 +42,55 @@ impl Bits for () {
 /// Kani far slower. Overflowing it is a bug in the bound, so it panics.
 pub const HEAP_CAP: usize = 128;
 
+/// The longest C string, including the NUL terminator, a symbolic buffer holds.
+/// Kept small: a symbolic string length explodes Kani's search quickly.
+pub const CSTR_CAP: usize = 6;
+
+/// A bounded, NUL-terminated symbolic C string on the heap. The last byte is
+/// always NUL, so any read that stops at a NUL stays in bounds whatever the
+/// interior bytes are; interior bytes are symbolic and may themselves be NUL.
+/// Returned as a raw pointer the callee treats as `*const c_char`.
+pub unsafe fn gen_cstr() -> *mut core::ffi::c_char {
+    let mut buf = Box::new([0 as core::ffi::c_char; CSTR_CAP]);
+    for b in buf.iter_mut().take(CSTR_CAP - 1) {
+        *b = kani::any();
+    }
+    buf[CSTR_CAP - 1] = 0;
+    Box::into_raw(buf) as *mut core::ffi::c_char
+}
+
+/// A byte-for-byte copy of a `gen_cstr` buffer into a fresh allocation, so both
+/// versions receive identical strings. `src` must be null or a `gen_cstr`
+/// buffer, so reading `CSTR_CAP` bytes from it is in bounds.
+pub unsafe fn clone_cstr(src: *const core::ffi::c_char) -> *mut core::ffi::c_char {
+    if src.is_null() {
+        return core::ptr::null_mut();
+    }
+    let mut buf = Box::new([0 as core::ffi::c_char; CSTR_CAP]);
+    for (i, b) in buf.iter_mut().enumerate() {
+        *b = *src.add(i);
+    }
+    Box::into_raw(buf) as *mut core::ffi::c_char
+}
+
+/// Whether two `gen_cstr` buffers hold the same bytes up to and including the
+/// first NUL. Both must be null or `gen_cstr` buffers.
+pub unsafe fn same_cstr(a: *const core::ffi::c_char, b: *const core::ffi::c_char) -> bool {
+    if a.is_null() || b.is_null() {
+        return a.is_null() == b.is_null();
+    }
+    for i in 0..CSTR_CAP {
+        let x = *a.add(i);
+        if x != *b.add(i) {
+            return false;
+        }
+        if x == 0 {
+            break;
+        }
+    }
+    true
+}
+
 /// The result of linking a pair into the correspondence map.
 pub enum Link {
     New,

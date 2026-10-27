@@ -44,6 +44,11 @@ enum Field {
     /// `kani::any()`, copied whole (arrays of scalars are `Copy`), compared
     /// with `==` (arrays are `PartialEq` for every length).
     ScalarArray,
+    /// A `*const c_char`: a bounded, NUL-terminated symbolic C string, built
+    /// with `gen_cstr`, copied with `clone_cstr`, compared with `same_cstr`.
+    /// Only `*const` (read-only): a `*mut c_char` may be an output buffer, which
+    /// this doesn't model, so it stays unsupported rather than falsely equal.
+    CStr,
 }
 
 /// The generated builder, cloner and comparer for one struct, plus the structs
@@ -133,9 +138,18 @@ fn classify(ty: &syn::Type, structs: &BTreeSet<&String>) -> Result<Field, String
             return Ok(Field::Scalar(name));
         }
     }
-    // A raw pointer to a struct we can build.
+    // A raw pointer to a struct we can build, or a `*const c_char` C string.
     if let syn::Type::Ptr(ptr) = ty {
         if let Some(name) = last_segment(&ptr.elem) {
+            // A read-only C string. `*mut c_char` is excluded: it may be an
+            // output buffer this doesn't compare, so treating it as input-only
+            // could call a divergent rewrite equivalent.
+            if name == "c_char" {
+                if ptr.mutability.is_some() {
+                    return Err("`*mut c_char` may be an output buffer".to_owned());
+                }
+                return Ok(Field::CStr);
+            }
             if structs.contains(&name) {
                 return Ok(Field::Pointer(name));
             }
@@ -248,6 +262,10 @@ pub enum Shape {
     /// A raw pointer to a named struct: built with `gen_<T>` and cloned with
     /// `clone_<T>`, compared with `same_<T>`.
     Heap(String),
+    /// A `*const c_char` argument: a bounded, NUL-terminated symbolic C string,
+    /// built with `gen_cstr` and cloned with `clone_cstr`. Read-only, so there
+    /// is no post-state to compare.
+    CStr,
 }
 
 /// The shapes of a function's arguments and return value for the heap path.
@@ -258,6 +276,16 @@ pub struct SigShapes {
     /// The structs named directly in the signature, so the caller knows which
     /// builders to generate (then closed over each one's `referenced` set).
     pub structs: BTreeSet<String>,
+}
+
+impl SigShapes {
+    /// Whether any argument or the return value is a pointer or C string the
+    /// heap path must build, so the scalar path can't handle this function.
+    pub fn needs_heap(&self) -> bool {
+        std::iter::once(&self.ret)
+            .chain(&self.args)
+            .any(|s| !matches!(s, Shape::Scalar))
+    }
 }
 
 /// Classify a function signature for the heap path: every argument and the
@@ -283,6 +311,7 @@ pub fn signature_shapes(
         }
         match classify(ty, &names)? {
             Field::Scalar(_) | Field::ScalarArray => Ok(Shape::Scalar),
+            Field::CStr => Ok(Shape::CStr),
             Field::Pointer(target) => {
                 structs.insert(target.clone());
                 Ok(Shape::Heap(target))
@@ -310,11 +339,22 @@ pub fn signature_shapes(
     let ret = match &sig.output {
         syn::ReturnType::Default => Shape::Scalar,
         syn::ReturnType::Type(_, ty) => {
-            shape_of(ty, &mut structs).map_err(|detail| Unsupported {
+            let shape = shape_of(ty, &mut structs).map_err(|detail| Unsupported {
                 struct_name: String::new(),
                 field: "<return>".to_owned(),
                 detail,
-            })?
+            })?;
+            // A returned C string may point into a caller buffer, a static, or
+            // fresh storage of unknown length; reading it as a `gen_cstr` buffer
+            // could run off the end. Only string arguments are modelled.
+            if shape == Shape::CStr {
+                return Err(Unsupported {
+                    struct_name: String::new(),
+                    field: "<return>".to_owned(),
+                    detail: "returns `*const c_char`, whose length is unknown".to_owned(),
+                });
+            }
+            shape
         }
     };
 
@@ -330,6 +370,7 @@ fn builder(struct_name: &str, old: &str, fields: &[(String, Field)]) -> String {
         let value = match field {
             Field::Scalar(_) => "kani::any()".to_owned(),
             Field::ScalarArray => "core::array::from_fn(|_| kani::any())".to_owned(),
+            Field::CStr => "gen_cstr()".to_owned(),
             Field::Pointer(target) => format!("gen_{target}(depth - 1)"),
         };
         inits += &format!("            {name}: {value},\n");
@@ -360,6 +401,10 @@ fn cloner(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)]) -
             // Scalars and scalar arrays are `Copy`: copy them in the initializer.
             Field::Scalar(_) | Field::ScalarArray => {
                 inits += &format!("        {name}: (*src).{name},\n")
+            }
+            // A C string is copied whole; it can't form cycles, so no linking.
+            Field::CStr => {
+                inits += &format!("        {name}: clone_cstr((*src).{name}),\n");
             }
             Field::Pointer(target) => {
                 inits += &format!("        {name}: core::ptr::null_mut(),\n");
@@ -398,6 +443,10 @@ fn comparer(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)])
             // Arrays of scalars are `PartialEq` for every length, like scalars.
             Field::Scalar(_) | Field::ScalarArray => {
                 format!("    if (*a).{name} != (*b).{name} {{ return false; }}\n")
+            }
+            // Compare C strings by content up to the first NUL.
+            Field::CStr => {
+                format!("    if !same_cstr((*a).{name}, (*b).{name}) {{ return false; }}\n")
             }
             Field::Pointer(target) => format!(
                 "    if !same_{target}((*a).{name}, (*b).{name}, corr) {{ return false; }}\n",
@@ -585,6 +634,53 @@ mod tests {
         let roots = ["A".to_owned()].into_iter().collect();
         let err = generate_all(&index(src), &roots, "old", "new").unwrap_err();
         assert_eq!(err.struct_name, "B");
+    }
+
+    #[test]
+    fn const_c_char_field_is_a_c_string() {
+        let src = "pub struct S { pub name: *const c_char, pub n: i32 }";
+        let g = generate(&index(src), "S", "old", "new").unwrap();
+        assert!(g.referenced.is_empty());
+        assert!(g.builder.contains("name: gen_cstr(),"));
+        assert!(g.cloner.contains("name: clone_cstr((*src).name),"));
+        assert!(g
+            .comparer
+            .contains("if !same_cstr((*a).name, (*b).name) { return false; }"));
+    }
+
+    #[test]
+    fn mut_c_char_field_is_unsupported() {
+        // A `*mut c_char` may be an output buffer, which isn't modelled.
+        let src = "pub struct S { pub buf: *mut c_char }";
+        let err = generate(&index(src), "S", "old", "new").unwrap_err();
+        assert_eq!(err.field, "buf");
+        assert!(err.detail.contains("output buffer"));
+    }
+
+    #[test]
+    fn const_c_char_argument_is_a_c_string_shape() {
+        let idx = index("pub struct T { pub v: i32 }");
+        let s = signature_shapes(&idx, &sig("fn f(s: *const c_char) -> size_t")).unwrap();
+        assert_eq!(s.args, vec![Shape::CStr]);
+        assert_eq!(s.ret, Shape::Scalar);
+        assert!(s.structs.is_empty());
+        assert!(s.needs_heap());
+    }
+
+    #[test]
+    fn returned_c_string_is_unsupported() {
+        // A returned `*const c_char` has unknown length; only arguments are built.
+        let idx = index("pub struct T { pub v: i32 }");
+        let err = signature_shapes(&idx, &sig("fn f(s: *const c_char) -> *const c_char")).unwrap_err();
+        assert_eq!(err.field, "<return>");
+        assert!(err.detail.contains("length is unknown"));
+    }
+
+    #[test]
+    fn mut_c_char_argument_is_unsupported() {
+        let idx = index("pub struct T { pub v: i32 }");
+        let err = signature_shapes(&idx, &sig("fn f(s: *mut c_char)")).unwrap_err();
+        assert!(err.detail.contains("output buffer"));
     }
 
     #[test]

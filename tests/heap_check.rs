@@ -52,9 +52,13 @@ pub unsafe fn sum(p: *mut Node) -> i64 {
 "#;
 
 fn opts() -> Options {
+    opts_unwind(5)
+}
+
+fn opts_unwind(unwind: u32) -> Options {
     let dir = tempfile::tempdir().unwrap().keep();
     let mut o = Options::new(dir);
-    o.unwind = 5;
+    o.unwind = unwind;
     o.kani_timeout = Duration::from_secs(120);
     o
 }
@@ -81,6 +85,77 @@ fn heap_path_does_not_prove_a_wrong_rewrite() {
     // Soundness: a real difference must never be reported as a proof. Without a
     // native heap runner the tool can't confirm the counterexample, so it skips
     // with a reason rather than proving.
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a wrong rewrite was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
+// A checksum over a `*const c_char`, read as a NUL-terminated C string. The
+// argument exercises the C-string path (`gen_cstr`/`clone_cstr`): both versions
+// get identical symbolic strings and the scalar result is compared.
+const CKSUM_OLD: &str = r#"
+pub unsafe fn cksum(s: *const core::ffi::c_char) -> i64 {
+    if s.is_null() { return -1; }
+    let mut total: i64 = 0;
+    let mut p = s;
+    while *p != 0 {
+        total += *p as i64;
+        p = p.add(1);
+    }
+    total
+}
+"#;
+
+// An idiomatic rewrite: index instead of a moving pointer, same behaviour.
+const CKSUM_OK: &str = r#"
+pub unsafe fn cksum(s: *const core::ffi::c_char) -> i64 {
+    if s.is_null() { return -1; }
+    let mut total = 0i64;
+    let mut i = 0isize;
+    loop {
+        let c = *s.offset(i);
+        if c == 0 { return total; }
+        total += c as i64;
+        i += 1;
+    }
+}
+"#;
+
+// A wrong rewrite: skips the first byte, so non-empty strings differ.
+const CKSUM_BAD: &str = r#"
+pub unsafe fn cksum(s: *const core::ffi::c_char) -> i64 {
+    if s.is_null() { return -1; }
+    let mut total = 0i64;
+    let mut p = s.add(1);
+    while *p != 0 {
+        total += *p as i64;
+        p = p.add(1);
+    }
+    total
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn c_string_path_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(CKSUM_OLD, &[]).unwrap();
+    let new = FnUnit::parse(CKSUM_OK, &[]).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn c_string_path_does_not_prove_a_wrong_rewrite() {
+    let old = FnUnit::parse(CKSUM_OLD, &[]).unwrap();
+    let new = FnUnit::parse(CKSUM_BAD, &[]).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
     assert!(
         !matches!(outcome.status, Status::Proved { .. }),
         "a wrong rewrite was proved equivalent: {:?}",

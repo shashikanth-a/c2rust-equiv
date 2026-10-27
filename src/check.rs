@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::crate_index::CrateIndex;
-use crate::heapgen::{self, Shape, SigShapes};
+use crate::heapgen::{self, SigShapes};
 use crate::kani;
 use crate::process;
 use crate::scratch;
@@ -268,9 +268,7 @@ pub fn heap_eligible(unit: &FnUnit) -> bool {
     let Ok(shapes) = heapgen::signature_shapes(&index, &unit.function.sig) else {
         return false;
     };
-    let has_heap = shapes.args.iter().any(|s| matches!(s, Shape::Heap(_)))
-        || matches!(shapes.ret, Shape::Heap(_));
-    has_heap
+    shapes.needs_heap()
         && unit.heap_body_in_scope().is_ok()
         && heapgen::generate_all(&index, &shapes.structs, "old", "new").is_ok()
 }
@@ -296,9 +294,7 @@ fn index_of(unit: &FnUnit) -> Option<CrateIndex> {
 fn heap_plan(old: &FnUnit, new: &FnUnit) -> Option<(SigShapes, String)> {
     let index = index_of(old)?;
     let shapes = heapgen::signature_shapes(&index, &old.function.sig).ok()?;
-    let has_heap = shapes.args.iter().any(|s| matches!(s, Shape::Heap(_)))
-        || matches!(shapes.ret, Shape::Heap(_));
-    if !has_heap {
+    if !shapes.needs_heap() {
         return None;
     }
     // The rewrite must have the same shape, or it isn't a drop-in replacement.
