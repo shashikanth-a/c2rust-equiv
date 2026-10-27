@@ -73,6 +73,56 @@ pub unsafe fn clone_cstr(src: *const core::ffi::c_char) -> *mut core::ffi::c_cha
     Box::into_raw(buf) as *mut core::ffi::c_char
 }
 
+/// The most distinct oracle calls a run records. A pure external function is
+/// modelled as an uninterpreted function: the same `(id, key)` always yields
+/// the same symbolic value, so both versions agree for equal arguments.
+pub const ORACLE_CAP: usize = 64;
+
+/// A shared memo of oracle results, keyed by `(function id, argument bits)`.
+/// Both versions consult the same table, so a pure external call returns the
+/// same value for the same arguments in each -- and a divergence in arguments
+/// surfaces as differing results. Sound only for deterministic, side-effect
+/// free functions.
+pub struct Oracle {
+    keys: [(u64, u128); ORACLE_CAP],
+    vals: [u128; ORACLE_CAP],
+    len: usize,
+}
+
+impl Default for Oracle {
+    fn default() -> Self {
+        Oracle {
+            keys: [(0, 0); ORACLE_CAP],
+            vals: [0; ORACLE_CAP],
+            len: 0,
+        }
+    }
+}
+
+impl Oracle {
+    pub fn get(&mut self, id: u64, key: u128) -> u128 {
+        for i in 0..self.len {
+            if self.keys[i] == (id, key) {
+                return self.vals[i];
+            }
+        }
+        assert!(self.len < ORACLE_CAP, "oracle exceeds ORACLE_CAP");
+        let v: u128 = kani::any();
+        self.keys[self.len] = (id, key);
+        self.vals[self.len] = v;
+        self.len += 1;
+        v
+    }
+}
+
+/// The one shared oracle for a run. Both versions' modelled external calls go
+/// through it, so equal arguments give equal results across versions.
+pub static mut ORACLE: Oracle = Oracle {
+    keys: [(0, 0); ORACLE_CAP],
+    vals: [0; ORACLE_CAP],
+    len: 0,
+};
+
 /// A pointer to a single symbolic scalar on the heap, or null. Models a
 /// `*mut T`/`*const T` argument or field that points at one value (a scalar
 /// out-parameter, say). A function that instead indexes it as an array past

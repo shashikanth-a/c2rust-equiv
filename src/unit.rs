@@ -329,6 +329,8 @@ pub(crate) fn is_modelled_c_fn(name: &str) -> bool {
         // and errno accessor (a per-run cell), also defined by `strmodel`.
         | "__assert_rtn" | "__assert_fail" | "__error" | "__errno_location"
     )
+    // Pure math / ctype functions, modelled as argument-keyed oracles.
+    || crate::strmodel::is_pure_oracle(name)
 }
 
 /// Finds constructs that are out of scope in a self-contained unit.

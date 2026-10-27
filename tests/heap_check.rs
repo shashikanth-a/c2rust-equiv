@@ -234,6 +234,58 @@ fn tagged_union_path_does_not_prove_a_wrong_rewrite() {
     );
 }
 
+// A pure external function (`fmod`) modelled as an argument-keyed oracle: both
+// versions calling it with equal arguments get equal results.
+const FMOD_DECL: &str = "extern \"C\" { fn fmod(_: f64, _: f64) -> f64; }";
+
+const ORACLE_OLD: &str = r#"
+pub unsafe fn m(p: *const f64) -> f64 {
+    if p.is_null() { return 0.0; }
+    fmod(*p, 2.0)
+}
+"#;
+
+const ORACLE_OK: &str = r#"
+pub unsafe fn m(p: *const f64) -> f64 {
+    if p.is_null() { return 0.0; }
+    let two = 2.0f64;
+    fmod(*p, two)
+}
+"#;
+
+const ORACLE_BAD: &str = r#"
+pub unsafe fn m(p: *const f64) -> f64 {
+    if p.is_null() { return 0.0; }
+    fmod(*p, 3.0)
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn pure_oracle_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(ORACLE_OLD, &[FMOD_DECL]).unwrap();
+    let new = FnUnit::parse(ORACLE_OK, &[FMOD_DECL]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn pure_oracle_catches_divergent_arguments() {
+    let old = FnUnit::parse(ORACLE_OLD, &[FMOD_DECL]).unwrap();
+    let new = FnUnit::parse(ORACLE_BAD, &[FMOD_DECL]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "divergent oracle arguments proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 // A scalar `static mut` global side effect: both versions start from the same
 // initializer and the harness compares the final value, catching a divergent
 // global write even when the return value matches.

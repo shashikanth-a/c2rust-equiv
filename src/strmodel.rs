@@ -32,7 +32,74 @@ pub fn is_str_model(name: &str) -> bool {
             | "__assert_fail"
             | "__error"
             | "__errno_location"
+    ) || is_pure_oracle(name)
+}
+
+/// Pure, deterministic libc functions of scalar arguments: math, and the
+/// `ctype` classifiers/converters. Modelled as uninterpreted functions keyed
+/// by their arguments (so both versions agree for equal arguments). Sound
+/// because they are side-effect free and depend only on their arguments.
+pub fn is_pure_oracle(name: &str) -> bool {
+    matches!(
+        name,
+        // <math.h>, one or two floating-point arguments.
+        "exp" | "exp2" | "log" | "log2" | "log10" | "sqrt" | "cbrt" | "sin" | "cos" | "tan"
+            | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "fabs" | "ceil" | "floor"
+            | "round" | "trunc" | "rint" | "nearbyint"
+            | "fmod" | "pow" | "atan2" | "hypot" | "copysign" | "fmax" | "fmin" | "fdim"
+        // <ctype.h> and integer helpers, one integer argument.
+            | "abs" | "labs" | "toupper" | "tolower" | "isdigit" | "isalpha" | "isspace"
+            | "isupper" | "islower" | "isalnum" | "ispunct" | "iscntrl" | "isprint"
+            | "isxdigit" | "isgraph" | "isblank"
     )
+}
+
+/// A 64-bit id for an oracle function, stable across the two versions (both
+/// hash the same name) and distinct between functions (FNV-1a).
+fn oracle_id(name: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in name.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Classify a scalar type's spelling as float (and width) or integer, for
+/// extracting its bits into an oracle key and rebuilding a result.
+fn float_width(ty: &str) -> Option<u32> {
+    let last = ty.rsplit("::").next().unwrap_or(ty).trim();
+    match last {
+        "f64" | "c_double" => Some(64),
+        "f32" | "c_float" => Some(32),
+        _ => None,
+    }
+}
+
+/// The body of a pure-oracle shim: combine the arguments' bits into a key,
+/// look the result up in the shared oracle, and rebuild the return type.
+fn oracle_body(name: &str, args: &[(String, String)], ret: &str) -> Option<String> {
+    if args.is_empty() || args.len() > 2 {
+        return None;
+    }
+    let bits = |(n, t): &(String, String)| match float_width(t) {
+        Some(_) => format!("({n}.to_bits() as u128)"),
+        None => format!("({n} as u128)"),
+    };
+    let key = match args {
+        [a] => bits(a),
+        [a, b] => format!("({} | ({} << 64))", bits(a), bits(b)),
+        _ => unreachable!(),
+    };
+    let id = oracle_id(name);
+    let v = format!("crate::support::ORACLE.get({id}u64, {key})");
+    let result = match float_width(ret) {
+        Some(32) => format!("f32::from_bits({v} as u32) as {ret}"),
+        Some(_) => format!("f64::from_bits({v} as u64) as {ret}"),
+        None if ret == "()" => format!("{{ let _ = {v}; }}"),
+        None => format!("{v} as {ret}"),
+    };
+    Some(format!("{{ {result} }}"))
 }
 
 /// Replace every `extern` declaration of a modelled C string function with a
@@ -83,8 +150,12 @@ fn define(name: &str, sig: &syn::Signature) -> Option<syn::ItemFn> {
         syn::ReturnType::Default => "()".to_owned(),
         syn::ReturnType::Type(_, t) => t.to_token_stream().to_string(),
     };
-    let names: Vec<&str> = params.iter().map(|(n, _)| n.as_str()).collect();
-    let body = body(name, &names, &ret)?;
+    let body = if is_pure_oracle(name) {
+        oracle_body(name, &params, &ret)?
+    } else {
+        let names: Vec<&str> = params.iter().map(|(n, _)| n.as_str()).collect();
+        body(name, &names, &ret)?
+    };
     let decl = params
         .iter()
         .map(|(n, t)| format!("{n}: {t}"))
