@@ -234,6 +234,66 @@ fn tagged_union_path_does_not_prove_a_wrong_rewrite() {
     );
 }
 
+// A side-effecting external (`emit`) modelled as an observable trace call:
+// both versions must make the same calls in the same order, catching a
+// divergence that the return value alone would miss.
+const EMIT_DECL: &str = "extern \"C\" { fn emit(_: i32); }";
+
+const TRACE_OLD: &str = r#"
+pub unsafe fn f(p: *const i32) -> i32 {
+    if p.is_null() { return 0; }
+    emit(*p);
+    emit(*p + 1);
+    *p
+}
+"#;
+
+const TRACE_OK: &str = r#"
+pub unsafe fn f(p: *const i32) -> i32 {
+    if p.is_null() { return 0; }
+    let v = *p;
+    emit(v);
+    emit(v + 1);
+    v
+}
+"#;
+
+// Same return, but the external calls are made in the opposite order.
+const TRACE_BAD: &str = r#"
+pub unsafe fn f(p: *const i32) -> i32 {
+    if p.is_null() { return 0; }
+    emit(*p + 1);
+    emit(*p);
+    *p
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn external_trace_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(TRACE_OLD, &[EMIT_DECL]).unwrap();
+    let new = FnUnit::parse(TRACE_OK, &[EMIT_DECL]).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(40));
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn external_trace_catches_reordered_side_effects() {
+    let old = FnUnit::parse(TRACE_OLD, &[EMIT_DECL]).unwrap();
+    let new = FnUnit::parse(TRACE_BAD, &[EMIT_DECL]).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(16));
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "reordered side effects proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 // A pure external function (`fmod`) modelled as an argument-keyed oracle: both
 // versions calling it with equal arguments get equal results.
 const FMOD_DECL: &str = "extern \"C\" { fn fmod(_: f64, _: f64) -> f64; }";

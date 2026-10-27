@@ -54,6 +54,65 @@ pub fn is_pure_oracle(name: &str) -> bool {
     )
 }
 
+/// Whether a foreign function can be modelled by the external-call trace: not
+/// variadic, and every argument a scalar or float (recorded by value). Such a
+/// call is an observable event -- both versions must make the same calls in the
+/// same order (VOC/CoVaC observable-behaviour equivalence). Pointer and string
+/// arguments need correspondence-based comparison and aren't handled yet.
+pub fn is_trace_modellable(item: &Option<syn::Item>) -> bool {
+    matches!(item, Some(syn::Item::ForeignMod(m))
+        if matches!(m.items.as_slice(), [syn::ForeignItem::Fn(f)] if is_trace_sig(&f.sig)))
+}
+
+fn is_trace_sig(sig: &syn::Signature) -> bool {
+    if sig.variadic.is_some() || sig.inputs.len() > 3 {
+        return false;
+    }
+    // A diverging function (`-> !`) isn't modelled as a returning trace call.
+    if matches!(&sig.output, syn::ReturnType::Type(_, t) if matches!(&**t, syn::Type::Never(_))) {
+        return false;
+    }
+    sig.inputs.iter().all(|a| match a {
+        syn::FnArg::Typed(pt) => scalar_or_float(&pt.ty.to_token_stream().to_string()),
+        syn::FnArg::Receiver(_) => false,
+    })
+}
+
+/// Whether a type's spelling is a scalar or float the trace records by value.
+fn scalar_or_float(ty: &str) -> bool {
+    let last = ty.rsplit("::").next().unwrap_or(ty).trim();
+    float_width(ty).is_some()
+        || crate::scalar::primitive(last).is_some()
+        || crate::scalar::c_type(last).is_some()
+        || crate::scalar::libc_typedef(last).is_some()
+}
+
+/// The body of a trace shim: record `(id, args)` as an observable call and
+/// return the shared symbolic result, rebuilt to the return type.
+fn trace_body(name: &str, args: &[(String, String)], ret: &str) -> String {
+    let mut slots = [String::from("0u128"), String::from("0u128"), String::from("0u128")];
+    for (i, (n, t)) in args.iter().enumerate() {
+        slots[i] = match float_width(t) {
+            Some(_) => format!("({n}.to_bits() as u128)"),
+            None => format!("({n} as u128)"),
+        };
+    }
+    let id = oracle_id(name);
+    let v = format!(
+        "(*core::ptr::addr_of_mut!(crate::support::TRACE)).step({id}u64, [{}, {}, {}])",
+        slots[0], slots[1], slots[2]
+    );
+    let result = match float_width(ret) {
+        Some(32) => format!("f32::from_bits({v} as u32) as {ret}"),
+        Some(_) => format!("f64::from_bits({v} as u64) as {ret}"),
+        None if ret == "()" => format!("{{ let _ = {v}; }}"),
+        // A pointer result goes through `usize`; a scalar casts directly.
+        None if ret.trim_start().starts_with('*') => format!("{v} as usize as {ret}"),
+        None => format!("{v} as {ret}"),
+    };
+    format!("{{ {result} }}")
+}
+
 /// A 64-bit id for an oracle function, stable across the two versions (both
 /// hash the same name) and distinct between functions (FNV-1a).
 fn oracle_id(name: &str) -> u64 {
@@ -112,7 +171,12 @@ pub fn inject(items: &mut Vec<syn::Item>) {
             m.items.retain(|it| {
                 if let syn::ForeignItem::Fn(f) = it {
                     let name = f.sig.ident.to_string();
-                    if is_str_model(&name) {
+                    // A string/oracle model, or any other non-variadic scalar
+                    // external modelled as an observable trace call. The
+                    // memory functions Kani models natively stay `extern`.
+                    if is_str_model(&name)
+                        || (is_trace_sig(&f.sig) && !crate::unit::is_modelled_c_fn(&name))
+                    {
                         wanted.entry(name).or_insert_with(|| f.sig.clone());
                         return false;
                     }
@@ -152,9 +216,12 @@ fn define(name: &str, sig: &syn::Signature) -> Option<syn::ItemFn> {
     };
     let body = if is_pure_oracle(name) {
         oracle_body(name, &params, &ret)?
-    } else {
+    } else if is_str_model(name) {
         let names: Vec<&str> = params.iter().map(|(n, _)| n.as_str()).collect();
         body(name, &names, &ret)?
+    } else {
+        // A side-effecting external modelled as an observable trace call.
+        trace_body(name, &params, &ret)
     };
     let decl = params
         .iter()

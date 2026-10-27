@@ -372,7 +372,17 @@ impl<'ast> Visit<'ast> for BodyChecker {
         // functions Kani models are allowed; any other foreign item is not.
         for item in &m.items {
             let ok = self.allow_pointers
-                && matches!(item, syn::ForeignItem::Fn(f) if is_modelled_c_fn(&f.sig.ident.to_string()));
+                && matches!(item, syn::ForeignItem::Fn(f)
+                    if is_modelled_c_fn(&f.sig.ident.to_string())
+                        || crate::strmodel::is_trace_modellable(&Some(syn::Item::ForeignMod(
+                            syn::ItemForeignMod {
+                                attrs: vec![],
+                                unsafety: m.unsafety,
+                                abi: m.abi.clone(),
+                                brace_token: m.brace_token,
+                                items: vec![syn::ForeignItem::Fn(f.clone())],
+                            },
+                        ))));
             if !ok {
                 let what = match item {
                     syn::ForeignItem::Fn(f) => format!("foreign function `{}`", f.sig.ident),
@@ -454,9 +464,10 @@ mod tests {
 
     #[test]
     fn heap_body_rejects_other_foreign_calls() {
+        // A variadic external isn't modelled (its varargs can't be recorded).
         let u = unit(
-            "pub unsafe fn f() { printf(); }",
-            &["extern \"C\" { fn printf(); }"],
+            "pub unsafe fn f() { printf(core::ptr::null()); }",
+            &["extern \"C\" { fn printf(_: *const i8, ...); }"],
         );
         let skip = u.heap_body_in_scope().unwrap_err();
         assert_eq!(skip.category, "foreign call");

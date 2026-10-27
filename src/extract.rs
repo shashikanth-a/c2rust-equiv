@@ -348,9 +348,15 @@ impl Resolver<'_> {
                 match self.index.defs_by_symbol(symbol).as_slice() {
                     [def] => Res::Item(*def),
                     // On the heap path, a C memory or string function Kani can
-                    // model (or `strmodel` defines) is pulled in as its own
-                    // declaration rather than rejected as a foreign call.
-                    [] if self.heap && crate::unit::is_modelled_c_fn(&entry.name) => Res::Item(e),
+                    // model (or `strmodel` defines), and any non-variadic scalar
+                    // external modelled as an observable trace call, is pulled in
+                    // as its own declaration rather than rejected.
+                    [] if self.heap
+                        && (crate::unit::is_modelled_c_fn(&entry.name)
+                            || crate::strmodel::is_trace_modellable(&entry.item)) =>
+                    {
+                        Res::Item(e)
+                    }
                     [] => Res::Skip(Skip::new(
                         "foreign call",
                         format!("calls foreign function `{shown}`"),
@@ -538,6 +544,15 @@ impl<'ast> Visit<'ast> for Analyzer<'_> {
             && m.items.iter().all(|it| match it {
                 syn::ForeignItem::Fn(f) => {
                     crate::unit::is_modelled_c_fn(&f.sig.ident.to_string())
+                        || crate::strmodel::is_trace_modellable(&Some(syn::Item::ForeignMod(
+                            syn::ItemForeignMod {
+                                attrs: vec![],
+                                unsafety: None,
+                                abi: m.abi.clone(),
+                                brace_token: m.brace_token,
+                                items: vec![syn::ForeignItem::Fn(f.clone())],
+                            },
+                        )))
                 }
                 syn::ForeignItem::Static(s) => {
                     crate::allocmodel::is_alloc_global(&s.ident.to_string())

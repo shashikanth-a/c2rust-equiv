@@ -317,11 +317,17 @@ fn heap_lib_source(
         "        let mut map = CloneMap::default();\n"
     };
 
+    // The first version called records its external-call trace; the second
+    // must replay it exactly (same calls, same order, same arguments), so both
+    // have identical observable behaviour (VOC/CoVaC observable equivalence).
+    let rec = "        let __tr = core::ptr::addr_of_mut!(TRACE);\n        (*__tr).record();\n";
+    let replay = "        (*__tr).replay();\n";
+    let finish = "        (*__tr).finish();\n";
     let harness = |name: &str, first_new: bool| {
         let calls = if first_new {
-            format!("        let n = {new_call};\n        let o = {old_call};\n")
+            format!("{rec}        let n = {new_call};\n{replay}        let o = {old_call};\n{finish}")
         } else {
-            format!("        let o = {old_call};\n        let n = {new_call};\n")
+            format!("{rec}        let o = {old_call};\n{replay}        let n = {new_call};\n{finish}")
         };
         format!(
             "    #[kani::proof]\n\

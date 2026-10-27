@@ -123,6 +123,85 @@ pub static mut ORACLE: Oracle = Oracle {
     len: 0,
 };
 
+/// The most external calls a run records. Observable-behaviour equivalence
+/// (VOC / CoVaC): the first version records its external-call trace, the second
+/// must replay it exactly, so both make the same calls in the same order.
+pub const TRACE_CAP: usize = 256;
+
+/// One recorded external call: its function id, up to three argument words
+/// (scalars by value, pointers by address, floats by bit pattern), and the
+/// symbolic result handed back (shared, so both versions see the same result).
+#[derive(Clone, Copy, Default)]
+pub struct Call {
+    pub id: u64,
+    pub args: [u128; 3],
+    pub ret: u128,
+}
+
+/// The shared external-call trace and its record/replay state.
+pub struct Trace {
+    pub calls: [Call; TRACE_CAP],
+    pub len: usize,
+    pub cursor: usize,
+    pub recording: bool,
+}
+
+pub static mut TRACE: Trace = Trace {
+    calls: [Call {
+        id: 0,
+        args: [0; 3],
+        ret: 0,
+    }; TRACE_CAP],
+    len: 0,
+    cursor: 0,
+    recording: true,
+};
+
+impl Trace {
+    /// Begin recording the first version's external calls.
+    pub fn record(&mut self) {
+        self.len = 0;
+        self.cursor = 0;
+        self.recording = true;
+    }
+    /// Begin replaying them against the second version.
+    pub fn replay(&mut self) {
+        self.cursor = 0;
+        self.recording = false;
+    }
+    /// After the second version, require it consumed the whole trace (it made
+    /// exactly the same number of external calls).
+    pub fn finish(&self) {
+        if !self.recording {
+            assert!(self.cursor == self.len, "external-call count differs");
+        }
+    }
+    /// One external call. While recording, append it with a fresh symbolic
+    /// result; while replaying, require it matches the recorded call and return
+    /// that call's result, so both versions make identical observable calls.
+    pub fn step(&mut self, id: u64, args: [u128; 3]) -> u128 {
+        if self.recording {
+            assert!(self.len < TRACE_CAP, "trace exceeds TRACE_CAP");
+            let ret: u128 = kani::any();
+            self.calls[self.len] = Call { id, args, ret };
+            self.len += 1;
+            ret
+        } else {
+            assert!(self.cursor < self.len, "second version makes more external calls");
+            let c = self.calls[self.cursor];
+            // Compare element-wise: `[u128; 3]` equality lowers to `memcmp`,
+            // whose byte loop would need a large unwind bound.
+            let same = c.id == id
+                && c.args[0] == args[0]
+                && c.args[1] == args[1]
+                && c.args[2] == args[2];
+            assert!(same, "external call sequence differs");
+            self.cursor += 1;
+            c.ret
+        }
+    }
+}
+
 /// A pointer to a single symbolic scalar on the heap, or null. Models a
 /// `*mut T`/`*const T` argument or field that points at one value (a scalar
 /// out-parameter, say). A function that instead indexes it as an array past
