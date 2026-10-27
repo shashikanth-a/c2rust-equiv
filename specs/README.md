@@ -7,7 +7,8 @@ configurations marked "Must fail" document a known limitation, or show that
 removing a safeguard breaks soundness.
 
 ```sh
-specs/check.sh path/to/tla2tools.jar   # TLA+ tools 1.7.4
+specs/check.sh path/to/tla2tools.jar                 # TLA+ tools 1.7.4
+specs/check_alloy.py path/to/alloy.jar specs/Heap.als  # Alloy 6.2.0
 ```
 
 - `Verdict.tla`: the verdict logic in `src/check.rs`. Old and new are arbitrary
@@ -31,3 +32,13 @@ specs/check.sh path/to/tla2tools.jar   # TLA+ tools 1.7.4
     hides a rewrite that changes state the callee reads and then restores it.
   - Checked with up to one call per run. Two calls make the program space too
     large to enumerate.
+- `Heap.als`: comparing the heaps old and new leave behind. Each version runs
+  on its own copy, so the harness walks both heaps in lockstep from their
+  roots and builds a correspondence between their objects. Checked up to 6
+  objects (also run locally up to 8).
+  - `WalkSound`, `WalkComplete`: with the injectivity check, the walk says
+    "equal" exactly when the reachable heaps are isomorphic.
+  - `WalkWithoutInjectivitySound` (expected counterexample): without it, one
+    object shared by two fields looks the same as two equal objects, though
+    writing through one alias changes what the other sees.
+  - `MissedOnlyBySharing`: that is the only way the weaker walk goes wrong.
