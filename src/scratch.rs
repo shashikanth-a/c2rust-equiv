@@ -55,8 +55,8 @@ debug-assertions = false
 pub fn write(dir: &Path, old: &FnUnit, new: &FnUnit, edition: &str, unwind: u32) -> io::Result<()> {
     fs::create_dir_all(dir.join("src"))?;
     fs::write(dir.join("Cargo.toml"), cargo_toml(edition))?;
-    fs::write(dir.join(OLD_FILE), module_source(old))?;
-    fs::write(dir.join(NEW_FILE), module_source(new))?;
+    fs::write(dir.join(OLD_FILE), module_source(old, false))?;
+    fs::write(dir.join(NEW_FILE), module_source(new, false))?;
     fs::write(dir.join("src/support.rs"), SUPPORT)?;
     fs::write(dir.join("src/lib.rs"), lib_source(old, new, unwind))?;
     fs::write(
@@ -87,8 +87,8 @@ pub fn write_heap(
 ) -> io::Result<()> {
     fs::create_dir_all(dir.join("src"))?;
     fs::write(dir.join("Cargo.toml"), cargo_toml(edition))?;
-    fs::write(dir.join(OLD_FILE), module_source(old))?;
-    fs::write(dir.join(NEW_FILE), module_source(new))?;
+    fs::write(dir.join(OLD_FILE), module_source(old, true))?;
+    fs::write(dir.join(NEW_FILE), module_source(new, true))?;
     fs::write(dir.join("src/support.rs"), HEAP_SUPPORT)?;
     fs::write(
         dir.join("src/lib.rs"),
@@ -98,9 +98,14 @@ pub fn write_heap(
     Ok(())
 }
 
-fn module_source(unit: &FnUnit) -> String {
+fn module_source(unit: &FnUnit, inject_str_models: bool) -> String {
     let mut items = unit.items();
     items.iter_mut().for_each(make_standalone);
+    // On the heap path, give the modelled C string functions Rust bodies so
+    // Kani resolves calls to them instead of refusing a foreign symbol.
+    if inject_str_models {
+        crate::strmodel::inject(&mut items);
+    }
     let file = syn::File {
         shebang: None,
         attrs: vec![],

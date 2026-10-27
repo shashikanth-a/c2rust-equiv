@@ -162,3 +162,64 @@ fn c_string_path_does_not_prove_a_wrong_rewrite() {
         outcome.status
     );
 }
+
+// A `strlen` extern declaration, as c2rust emits it.
+const STRLEN_DECL: &str = "extern \"C\" { fn strlen(s: *const core::ffi::c_char) -> usize; }";
+
+// The original calls libc `strlen`; the heap path must give it a Rust model so
+// Kani resolves the call (it refuses `strlen` as a foreign symbol otherwise).
+const SLEN_OLD: &str = r#"
+pub unsafe fn slen(s: *const core::ffi::c_char) -> i64 {
+    if s.is_null() { return -1; }
+    strlen(s) as i64
+}
+"#;
+
+// A rewrite that counts by hand. Proving it equals the `strlen`-based original
+// shows the injected model matches a real length computation for every input.
+const SLEN_OK: &str = r#"
+pub unsafe fn slen(s: *const core::ffi::c_char) -> i64 {
+    if s.is_null() { return -1; }
+    let mut n = 0i64;
+    let mut p = s;
+    while *p != 0 { n += 1; p = p.add(1); }
+    n
+}
+"#;
+
+// A rewrite that is off by one, so it differs from `strlen`.
+const SLEN_BAD: &str = r#"
+pub unsafe fn slen(s: *const core::ffi::c_char) -> i64 {
+    if s.is_null() { return -1; }
+    let mut n = 1i64;
+    let mut p = s;
+    while *p != 0 { n += 1; p = p.add(1); }
+    n
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn str_model_matches_a_hand_written_length_loop() {
+    let old = FnUnit::parse(SLEN_OLD, &[STRLEN_DECL]).unwrap();
+    let new = FnUnit::parse(SLEN_OK, &[]).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved (model == hand loop), got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn str_model_catches_a_wrong_length() {
+    let old = FnUnit::parse(SLEN_OLD, &[STRLEN_DECL]).unwrap();
+    let new = FnUnit::parse(SLEN_BAD, &[]).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a wrong rewrite was proved equivalent: {:?}",
+        outcome.status
+    );
+}

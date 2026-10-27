@@ -301,7 +301,13 @@ pub(crate) fn std_path_skip(segs: &[String]) -> Option<Skip> {
 fn is_modelled_c_fn(name: &str) -> bool {
     matches!(
         name,
+        // Allocation and memory functions, modelled by Kani/CBMC natively.
         "malloc" | "calloc" | "realloc" | "free" | "memcpy" | "memmove" | "memset" | "memcmp"
+        // Read-only C string functions, defined for the scratch crate by
+        // `heap_support` (sound Rust reimplementations over NUL-terminated
+        // buffers, which `gen_cstr` guarantees). Writing functions (`strcpy`,
+        // `strcat`) are left out: their destination bounds aren't modelled.
+        | "strlen" | "strcmp" | "strncmp" | "strchr" | "strrchr"
     )
 }
 
