@@ -64,35 +64,50 @@ pub struct Generated {
     pub referenced: BTreeSet<String>,
 }
 
-/// A struct the generator can read: its name and fields, in order.
+/// A struct or union the generator can read: its name and fields, in order,
+/// and whether it is a union (at most one field is active at a time, so only a
+/// single-field union can be built without knowing which).
 struct StructDef {
     name: String,
     fields: Vec<(String, syn::Type)>,
+    is_union: bool,
+}
+
+fn named_fields(fields: &syn::FieldsNamed) -> Vec<(String, syn::Type)> {
+    fields
+        .named
+        .iter()
+        .map(|f| (f.ident.as_ref().unwrap().to_string(), f.ty.clone()))
+        .collect()
 }
 
 fn struct_def(item: &syn::Item) -> Option<StructDef> {
-    let syn::Item::Struct(s) = item else {
-        return None;
-    };
-    let fields = match &s.fields {
-        syn::Fields::Named(named) => named
-            .named
-            .iter()
-            .map(|f| (f.ident.as_ref().unwrap().to_string(), f.ty.clone()))
-            .collect(),
-        // Tuple structs: fields are positional (`.0`, `.1`, ...).
-        syn::Fields::Unnamed(unnamed) => unnamed
-            .unnamed
-            .iter()
-            .enumerate()
-            .map(|(i, f)| (i.to_string(), f.ty.clone()))
-            .collect(),
-        syn::Fields::Unit => vec![],
-    };
-    Some(StructDef {
-        name: s.ident.to_string(),
-        fields,
-    })
+    match item {
+        syn::Item::Struct(s) => {
+            let fields = match &s.fields {
+                syn::Fields::Named(named) => named_fields(named),
+                // Tuple structs: fields are positional (`.0`, `.1`, ...).
+                syn::Fields::Unnamed(unnamed) => unnamed
+                    .unnamed
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| (i.to_string(), f.ty.clone()))
+                    .collect(),
+                syn::Fields::Unit => vec![],
+            };
+            Some(StructDef {
+                name: s.ident.to_string(),
+                fields,
+                is_union: false,
+            })
+        }
+        syn::Item::Union(u) => Some(StructDef {
+            name: u.ident.to_string(),
+            fields: named_fields(&u.fields),
+            is_union: true,
+        }),
+        _ => None,
+    }
 }
 
 /// The structs defined in a crate, by name. A name defined twice is dropped,
@@ -127,8 +142,8 @@ fn last_segment(ty: &syn::Type) -> Option<String> {
     }
 }
 
-/// Classify a field type, given the set of struct names we can build.
-fn classify(ty: &syn::Type, structs: &BTreeSet<&String>) -> Result<Field, String> {
+/// Classify a field type, given the aggregates (structs and unions) we can see.
+fn classify(ty: &syn::Type, table: &BTreeMap<String, StructDef>) -> Result<Field, String> {
     // A scalar, by its last path segment.
     if let Some(name) = last_segment(ty) {
         if scalar::primitive(&name).is_some()
@@ -138,7 +153,7 @@ fn classify(ty: &syn::Type, structs: &BTreeSet<&String>) -> Result<Field, String
             return Ok(Field::Scalar(name));
         }
     }
-    // A raw pointer to a struct we can build, or a `*const c_char` C string.
+    // A raw pointer to an aggregate we can build, or a `*const c_char` C string.
     if let syn::Type::Ptr(ptr) = ty {
         if let Some(name) = last_segment(&ptr.elem) {
             // A read-only C string. `*mut c_char` is excluded: it may be an
@@ -150,10 +165,19 @@ fn classify(ty: &syn::Type, structs: &BTreeSet<&String>) -> Result<Field, String
                 }
                 return Ok(Field::CStr);
             }
-            if structs.contains(&name) {
-                return Ok(Field::Pointer(name));
+            match table.get(&name) {
+                // A multi-field union needs a discriminant to say which variant
+                // is live; building an arbitrary one would read a scalar as a
+                // pointer. Only a single-field union is unambiguous.
+                Some(def) if def.is_union && def.fields.len() != 1 => {
+                    return Err(format!(
+                        "pointer to union `{name}`, which needs a discriminant \
+                         (only single-field unions are supported)"
+                    ));
+                }
+                Some(_) => return Ok(Field::Pointer(name)),
+                None => return Err(format!("pointer to `{name}`, which is not a plain aggregate")),
             }
-            return Err(format!("pointer to `{name}`, which is not a plain struct"));
         }
         return Err("pointer to a non-struct type".to_owned());
     }
@@ -188,17 +212,25 @@ pub fn generate(
     new: &str,
 ) -> Result<Generated, Unsupported> {
     let table = struct_table(index);
-    let names: BTreeSet<&String> = table.keys().collect();
     let def = table.get(struct_name).ok_or_else(|| Unsupported {
         struct_name: struct_name.to_owned(),
         field: String::new(),
         detail: "not a plain struct in the crate".to_owned(),
     })?;
+    // A union can only be built if exactly one field is ever active; with more,
+    // the generator can't tell which to construct without a discriminant.
+    if def.is_union && def.fields.len() != 1 {
+        return Err(Unsupported {
+            struct_name: struct_name.to_owned(),
+            field: String::new(),
+            detail: "multi-field union needs a discriminant".to_owned(),
+        });
+    }
 
     let mut fields = Vec::new();
     let mut referenced = BTreeSet::new();
     for (name, ty) in &def.fields {
-        match classify(ty, &names) {
+        match classify(ty, &table) {
             Ok(Field::Pointer(target)) => {
                 referenced.insert(target.clone());
                 fields.push((name.clone(), Field::Pointer(target)));
@@ -299,7 +331,6 @@ pub fn signature_shapes(
     sig: &syn::Signature,
 ) -> Result<SigShapes, Unsupported> {
     let table = struct_table(index);
-    let names: BTreeSet<&String> = table.keys().collect();
     let mut structs = BTreeSet::new();
 
     let shape_of = |ty: &syn::Type, structs: &mut BTreeSet<String>| -> Result<Shape, String> {
@@ -309,7 +340,7 @@ pub fn signature_shapes(
                 return Ok(Shape::Scalar);
             }
         }
-        match classify(ty, &names)? {
+        match classify(ty, &table)? {
             Field::Scalar(_) | Field::ScalarArray => Ok(Shape::Scalar),
             Field::CStr => Ok(Shape::CStr),
             Field::Pointer(target) => {
@@ -681,6 +712,38 @@ mod tests {
         let idx = index("pub struct T { pub v: i32 }");
         let err = signature_shapes(&idx, &sig("fn f(s: *mut c_char)")).unwrap_err();
         assert!(err.detail.contains("output buffer"));
+    }
+
+    #[test]
+    fn single_field_union_pointer_is_built_like_a_struct() {
+        // A one-field union is unambiguous: only that field can be active.
+        let src = "pub struct S { pub u: *mut U }\npub union U { pub only: i32 }";
+        let g = generate(&index(src), "S", "old", "new").unwrap();
+        assert_eq!(g.referenced, ["U".to_owned()].into_iter().collect());
+        let gu = generate(&index(src), "U", "old", "new").unwrap();
+        assert!(gu.builder.contains("gen_U(depth: usize) -> *mut old::U"));
+        assert!(gu.builder.contains("only: kani::any(),"));
+        assert!(gu.cloner.contains("only: (*src).only,"));
+        assert!(gu
+            .comparer
+            .contains("if (*a).only != (*b).only { return false; }"));
+    }
+
+    #[test]
+    fn multi_field_union_pointer_needs_a_discriminant() {
+        let src =
+            "pub struct S { pub u: *mut U }\npub union U { pub i: i32, pub p: *mut S }";
+        let err = generate(&index(src), "S", "old", "new").unwrap_err();
+        assert_eq!(err.field, "u");
+        assert!(err.detail.contains("discriminant"), "got: {}", err.detail);
+    }
+
+    #[test]
+    fn generating_a_multi_field_union_directly_is_unsupported() {
+        let src = "pub union U { pub i: i32, pub f: f64 }";
+        let err = generate(&index(src), "U", "old", "new").unwrap_err();
+        assert_eq!(err.struct_name, "U");
+        assert!(err.detail.contains("discriminant"));
     }
 
     #[test]

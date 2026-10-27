@@ -163,6 +163,57 @@ fn c_string_path_does_not_prove_a_wrong_rewrite() {
     );
 }
 
+// A single-field union: unambiguous, so the heap path builds it like a struct.
+const BOX1: &str = "#[derive(Copy, Clone)] #[repr(C)] pub union Box1 { pub v: i32 }";
+
+const UGET_OLD: &str = r#"
+pub unsafe fn uget(p: *mut Box1) -> i64 {
+    if p.is_null() { return -1; }
+    (*p).v as i64
+}
+"#;
+
+const UGET_OK: &str = r#"
+pub unsafe fn uget(p: *mut Box1) -> i64 {
+    if p.is_null() { return -1; }
+    let x = (*p).v;
+    x as i64
+}
+"#;
+
+const UGET_BAD: &str = r#"
+pub unsafe fn uget(p: *mut Box1) -> i64 {
+    if p.is_null() { return -1; }
+    (*p).v as i64 + 1
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn single_field_union_path_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(UGET_OLD, &[BOX1]).unwrap();
+    let new = FnUnit::parse(UGET_OK, &[BOX1]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn single_field_union_path_does_not_prove_a_wrong_rewrite() {
+    let old = FnUnit::parse(UGET_OLD, &[BOX1]).unwrap();
+    let new = FnUnit::parse(UGET_BAD, &[BOX1]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a wrong rewrite was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 // A `strlen` extern declaration, as c2rust emits it.
 const STRLEN_DECL: &str = "extern \"C\" { fn strlen(s: *const core::ffi::c_char) -> usize; }";
 
