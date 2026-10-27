@@ -218,6 +218,7 @@ fn heap_lib_source(
     let mut new_args = Vec::new();
     let mut heap_args: Vec<(usize, &str)> = Vec::new();
     let mut cell_args: Vec<usize> = Vec::new();
+    let mut cstr_args: Vec<usize> = Vec::new();
     for (i, shape) in shapes.args.iter().enumerate() {
         match shape {
             Shape::Scalar => {
@@ -242,6 +243,7 @@ fn heap_lib_source(
                 clone += &format!("        let b{i} = clone_cstr(a{i});\n");
                 old_args.push(format!("a{i} as {}", qualify(arg_types[i], "old")));
                 new_args.push(format!("b{i} as {}", qualify(arg_types[i], "new")));
+                cstr_args.push(i);
             }
             // A pointer to one scalar: both versions get an identical cell; its
             // post-state is compared, catching a divergent write through `*mut`.
@@ -281,6 +283,11 @@ fn heap_lib_source(
     }
     for i in &cell_args {
         arg_cmp += &format!("        assert!(same_cell(a{i}, b{i}), \"cell differs\");\n");
+    }
+    // A C-string argument's post-state: catches a divergent write through a
+    // `*mut` buffer (for `*const` it is unchanged, so trivially equal).
+    for i in &cstr_args {
+        arg_cmp += &format!("        assert!(same_cstr(a{i}, b{i}), \"string differs\");\n");
     }
     // `corr` is used only by struct-pointer comparisons; a C-string-only
     // signature has none, so declaring it unconditionally would warn.

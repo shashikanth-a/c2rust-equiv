@@ -211,15 +211,11 @@ fn classify(
         // struct (or `c_char`) it ultimately names.
         let elem = resolve_alias(&ptr.elem, aliases);
         if let Some(name) = last_segment(&elem) {
-            // A read-only C string: `*const c_char`, or `*const c_uchar`
-            // (libxml2's `xmlChar`), both NUL-terminated by convention. `*mut`
-            // is excluded: it may be an output buffer this doesn't compare, so
-            // treating it as input-only could call a divergent rewrite
-            // equivalent.
+            // A C string: `*const`/`*mut c_char`, or `c_uchar` (libxml2's
+            // xmlChar), NUL-terminated by convention. A `*mut` buffer is built
+            // the same way and its post-state is compared, so a divergent write
+            // is caught (an out-of-bounds write just yields "not proved").
             if name == "c_char" || name == "c_uchar" {
-                if ptr.mutability.is_some() {
-                    return Err(format!("`*mut {name}` may be an output buffer"));
-                }
                 return Ok(Field::CStr);
             }
             match table.get(&name) {
@@ -991,12 +987,12 @@ mod tests {
     }
 
     #[test]
-    fn mut_c_char_field_is_unsupported() {
-        // A `*mut c_char` may be an output buffer, which isn't modelled.
+    fn mut_c_char_field_is_a_c_string() {
+        // A `*mut c_char` buffer is built like a C string; its post-state is
+        // compared, so a divergent write is caught.
         let src = "pub struct S { pub buf: *mut c_char }";
-        let err = generate(&index(src), "S", "old", "new").unwrap_err();
-        assert_eq!(err.field, "buf");
-        assert!(err.detail.contains("output buffer"));
+        let g = generate(&index(src), "S", "old", "new").unwrap();
+        assert!(g.builder.contains("buf: gen_cstr() as _,"));
     }
 
     #[test]
@@ -1041,10 +1037,11 @@ mod tests {
     }
 
     #[test]
-    fn mut_c_char_argument_is_unsupported() {
+    fn mut_c_char_argument_is_a_c_string() {
+        // A `*mut c_char` output buffer is a C string whose post-state is checked.
         let idx = index("pub struct T { pub v: i32 }");
-        let err = signature_shapes(&idx, &sig("fn f(s: *mut c_char)")).unwrap_err();
-        assert!(err.detail.contains("output buffer"));
+        let s = signature_shapes(&idx, &sig("fn f(s: *mut c_char)")).unwrap();
+        assert_eq!(s.args, vec![Shape::CStr]);
     }
 
     #[test]

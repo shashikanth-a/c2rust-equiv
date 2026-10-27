@@ -234,6 +234,59 @@ fn tagged_union_path_does_not_prove_a_wrong_rewrite() {
     );
 }
 
+// A `*mut c_char` output buffer: uppercase the first byte in place. The heap
+// path compares the buffer's post-state, so a divergent write is caught.
+const OUTBUF_OLD: &str = r#"
+pub unsafe fn up1(s: *mut core::ffi::c_char) {
+    if s.is_null() || *s == 0 { return; }
+    let c = *s as u8;
+    if c >= b'a' && c <= b'z' { *s = (c - 32) as core::ffi::c_char; }
+}
+"#;
+
+const OUTBUF_OK: &str = r#"
+pub unsafe fn up1(s: *mut core::ffi::c_char) {
+    if s.is_null() { return; }
+    let c = *s as u8;
+    if c == 0 { return; }
+    if c.is_ascii_lowercase() { *s = c.to_ascii_uppercase() as core::ffi::c_char; }
+}
+"#;
+
+const OUTBUF_BAD: &str = r#"
+pub unsafe fn up1(s: *mut core::ffi::c_char) {
+    if s.is_null() || *s == 0 { return; }
+    let c = *s as u8;
+    if c >= b'a' && c <= b'z' { *s = (c - 31) as core::ffi::c_char; }
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn mut_c_string_post_state_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(OUTBUF_OLD, &[]).unwrap();
+    let new = FnUnit::parse(OUTBUF_OK, &[]).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn mut_c_string_post_state_catches_a_divergent_write() {
+    let old = FnUnit::parse(OUTBUF_OLD, &[]).unwrap();
+    let new = FnUnit::parse(OUTBUF_BAD, &[]).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent write was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 // A function returning a C string (a pointer into its input): the heap path
 // compares the returned string's content after the call.
 const RET_OLD: &str = r#"
