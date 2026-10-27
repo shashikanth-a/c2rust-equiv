@@ -315,3 +315,57 @@ pub fn run_main() {
         }
     }
 }
+
+// --- Symbolic-heap support (used by generated `gen_`/`clone_`/`same_` code) ---
+
+/// The result of linking a pair into the correspondence map.
+pub enum Link {
+    /// A new pair; keep comparing the pointees.
+    New,
+    /// This exact pair was already linked; the pointees already matched.
+    Seen,
+    /// One side is already linked to a different partner, which breaks the
+    /// map's functionality or injectivity: the heaps differ.
+    Conflict,
+}
+
+/// A correspondence between the two heaps' objects, kept functional (each `a`
+/// maps to one `b`) and injective (each `b` from one `a`). `specs/Heap.als`
+/// shows both directions are needed: without injectivity, two distinct objects
+/// on one side sharing a partner on the other would wrongly compare equal.
+#[derive(Default)]
+pub struct Corr {
+    pairs: Vec<(*const (), *const ())>,
+}
+
+impl Corr {
+    pub fn link(&mut self, a: *const (), b: *const ()) -> Link {
+        for &(x, y) in &self.pairs {
+            if x == a && y == b {
+                return Link::Seen;
+            }
+            if x == a || y == b {
+                return Link::Conflict;
+            }
+        }
+        self.pairs.push((a, b));
+        Link::New
+    }
+}
+
+/// A map from each cloned source object to its copy, so that a deep copy
+/// preserves sharing (two fields pointing at one object stay shared) and
+/// terminates on cycles (a back-edge resolves to the registered copy).
+#[derive(Default)]
+pub struct CloneMap {
+    pairs: Vec<(*const (), *const ())>,
+}
+
+impl CloneMap {
+    pub fn get(&self, a: *const ()) -> Option<*const ()> {
+        self.pairs.iter().find(|&&(x, _)| x == a).map(|&(_, y)| y)
+    }
+    pub fn insert(&mut self, a: *const (), b: *const ()) {
+        self.pairs.push((a, b));
+    }
+}
