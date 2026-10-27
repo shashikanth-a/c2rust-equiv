@@ -304,6 +304,12 @@ impl Resolver<'_> {
         let entry = &self.index.entries[e];
         match entry.kind {
             Kind::Fn | Kind::Const | Kind::TypeAlias => Res::Item(e),
+            // libxml2's allocator-indirection globals are modelled on the heap
+            // path (given a module-local definition by `allocmodel`); keep the
+            // bare path so it resolves to that definition.
+            Kind::ForeignStatic if self.heap && crate::allocmodel::is_alloc_global(&entry.name) => {
+                Res::External(None)
+            }
             Kind::Static | Kind::ForeignStatic => {
                 Res::Skip(Skip::new("global", format!("accesses `{shown}`")))
             }

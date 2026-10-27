@@ -5,6 +5,7 @@
 //! falls back to differential testing when Kani can't decide. [`extract`] and
 //! [`CrateIndex`] build those units from a crate's source files.
 
+mod allocmodel;
 pub mod cache;
 pub mod check;
 pub mod crate_index;

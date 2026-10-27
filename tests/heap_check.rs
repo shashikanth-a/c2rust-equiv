@@ -282,6 +282,62 @@ fn returned_c_string_path_catches_a_difference() {
     );
 }
 
+// libxml2-style allocation through the `xmlMalloc` global: the heap path gives
+// it a model calling Kani's `malloc`, with no extern declaration provided here
+// (the model is injected). Allocate an int, store, return it.
+const ALLOC_OLD: &str = r#"
+pub unsafe fn mk(v: i32) -> *mut i32 {
+    let p = xmlMalloc.expect("non-null function pointer")(core::mem::size_of::<i32>()) as *mut i32;
+    if p.is_null() { return p; }
+    *p = v;
+    p
+}
+"#;
+
+const ALLOC_OK: &str = r#"
+pub unsafe fn mk(v: i32) -> *mut i32 {
+    let p = xmlMalloc.expect("non-null function pointer")(core::mem::size_of::<i32>()) as *mut i32;
+    if p.is_null() { return core::ptr::null_mut(); }
+    *p = v;
+    p
+}
+"#;
+
+const ALLOC_BAD: &str = r#"
+pub unsafe fn mk(v: i32) -> *mut i32 {
+    let p = xmlMalloc.expect("non-null function pointer")(core::mem::size_of::<i32>()) as *mut i32;
+    if p.is_null() { return p; }
+    *p = v.wrapping_add(1);
+    p
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn allocator_global_model_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(ALLOC_OLD, &[]).unwrap();
+    let new = FnUnit::parse(ALLOC_OK, &[]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn allocator_global_model_catches_a_difference() {
+    let old = FnUnit::parse(ALLOC_OLD, &[]).unwrap();
+    let new = FnUnit::parse(ALLOC_BAD, &[]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a wrong rewrite was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 // A scalar out-parameter (`*mut i32`): the heap path builds a single cell and
 // compares its post-state, catching a divergent write.
 const CELL_OLD: &str = r#"

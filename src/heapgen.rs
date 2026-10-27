@@ -572,7 +572,9 @@ fn build_value(field: &Field) -> String {
     match field {
         Field::Scalar(_) => "kani::any()".to_owned(),
         Field::ScalarArray => "core::array::from_fn(|_| kani::any())".to_owned(),
-        Field::CStr => "gen_cstr()".to_owned(),
+        // `gen_cstr` yields `*mut c_char`; `as _` casts it to the field's own
+        // pointer type (e.g. `*const c_uchar` for xmlChar).
+        Field::CStr => "gen_cstr() as _".to_owned(),
         Field::ScalarCell => "gen_cell()".to_owned(),
         Field::Pointer(target) => format!("gen_{target}(depth - 1)"),
     }
@@ -582,7 +584,7 @@ fn build_value(field: &Field) -> String {
 fn clone_value(field: &Field, src: &str) -> String {
     match field {
         Field::Scalar(_) | Field::ScalarArray => src.to_owned(),
-        Field::CStr => format!("clone_cstr({src})"),
+        Field::CStr => format!("clone_cstr({src} as *const core::ffi::c_char) as _"),
         Field::ScalarCell => format!("clone_cell({src})"),
         Field::Pointer(target) => format!("clone_{target}({src}, map)"),
     }
@@ -595,7 +597,9 @@ fn compare_stmt(field: &Field, a: &str, b: &str) -> String {
         Field::Scalar(_) | Field::ScalarArray => {
             format!("    if {a} != {b} {{ return false; }}\n")
         }
-        Field::CStr => format!("    if !same_cstr({a}, {b}) {{ return false; }}\n"),
+        Field::CStr => format!(
+            "    if !same_cstr({a} as *const core::ffi::c_char, {b} as *const core::ffi::c_char) {{ return false; }}\n"
+        ),
         Field::ScalarCell => format!("    if !same_cell({a}, {b}) {{ return false; }}\n"),
         Field::Pointer(target) => {
             format!("    if !same_{target}({a}, {b}, corr) {{ return false; }}\n")
@@ -674,7 +678,7 @@ fn cloner(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)], t
             }
             // A C string is copied whole; it can't form cycles, so no linking.
             Field::CStr => {
-                inits += &format!("        {name}: clone_cstr((*src).{name}),\n");
+                inits += &format!("        {name}: {},\n", clone_value(field, &format!("(*src).{name}")));
             }
             // A scalar cell: copy the pointed-to value; no cycles.
             Field::ScalarCell => {
@@ -979,11 +983,11 @@ mod tests {
         let src = "pub struct S { pub name: *const c_char, pub n: i32 }";
         let g = generate(&index(src), "S", "old", "new").unwrap();
         assert!(g.referenced.is_empty());
-        assert!(g.builder.contains("name: gen_cstr(),"));
-        assert!(g.cloner.contains("name: clone_cstr((*src).name),"));
-        assert!(g
-            .comparer
-            .contains("if !same_cstr((*a).name, (*b).name) { return false; }"));
+        // Built/cloned/compared through `gen_cstr`/`clone_cstr`/`same_cstr`,
+        // with casts to the field's own pointer type (c_char vs c_uchar).
+        assert!(g.builder.contains("name: gen_cstr() as _,"));
+        assert!(g.cloner.contains("name: clone_cstr((*src).name as *const core::ffi::c_char) as _,"));
+        assert!(g.comparer.contains("same_cstr((*a).name as *const core::ffi::c_char"));
     }
 
     #[test]

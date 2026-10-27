@@ -105,6 +105,7 @@ fn module_source(unit: &FnUnit, inject_str_models: bool) -> String {
     // Kani resolves calls to them instead of refusing a foreign symbol.
     if inject_str_models {
         crate::strmodel::inject(&mut items);
+        crate::allocmodel::inject(&mut items);
     }
     let file = syn::File {
         shebang: None,
