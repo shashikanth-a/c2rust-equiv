@@ -266,9 +266,12 @@ fn heap_lib_source(
         Shape::Heap(name) => {
             format!("        assert!(same_{name}(o, n, &mut corr), \"results differ\");\n")
         }
-        // `signature_shapes` rejects a bare-pointer return, so these can't arise.
-        Shape::CStr => unreachable!("a C string return is not a supported shape"),
-        Shape::ScalarCell => unreachable!("a scalar-pointer return is not a supported shape"),
+        // A returned C string / scalar pointer: compare the pointed-to content.
+        // `o`/`n` are the functions' own return types; cast to the comparer's.
+        Shape::CStr => "        assert!(same_cstr(o as *const core::ffi::c_char, n as *const core::ffi::c_char), \"results differ\");\n".to_owned(),
+        Shape::ScalarCell => {
+            "        assert!(same_cell(o, n), \"results differ\");\n".to_owned()
+        }
     };
     let mut arg_cmp = String::new();
     for (i, name) in &heap_args {

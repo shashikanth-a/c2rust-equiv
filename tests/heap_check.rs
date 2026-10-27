@@ -234,6 +234,54 @@ fn tagged_union_path_does_not_prove_a_wrong_rewrite() {
     );
 }
 
+// A function returning a C string (a pointer into its input): the heap path
+// compares the returned string's content after the call.
+const RET_OLD: &str = r#"
+pub unsafe fn tail(s: *const core::ffi::c_char) -> *const core::ffi::c_char {
+    if s.is_null() { return s; }
+    if *s == 0 { s } else { s.add(1) }
+}
+"#;
+
+const RET_OK: &str = r#"
+pub unsafe fn tail(s: *const core::ffi::c_char) -> *const core::ffi::c_char {
+    if s.is_null() || *s == 0 { return s; }
+    s.offset(1)
+}
+"#;
+
+const RET_BAD: &str = r#"
+pub unsafe fn tail(s: *const core::ffi::c_char) -> *const core::ffi::c_char {
+    s
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn returned_c_string_path_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(RET_OLD, &[]).unwrap();
+    let new = FnUnit::parse(RET_OK, &[]).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn returned_c_string_path_catches_a_difference() {
+    let old = FnUnit::parse(RET_OLD, &[]).unwrap();
+    let new = FnUnit::parse(RET_BAD, &[]).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a wrong rewrite was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 // A scalar out-parameter (`*mut i32`): the heap path builds a single cell and
 // compares its post-state, catching a divergent write.
 const CELL_OLD: &str = r#"

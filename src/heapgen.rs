@@ -529,22 +529,15 @@ pub fn signature_shapes(
     let ret = match &sig.output {
         syn::ReturnType::Default => Shape::Scalar,
         syn::ReturnType::Type(_, ty) => {
-            let shape = shape_of(ty, &mut structs).map_err(|detail| Unsupported {
+            // A returned string or scalar pointer is compared after the call.
+            // Its provenance is unknown, so a read may go out of bounds; that
+            // surfaces as a Kani failure (hence "not proved"), never a false
+            // counterexample, and a proof means no such read occurred.
+            shape_of(ty, &mut structs).map_err(|detail| Unsupported {
                 struct_name: String::new(),
                 field: "<return>".to_owned(),
                 detail,
-            })?;
-            // A returned string or scalar pointer may point into a caller
-            // buffer, a static, or fresh storage; reading it as our own buffer
-            // or cell isn't sound. Only such arguments are modelled.
-            if shape == Shape::CStr || shape == Shape::ScalarCell {
-                return Err(Unsupported {
-                    struct_name: String::new(),
-                    field: "<return>".to_owned(),
-                    detail: "returns a bare pointer whose provenance is unknown".to_owned(),
-                });
-            }
-            shape
+            })?
         }
     };
 
@@ -1034,12 +1027,13 @@ mod tests {
     }
 
     #[test]
-    fn returned_c_string_is_unsupported() {
-        // A returned `*const c_char` has unknown length; only arguments are built.
+    fn returned_c_string_is_compared() {
+        // A returned `*const c_char` is compared after the call (an OOB read on
+        // an unexpected provenance surfaces as "not proved", never a false
+        // counterexample).
         let idx = index("pub struct T { pub v: i32 }");
-        let err = signature_shapes(&idx, &sig("fn f(s: *const c_char) -> *const c_char")).unwrap_err();
-        assert_eq!(err.field, "<return>");
-        assert!(err.detail.contains("provenance is unknown"));
+        let s = signature_shapes(&idx, &sig("fn f(s: *const c_char) -> *const c_char")).unwrap();
+        assert_eq!(s.ret, Shape::CStr);
     }
 
     #[test]
