@@ -49,6 +49,10 @@ enum Field {
     /// Only `*const` (read-only): a `*mut c_char` may be an output buffer, which
     /// this doesn't model, so it stays unsupported rather than falsely equal.
     CStr,
+    /// A `*mut T`/`*const T` to a single scalar: one heap cell, built with
+    /// `gen_cell`, copied with `clone_cell`, compared (post-state) with
+    /// `same_cell`.
+    ScalarCell,
 }
 
 /// The generated builder, cloner and comparer for one struct, plus the structs
@@ -229,6 +233,13 @@ fn classify(
                     ));
                 }
                 Some(_) => return Ok(Field::Pointer(name)),
+                // A pointer to a scalar: one heap cell holding that scalar.
+                None if scalar::primitive(&name).is_some()
+                    || scalar::c_type(&name).is_some()
+                    || scalar::libc_typedef(&name).is_some() =>
+                {
+                    return Ok(Field::ScalarCell)
+                }
                 None => return Err(format!("pointer to `{name}`, which is not a plain aggregate")),
             }
         }
@@ -441,6 +452,9 @@ pub enum Shape {
     /// built with `gen_cstr` and cloned with `clone_cstr`. Read-only, so there
     /// is no post-state to compare.
     CStr,
+    /// A `*mut T`/`*const T` argument to a single scalar: one heap cell, whose
+    /// post-state is compared (a divergent write through `*mut T` is caught).
+    ScalarCell,
 }
 
 /// The shapes of a function's arguments and return value for the heap path.
@@ -487,6 +501,7 @@ pub fn signature_shapes(
         match classify(ty, &table, &aliases)? {
             Field::Scalar(_) | Field::ScalarArray => Ok(Shape::Scalar),
             Field::CStr => Ok(Shape::CStr),
+            Field::ScalarCell => Ok(Shape::ScalarCell),
             Field::Pointer(target) => {
                 structs.insert(target.clone());
                 Ok(Shape::Heap(target))
@@ -519,14 +534,14 @@ pub fn signature_shapes(
                 field: "<return>".to_owned(),
                 detail,
             })?;
-            // A returned C string may point into a caller buffer, a static, or
-            // fresh storage of unknown length; reading it as a `gen_cstr` buffer
-            // could run off the end. Only string arguments are modelled.
-            if shape == Shape::CStr {
+            // A returned string or scalar pointer may point into a caller
+            // buffer, a static, or fresh storage; reading it as our own buffer
+            // or cell isn't sound. Only such arguments are modelled.
+            if shape == Shape::CStr || shape == Shape::ScalarCell {
                 return Err(Unsupported {
                     struct_name: String::new(),
                     field: "<return>".to_owned(),
-                    detail: "returns `*const c_char`, whose length is unknown".to_owned(),
+                    detail: "returns a bare pointer whose provenance is unknown".to_owned(),
                 });
             }
             shape
@@ -565,6 +580,7 @@ fn build_value(field: &Field) -> String {
         Field::Scalar(_) => "kani::any()".to_owned(),
         Field::ScalarArray => "core::array::from_fn(|_| kani::any())".to_owned(),
         Field::CStr => "gen_cstr()".to_owned(),
+        Field::ScalarCell => "gen_cell()".to_owned(),
         Field::Pointer(target) => format!("gen_{target}(depth - 1)"),
     }
 }
@@ -574,6 +590,7 @@ fn clone_value(field: &Field, src: &str) -> String {
     match field {
         Field::Scalar(_) | Field::ScalarArray => src.to_owned(),
         Field::CStr => format!("clone_cstr({src})"),
+        Field::ScalarCell => format!("clone_cell({src})"),
         Field::Pointer(target) => format!("clone_{target}({src}, map)"),
     }
 }
@@ -586,6 +603,7 @@ fn compare_stmt(field: &Field, a: &str, b: &str) -> String {
             format!("    if {a} != {b} {{ return false; }}\n")
         }
         Field::CStr => format!("    if !same_cstr({a}, {b}) {{ return false; }}\n"),
+        Field::ScalarCell => format!("    if !same_cell({a}, {b}) {{ return false; }}\n"),
         Field::Pointer(target) => {
             format!("    if !same_{target}({a}, {b}, corr) {{ return false; }}\n")
         }
@@ -664,6 +682,10 @@ fn cloner(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)], t
             // A C string is copied whole; it can't form cycles, so no linking.
             Field::CStr => {
                 inits += &format!("        {name}: clone_cstr((*src).{name}),\n");
+            }
+            // A scalar cell: copy the pointed-to value; no cycles.
+            Field::ScalarCell => {
+                inits += &format!("        {name}: clone_cell((*src).{name}),\n");
             }
             Field::Pointer(target) => {
                 inits += &format!("        {name}: core::ptr::null_mut(),\n");
@@ -999,12 +1021,25 @@ mod tests {
     }
 
     #[test]
+    fn pointer_to_scalar_is_a_cell_shape() {
+        let idx = index("pub struct T { pub v: i32 }");
+        // Both a mutable out-parameter and a read-only in-parameter are cells.
+        let s = signature_shapes(&idx, &sig("fn f(out: *mut c_int, inp: *const i64)")).unwrap();
+        assert_eq!(s.args, vec![Shape::ScalarCell, Shape::ScalarCell]);
+        // A pointer-to-scalar field is a cell too.
+        let g = generate(&index("pub struct S { pub p: *mut i32 }"), "S", "old", "new").unwrap();
+        assert!(g.builder.contains("p: gen_cell(),"));
+        assert!(g.cloner.contains("p: clone_cell((*src).p),"));
+        assert!(g.comparer.contains("if !same_cell((*a).p, (*b).p)"));
+    }
+
+    #[test]
     fn returned_c_string_is_unsupported() {
         // A returned `*const c_char` has unknown length; only arguments are built.
         let idx = index("pub struct T { pub v: i32 }");
         let err = signature_shapes(&idx, &sig("fn f(s: *const c_char) -> *const c_char")).unwrap_err();
         assert_eq!(err.field, "<return>");
-        assert!(err.detail.contains("length is unknown"));
+        assert!(err.detail.contains("provenance is unknown"));
     }
 
     #[test]

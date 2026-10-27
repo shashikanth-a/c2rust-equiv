@@ -73,6 +73,38 @@ pub unsafe fn clone_cstr(src: *const core::ffi::c_char) -> *mut core::ffi::c_cha
     Box::into_raw(buf) as *mut core::ffi::c_char
 }
 
+/// A pointer to a single symbolic scalar on the heap, or null. Models a
+/// `*mut T`/`*const T` argument or field that points at one value (a scalar
+/// out-parameter, say). A function that instead indexes it as an array past
+/// element 0 reads out of bounds, which Kani reports as a failure, so such a
+/// function is left unproved rather than being called equivalent unsoundly.
+pub unsafe fn gen_cell<T: kani::Arbitrary>() -> *mut T {
+    if kani::any() {
+        core::ptr::null_mut()
+    } else {
+        Box::into_raw(Box::new(kani::any()))
+    }
+}
+
+/// A copy of a `gen_cell` pointer's value into a fresh allocation, so both
+/// versions get the same scalar. `src` must be null or a `gen_cell` pointer.
+pub unsafe fn clone_cell<T: Copy>(src: *const T) -> *mut T {
+    if src.is_null() {
+        core::ptr::null_mut()
+    } else {
+        Box::into_raw(Box::new(*src))
+    }
+}
+
+/// Whether two `gen_cell` pointers' values are identical (matching null-ness).
+/// Compares the post-state, catching a divergent write through a `*mut T`.
+pub unsafe fn same_cell<T: Bits>(a: *const T, b: *const T) -> bool {
+    if a.is_null() || b.is_null() {
+        return a.is_null() == b.is_null();
+    }
+    Bits::bits(&*a) == Bits::bits(&*b)
+}
+
 /// Whether two `gen_cstr` buffers hold the same bytes up to and including the
 /// first NUL. Both must be null or `gen_cstr` buffers.
 pub unsafe fn same_cstr(a: *const core::ffi::c_char, b: *const core::ffi::c_char) -> bool {

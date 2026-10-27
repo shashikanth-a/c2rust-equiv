@@ -234,6 +234,59 @@ fn tagged_union_path_does_not_prove_a_wrong_rewrite() {
     );
 }
 
+// A scalar out-parameter (`*mut i32`): the heap path builds a single cell and
+// compares its post-state, catching a divergent write.
+const CELL_OLD: &str = r#"
+pub unsafe fn dbl(p: *mut i32, k: i32) -> i32 {
+    if p.is_null() { return -1; }
+    *p = (*p).wrapping_mul(2);
+    k
+}
+"#;
+
+const CELL_OK: &str = r#"
+pub unsafe fn dbl(p: *mut i32, k: i32) -> i32 {
+    if p.is_null() { return -1; }
+    let v = *p;
+    *p = v.wrapping_add(v);
+    k
+}
+"#;
+
+const CELL_BAD: &str = r#"
+pub unsafe fn dbl(p: *mut i32, k: i32) -> i32 {
+    if p.is_null() { return -1; }
+    *p = (*p).wrapping_mul(2).wrapping_add(1);
+    k
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn scalar_cell_path_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(CELL_OLD, &[]).unwrap();
+    let new = FnUnit::parse(CELL_OK, &[]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn scalar_cell_path_catches_a_divergent_write() {
+    let old = FnUnit::parse(CELL_OLD, &[]).unwrap();
+    let new = FnUnit::parse(CELL_BAD, &[]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a wrong rewrite was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 // A single-field union: unambiguous, so the heap path builds it like a struct.
 const BOX1: &str = "#[derive(Copy, Clone)] #[repr(C)] pub union Box1 { pub v: i32 }";
 
