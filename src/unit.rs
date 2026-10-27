@@ -465,14 +465,14 @@ mod tests {
 
     #[test]
     fn heap_body_rejects_other_foreign_calls() {
-        // A variadic external isn't modelled (its varargs can't be recorded).
+        // An external with more arguments than the trace records isn't modelled.
         let u = unit(
-            "pub unsafe fn f() { printf(core::ptr::null()); }",
-            &["extern \"C\" { fn printf(_: *const i8, ...); }"],
+            "pub unsafe fn f() { big(1, 2, 3, 4); }",
+            &["extern \"C\" { fn big(_: i32, _: i32, _: i32, _: i32); }"],
         );
         let skip = u.heap_body_in_scope().unwrap_err();
         assert_eq!(skip.category, "foreign call");
-        assert!(skip.detail.contains("printf"));
+        assert!(skip.detail.contains("big"));
     }
 
     #[test]
