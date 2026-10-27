@@ -42,12 +42,14 @@ fn infers_json_object_tag_map_from_real_source() {
 
 #[test]
 fn json_object_still_blocked_after_union_support() {
-    // Even with the tag map inferred, json_object does not yet build. The first
-    // blocker is a crate-local typedef: the `boolean` variant's field is
-    // `json_bool` (an alias for `c_int`), which the generator doesn't resolve.
-    // Behind that lie the object/array variants' `lh_table`/`array_list` (whose
-    // fields need `void**`/function-pointer support) and json_object's own
-    // function-pointer (`_delete`) and `c_void` (`_userdata`) fields.
+    // Even with the tag map inferred and typedefs resolved, json_object does
+    // not yet build. The blocker is now the `string` variant's field, a
+    // by-value nested aggregate (`C2Rust_Unnamed`: a struct wrapping a
+    // ptr-or-inline-buffer union and a length) -- the generator only handles
+    // aggregates behind a pointer. Behind that lie the object/array variants'
+    // `lh_table`/`array_list` (whose fields need `void**` support) and
+    // json_object's own function-pointer (`_delete`) and `c_void`
+    // (`_userdata`) fields.
     if !Path::new(JSONC).exists() {
         eprintln!("skipping: {JSONC} not present");
         return;

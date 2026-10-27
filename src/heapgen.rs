@@ -132,6 +132,45 @@ fn struct_table(index: &CrateIndex) -> BTreeMap<String, StructDef> {
     table
 }
 
+/// Crate-local type aliases (`type json_bool = c_int;`), by name. A name
+/// defined twice is dropped, like structs, since the target is then ambiguous.
+fn alias_table(index: &CrateIndex) -> BTreeMap<String, syn::Type> {
+    let mut table: BTreeMap<String, syn::Type> = BTreeMap::new();
+    let mut ambiguous: BTreeSet<String> = BTreeSet::new();
+    for entry in &index.entries {
+        if let Some(syn::Item::Type(t)) = &entry.item {
+            let name = t.ident.to_string();
+            if table.contains_key(&name) {
+                ambiguous.insert(name.clone());
+            }
+            table.insert(name, (*t.ty).clone());
+        }
+    }
+    for name in ambiguous {
+        table.remove(&name);
+    }
+    table
+}
+
+/// Follow crate-local type aliases to the underlying type, so a typedef'd
+/// scalar or pointer is classified by what it stands for. Bounded, so an alias
+/// cycle terminates rather than looping.
+fn resolve_alias(ty: &syn::Type, aliases: &BTreeMap<String, syn::Type>) -> syn::Type {
+    let mut ty = ty.clone();
+    for _ in 0..16 {
+        let Some(name) = last_segment(&ty) else { break };
+        // Only resolve a bare name; a pointer or array wraps a type we keep.
+        if !matches!(ty, syn::Type::Path(_)) {
+            break;
+        }
+        match aliases.get(&name) {
+            Some(next) => ty = next.clone(),
+            None => break,
+        }
+    }
+    ty
+}
+
 /// The last path segment of a type, if it's a plain path (`a::b::C` -> `C`).
 fn last_segment(ty: &syn::Type) -> Option<String> {
     match ty {
@@ -142,8 +181,17 @@ fn last_segment(ty: &syn::Type) -> Option<String> {
     }
 }
 
-/// Classify a field type, given the aggregates (structs and unions) we can see.
-fn classify(ty: &syn::Type, table: &BTreeMap<String, StructDef>) -> Result<Field, String> {
+/// Classify a field type, given the aggregates (structs and unions) we can see
+/// and the crate-local type aliases. The type is first resolved through aliases
+/// (`type json_bool = c_int` -> `c_int`), then classified; a pointer's pointee
+/// is likewise resolved so a `*mut Alias` reaches the struct it names.
+fn classify(
+    ty: &syn::Type,
+    table: &BTreeMap<String, StructDef>,
+    aliases: &BTreeMap<String, syn::Type>,
+) -> Result<Field, String> {
+    let resolved = resolve_alias(ty, aliases);
+    let ty = &resolved;
     // A scalar, by its last path segment.
     if let Some(name) = last_segment(ty) {
         if scalar::primitive(&name).is_some()
@@ -155,7 +203,10 @@ fn classify(ty: &syn::Type, table: &BTreeMap<String, StructDef>) -> Result<Field
     }
     // A raw pointer to an aggregate we can build, or a `*const c_char` C string.
     if let syn::Type::Ptr(ptr) = ty {
-        if let Some(name) = last_segment(&ptr.elem) {
+        // Resolve the pointee through aliases, so `*mut Alias` reaches the
+        // struct (or `c_char`) it ultimately names.
+        let elem = resolve_alias(&ptr.elem, aliases);
+        if let Some(name) = last_segment(&elem) {
             // A read-only C string. `*mut c_char` is excluded: it may be an
             // output buffer this doesn't compare, so treating it as input-only
             // could call a divergent rewrite equivalent.
@@ -212,6 +263,7 @@ pub fn generate(
     new: &str,
 ) -> Result<Generated, Unsupported> {
     let table = struct_table(index);
+    let aliases = alias_table(index);
     let def = table.get(struct_name).ok_or_else(|| Unsupported {
         struct_name: struct_name.to_owned(),
         field: String::new(),
@@ -231,7 +283,7 @@ pub fn generate(
     // A by-value multi-field union field, if any, is handled as a tagged union
     // (its discriminant inferred); its tag and union fields are then built
     // together rather than as independent fields.
-    let tagged = tagged_union(index, def, &table, &mut referenced)?;
+    let tagged = tagged_union(index, def, &table, &aliases, &mut referenced)?;
     let skip: BTreeSet<&str> = match &tagged {
         Some(tu) => [tu.tag_field.as_str(), tu.union_field.as_str()]
             .into_iter()
@@ -244,7 +296,7 @@ pub fn generate(
         if skip.contains(name.as_str()) {
             continue;
         }
-        match classify(ty, &table) {
+        match classify(ty, &table, &aliases) {
             Ok(Field::Pointer(target)) => {
                 referenced.insert(target.clone());
                 fields.push((name.clone(), Field::Pointer(target)));
@@ -278,6 +330,7 @@ fn tagged_union(
     index: &CrateIndex,
     def: &StructDef,
     table: &BTreeMap<String, StructDef>,
+    aliases: &BTreeMap<String, syn::Type>,
     referenced: &mut BTreeSet<String>,
 ) -> Result<Option<TaggedUnion>, Unsupported> {
     let unsupported = |field: &str, detail: String| Unsupported {
@@ -289,7 +342,7 @@ fn tagged_union(
     // Find the (single) by-value multi-field union field.
     let mut found: Option<(&String, &StructDef)> = None;
     for (name, ty) in &def.fields {
-        let Some(u) = last_segment(ty).and_then(|n| table.get(&n)) else {
+        let Some(u) = last_segment(&resolve_alias(ty, aliases)).and_then(|n| table.get(&n)) else {
             continue;
         };
         if u.is_union && u.fields.len() > 1 {
@@ -324,7 +377,7 @@ fn tagged_union(
                     .find(|(n, _)| n == s)
                     .map(|(_, t)| t)
                     .expect("mined sub-field is a union field");
-                let field = classify(ty, table).map_err(|d| unsupported(s, d))?;
+                let field = classify(ty, table, aliases).map_err(|d| unsupported(s, d))?;
                 if let Field::Pointer(t) = &field {
                     referenced.insert(t.clone());
                 }
@@ -419,6 +472,7 @@ pub fn signature_shapes(
     sig: &syn::Signature,
 ) -> Result<SigShapes, Unsupported> {
     let table = struct_table(index);
+    let aliases = alias_table(index);
     let mut structs = BTreeSet::new();
 
     let shape_of = |ty: &syn::Type, structs: &mut BTreeSet<String>| -> Result<Shape, String> {
@@ -428,7 +482,7 @@ pub fn signature_shapes(
                 return Ok(Shape::Scalar);
             }
         }
-        match classify(ty, &table)? {
+        match classify(ty, &table, &aliases)? {
             Field::Scalar(_) | Field::ScalarArray => Ok(Shape::Scalar),
             Field::CStr => Ok(Shape::CStr),
             Field::Pointer(target) => {
@@ -811,6 +865,21 @@ mod tests {
         let err = generate(&index(src), "S", "old", "new").unwrap_err();
         assert_eq!(err.field, "kids");
         assert!(err.detail.contains("array"));
+    }
+
+    #[test]
+    fn crate_local_type_aliases_are_resolved() {
+        // `json_bool` aliases `c_int`; a `*mut Handle` aliases a struct pointer.
+        let src = "pub type json_bool = c_int;\n\
+                   pub type NodePtr = *mut N;\n\
+                   pub struct N { pub v: i32 }\n\
+                   pub struct S { pub flag: json_bool, pub next: NodePtr }";
+        let g = generate(&index(src), "S", "old", "new").unwrap();
+        // The typedef'd scalar is built like any scalar.
+        assert!(g.builder.contains("flag: kani::any(),"));
+        // The typedef'd pointer reaches `N` and references it.
+        assert!(g.referenced.contains("N"));
+        assert!(g.builder.contains("next: gen_N(depth - 1),"));
     }
 
     #[test]
