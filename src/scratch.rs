@@ -8,10 +8,12 @@ use std::path::Path;
 use quote::ToTokens;
 use syn::visit_mut::VisitMut;
 
+use crate::heapgen::{Shape, SigShapes};
 use crate::scalar;
 use crate::unit::FnUnit;
 
 const SUPPORT: &str = include_str!("scratch_template/support.rs");
+const HEAP_SUPPORT: &str = include_str!("scratch_template/heap_support.rs");
 
 /// The scratch crate's package name, which is also the runner binary's name.
 pub const PACKAGE: &str = "equiv_scratch";
@@ -25,12 +27,9 @@ pub const NEW_FILE: &str = "src/new.rs";
 pub const OLD_FIRST: &str = "proofs::old_then_new";
 pub const NEW_FIRST: &str = "proofs::new_then_old";
 
-pub fn write(dir: &Path, old: &FnUnit, new: &FnUnit, edition: &str, unwind: u32) -> io::Result<()> {
-    fs::create_dir_all(dir.join("src"))?;
-    fs::write(
-        dir.join("Cargo.toml"),
-        format!(
-            r#"[package]
+fn cargo_toml(edition: &str) -> String {
+    format!(
+        r#"[package]
 name = "{PACKAGE}"
 version = "0.0.0"
 edition = "{edition}"
@@ -50,8 +49,12 @@ opt-level = 1
 overflow-checks = true
 debug-assertions = false
 "#
-        ),
-    )?;
+    )
+}
+
+pub fn write(dir: &Path, old: &FnUnit, new: &FnUnit, edition: &str, unwind: u32) -> io::Result<()> {
+    fs::create_dir_all(dir.join("src"))?;
+    fs::write(dir.join("Cargo.toml"), cargo_toml(edition))?;
     fs::write(dir.join(OLD_FILE), module_source(old))?;
     fs::write(dir.join(NEW_FILE), module_source(new))?;
     fs::write(dir.join("src/support.rs"), SUPPORT)?;
@@ -62,6 +65,36 @@ debug-assertions = false
             "#[cfg(not(kani))]\nfn main() {{\n    {PACKAGE}::run_main();\n}}\n\n#[cfg(kani)]\nfn main() {{}}\n"
         ),
     )?;
+    Ok(())
+}
+
+/// How deep the symbolic heaps are built in the heap path.
+pub const HEAP_DEPTH: usize = 3;
+
+/// Write a scratch crate for the heap path: the two versions, the generated
+/// `gen_`/`clone_`/`same_` code for the structs in the signature, and a
+/// pointer-aware Kani harness. There is no native runner (symbolic heaps can't
+/// yet be rebuilt from Kani's concrete bytes), so `main` is empty and the
+/// caller runs only Kani on this crate.
+pub fn write_heap(
+    dir: &Path,
+    old: &FnUnit,
+    new: &FnUnit,
+    edition: &str,
+    unwind: u32,
+    shapes: &SigShapes,
+    generated: &str,
+) -> io::Result<()> {
+    fs::create_dir_all(dir.join("src"))?;
+    fs::write(dir.join("Cargo.toml"), cargo_toml(edition))?;
+    fs::write(dir.join(OLD_FILE), module_source(old))?;
+    fs::write(dir.join(NEW_FILE), module_source(new))?;
+    fs::write(dir.join("src/support.rs"), HEAP_SUPPORT)?;
+    fs::write(
+        dir.join("src/lib.rs"),
+        heap_lib_source(old, new, shapes, generated, unwind),
+    )?;
+    fs::write(dir.join("src/main.rs"), "fn main() {}\n")?;
     Ok(())
 }
 
@@ -144,6 +177,117 @@ mod proofs {{
     }}
 }}
 "#
+    )
+}
+
+/// The crate root for the heap path: the generated code, and two harnesses
+/// that build a symbolic `old` heap, clone it into an isomorphic `new` heap,
+/// run both versions and compare the returned value and the mutated heaps.
+fn heap_lib_source(
+    old: &FnUnit,
+    new: &FnUnit,
+    shapes: &SigShapes,
+    generated: &str,
+    unwind: u32,
+) -> String {
+    let sig = &old.function.sig;
+    let old_name = old.name();
+    let new_name = new.name();
+    let depth = HEAP_DEPTH;
+
+    let arg_types: Vec<&syn::Type> = sig
+        .inputs
+        .iter()
+        .filter_map(|a| match a {
+            syn::FnArg::Typed(pt) => Some(&*pt.ty),
+            syn::FnArg::Receiver(_) => None,
+        })
+        .collect();
+
+    // Build each argument once (old's), clone the heap ones into new's. A
+    // single clone map across all arguments preserves aliasing between them.
+    let mut build = String::new();
+    let mut clone = String::new();
+    let mut old_args = Vec::new();
+    let mut new_args = Vec::new();
+    let mut heap_args: Vec<(usize, &str)> = Vec::new();
+    for (i, shape) in shapes.args.iter().enumerate() {
+        match shape {
+            Shape::Scalar => {
+                let ty = qualify(arg_types[i], "old");
+                build += &format!("        let a{i}: {ty} = kani::any();\n");
+                old_args.push(format!("a{i}"));
+                new_args.push(format!("a{i}"));
+            }
+            Shape::Heap(name) => {
+                build += &format!("        let a{i} = gen_{name}(DEPTH);\n");
+                clone += &format!("        let b{i} = clone_{name}(a{i}, &mut map);\n");
+                old_args.push(format!("a{i}"));
+                new_args.push(format!("b{i}"));
+                heap_args.push((i, name));
+            }
+        }
+    }
+    let old_call = format!("old::{old_name}({})", old_args.join(", "));
+    let new_call = format!("new::{new_name}({})", new_args.join(", "));
+
+    // Compare the return value, then every heap argument's post-state, all
+    // under one correspondence so aliasing between them is checked too.
+    let ret_cmp = match &shapes.ret {
+        Shape::Scalar => {
+            "        assert!(Bits::bits(&o) == Bits::bits(&n), \"results differ\");\n".to_owned()
+        }
+        Shape::Heap(name) => {
+            format!("        assert!(same_{name}(o, n, &mut corr), \"results differ\");\n")
+        }
+    };
+    let mut arg_cmp = String::new();
+    for (i, name) in &heap_args {
+        arg_cmp +=
+            &format!("        assert!(same_{name}(a{i}, b{i}, &mut corr), \"heaps differ\");\n");
+    }
+
+    let harness = |name: &str, first_new: bool| {
+        let calls = if first_new {
+            format!("        let n = {new_call};\n        let o = {old_call};\n")
+        } else {
+            format!("        let o = {old_call};\n        let n = {new_call};\n")
+        };
+        format!(
+            "    #[kani::proof]\n\
+             \x20   #[kani::unwind({unwind})]\n\
+             \x20   fn {name}() {{ unsafe {{\n\
+             {build}\
+             \x20       let mut map = CloneMap::default();\n\
+             {clone}\
+             {calls}\
+             \x20       let mut corr = Corr::default();\n\
+             {ret_cmp}{arg_cmp}\
+             \x20   }} }}\n"
+        )
+    };
+
+    format!(
+        r#"#![allow(warnings)]
+
+pub mod new;
+pub mod old;
+mod support;
+
+pub use support::*;
+
+{generated}
+
+#[cfg(kani)]
+mod proofs {{
+    use super::*;
+    const DEPTH: usize = {depth};
+
+{old_then_new}
+{new_then_old}}}
+"#,
+        old_then_new = harness("old_then_new", false),
+        new_then_old = harness("new_then_old", true),
     )
 }
 

@@ -15,10 +15,7 @@ use c2rust_equiv::{heapgen, CrateIndex};
 
 /// The real heap-support types (`Corr`, `Link`, `CloneMap`) from the template.
 fn heap_support() -> String {
-    let support = include_str!("../src/scratch_template/support.rs");
-    let marker = "// --- Symbolic-heap support";
-    let start = support.find(marker).expect("heap-support section present");
-    support[start..].to_owned()
+    include_str!("../src/scratch_template/heap_support.rs").to_owned()
 }
 
 const DEF: &str = "pub struct Node { pub v: i32, pub tag: [u8; 2], pub next: *mut Node }";

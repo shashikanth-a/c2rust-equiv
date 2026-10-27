@@ -96,13 +96,28 @@ impl FnUnit {
     /// Check that the unit is in scope for this version, and return its signature.
     pub fn validate(&self) -> Result<Signature, Skip> {
         let sig = self.signature()?;
-        let mut checker = BodyChecker { skip: None };
+        self.body_in_scope(false)?;
+        Ok(sig)
+    }
+
+    /// Check the body for the heap path: raw pointers are allowed (the heap
+    /// path builds and compares them), but IO, globals, foreign calls and
+    /// unsupported macros still put the function out of scope.
+    pub fn heap_body_in_scope(&self) -> Result<(), Skip> {
+        self.body_in_scope(true)
+    }
+
+    fn body_in_scope(&self, allow_pointers: bool) -> Result<(), Skip> {
+        let mut checker = BodyChecker {
+            skip: None,
+            allow_pointers,
+        };
         for item in self.items() {
             checker.visit_item(&item);
         }
         match checker.skip {
             Some(skip) => Err(skip),
-            None => Ok(sig),
+            None => Ok(()),
         }
     }
 
@@ -283,6 +298,9 @@ pub(crate) fn std_path_skip(segs: &[String]) -> Option<Skip> {
 /// Finds constructs that are out of scope in a self-contained unit.
 struct BodyChecker {
     skip: Option<Skip>,
+    /// The heap path handles raw pointers, so it allows them while still
+    /// rejecting the rest (IO, globals, foreign calls, unsupported macros).
+    allow_pointers: bool,
 }
 
 impl BodyChecker {
@@ -292,8 +310,11 @@ impl BodyChecker {
 }
 
 impl<'ast> Visit<'ast> for BodyChecker {
-    fn visit_type_ptr(&mut self, _: &'ast syn::TypePtr) {
-        self.set(Skip::new("raw pointer", "uses raw pointers"));
+    fn visit_type_ptr(&mut self, p: &'ast syn::TypePtr) {
+        if !self.allow_pointers {
+            self.set(Skip::new("raw pointer", "uses raw pointers"));
+        }
+        syn::visit::visit_type_ptr(self, p);
     }
 
     fn visit_item_static(&mut self, s: &'ast syn::ItemStatic) {

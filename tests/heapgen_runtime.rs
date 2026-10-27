@@ -17,10 +17,7 @@ use c2rust_equiv::{heapgen, CrateIndex};
 /// The heap-support types (`Corr`, `Link`, `CloneMap`), taken from the real
 /// template so the test exercises the shipped code, not a copy.
 fn heap_support() -> String {
-    let support = include_str!("../src/scratch_template/support.rs");
-    let marker = "// --- Symbolic-heap support";
-    let start = support.find(marker).expect("heap-support section present");
-    support[start..].to_owned()
+    include_str!("../src/scratch_template/heap_support.rs").to_owned()
 }
 
 // A node with two pointer fields, so a diamond and the injectivity check are

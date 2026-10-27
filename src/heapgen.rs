@@ -208,6 +208,38 @@ pub fn generate(
     })
 }
 
+/// Generate the builder, cloner and comparer for every struct reachable from
+/// `roots` (following pointer fields), concatenated as one block of source.
+/// Fails if any reachable struct has a field the generator can't handle.
+pub fn generate_all(
+    index: &CrateIndex,
+    roots: &BTreeSet<String>,
+    old: &str,
+    new: &str,
+) -> Result<String, Unsupported> {
+    let mut done = BTreeSet::new();
+    let mut queue: Vec<String> = roots.iter().cloned().collect();
+    let mut out = String::new();
+    while let Some(name) = queue.pop() {
+        if !done.insert(name.clone()) {
+            continue;
+        }
+        let g = generate(index, &name, old, new)?;
+        out.push_str(&g.builder);
+        out.push('\n');
+        out.push_str(&g.cloner);
+        out.push('\n');
+        out.push_str(&g.comparer);
+        out.push('\n');
+        for r in g.referenced {
+            if !done.contains(&r) {
+                queue.push(r);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// How one argument or return value is supplied to the two versions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Shape {
@@ -533,6 +565,26 @@ mod tests {
         let idx = index("pub struct T { pub v: i32 }");
         let s = signature_shapes(&idx, &sig("fn f(a: i32)")).unwrap();
         assert_eq!(s.ret, Shape::Scalar);
+    }
+
+    #[test]
+    fn generate_all_closes_over_referenced_structs() {
+        let src = "pub struct A { pub b: *mut B, pub x: i32 }\npub struct B { pub y: i32 }";
+        let roots = ["A".to_owned()].into_iter().collect();
+        let code = generate_all(&index(src), &roots, "old", "new").unwrap();
+        // Reached A directly and B through A's pointer field.
+        assert!(code.contains("gen_A(depth: usize) -> *mut old::A"));
+        assert!(code.contains("gen_B(depth: usize) -> *mut old::B"));
+        assert!(code.contains("clone_B("));
+        assert!(code.contains("same_B("));
+    }
+
+    #[test]
+    fn generate_all_fails_on_an_unsupported_reachable_struct() {
+        let src = "pub struct A { pub b: *mut B }\npub struct B { pub f: *mut FILE }";
+        let roots = ["A".to_owned()].into_iter().collect();
+        let err = generate_all(&index(src), &roots, "old", "new").unwrap_err();
+        assert_eq!(err.struct_name, "B");
     }
 
     #[test]

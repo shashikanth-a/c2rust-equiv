@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::crate_index::CrateIndex;
+use crate::heapgen::{self, Shape, SigShapes};
 use crate::kani;
 use crate::process;
 use crate::scratch;
@@ -171,6 +173,12 @@ fn run_check(
     kani_ms: &mut Option<u64>,
     test_ms: &mut Option<u64>,
 ) -> io::Result<Status> {
+    // Functions that pass pointers to structs the generator supports take the
+    // heap path; everything else takes the scalar path below.
+    if let Some((shapes, code)) = heap_plan(old, new) {
+        return run_heap_check(old, new, opts, &shapes, &code, kani_ms);
+    }
+
     let old_sig = match old.validate() {
         Ok(sig) => sig,
         Err(skip) => return Ok(skipped(skip.category, skip.detail)),
@@ -246,6 +254,162 @@ fn run_check(
 
 fn skipped(category: String, reason: String) -> Status {
     Status::Skipped { category, reason }
+}
+
+/// A crate index over a unit's own items, so the generator can see its structs.
+fn index_of(unit: &FnUnit) -> Option<CrateIndex> {
+    let file = syn::File {
+        shebang: None,
+        attrs: vec![],
+        items: unit.items(),
+    };
+    let mut index = CrateIndex::default();
+    index
+        .add_source("unit.rs", &prettyplease::unparse(&file))
+        .ok()?;
+    Some(index)
+}
+
+/// If both versions take or return pointers to structs the generator supports
+/// (and their bodies are in scope for the heap path), the shared shapes and the
+/// generated builder/cloner/comparer code. `None` falls through to the scalar
+/// path, which reports why the function is out of scope.
+fn heap_plan(old: &FnUnit, new: &FnUnit) -> Option<(SigShapes, String)> {
+    let index = index_of(old)?;
+    let shapes = heapgen::signature_shapes(&index, &old.function.sig).ok()?;
+    let has_heap = shapes.args.iter().any(|s| matches!(s, Shape::Heap(_)))
+        || matches!(shapes.ret, Shape::Heap(_));
+    if !has_heap {
+        return None;
+    }
+    // The rewrite must have the same shape, or it isn't a drop-in replacement.
+    let new_shapes = heapgen::signature_shapes(&index_of(new)?, &new.function.sig).ok()?;
+    if new_shapes.args != shapes.args || new_shapes.ret != shapes.ret {
+        return None;
+    }
+    // Pointers are allowed on this path, but IO, globals and foreign calls still
+    // put the function out of scope; the scalar path then reports the reason.
+    old.heap_body_in_scope().ok()?;
+    new.heap_body_in_scope().ok()?;
+    let code = heapgen::generate_all(&index, &shapes.structs, "old", "new").ok()?;
+    Some((shapes, code))
+}
+
+fn run_heap_check(
+    old: &FnUnit,
+    new: &FnUnit,
+    opts: &Options,
+    shapes: &SigShapes,
+    code: &str,
+    kani_ms: &mut Option<u64>,
+) -> io::Result<Status> {
+    if !opts.kani {
+        return Ok(skipped(
+            "heap".into(),
+            "the heap path needs Kani (there is no native heap runner yet)".into(),
+        ));
+    }
+    let opts = &Options {
+        work_dir: std::env::current_dir()?.join(&opts.work_dir),
+        ..opts.clone()
+    };
+    let dir = opts.work_dir.join("scratch").join(old.name());
+    if dir.exists() {
+        fs::remove_dir_all(&dir)?;
+    }
+    scratch::write_heap(&dir, old, new, &opts.edition, opts.unwind, shapes, code)?;
+    let timeout = if old.uses_floats() || new.uses_floats() {
+        opts.float_kani_timeout
+    } else {
+        opts.kani_timeout
+    };
+    let start = Instant::now();
+    let status = heap_decision(&dir, opts, timeout)?;
+    *kani_ms = Some(start.elapsed().as_millis() as u64);
+    Ok(status)
+}
+
+/// The heap path's verdict. It only ever proves or skips: without a native
+/// heap runner it can't confirm a difference, and the spec requires every
+/// reported counterexample to be real (specs/Verdict.tla), so an unconfirmed
+/// Kani failure is reported as a skip with its reason, never as a proof.
+fn heap_decision(dir: &Path, opts: &Options, timeout: Duration) -> io::Result<Status> {
+    if !kani::available() {
+        return Ok(skipped("heap".into(), "kani is not installed".into()));
+    }
+    let harnesses = match kani::run(dir, &opts.work_dir.join("target-kani"), timeout)? {
+        kani::Run::Done(h) => h,
+        kani::Run::TimedOut => {
+            return Ok(skipped(
+                "heap".into(),
+                format!("kani timed out after {}s", timeout.as_secs()),
+            ))
+        }
+        kani::Run::BuildFailed(e) => {
+            return Ok(Status::Error {
+                reason: format!("heap scratch crate did not build under kani: {e}"),
+            })
+        }
+    };
+    let names: Vec<&str> = harnesses.iter().map(|h| h.name.as_str()).collect();
+    if names != [scratch::NEW_FIRST, scratch::OLD_FIRST]
+        && names != [scratch::OLD_FIRST, scratch::NEW_FIRST]
+    {
+        return Ok(skipped(
+            "heap".into(),
+            format!("unexpected kani harnesses: {names:?}"),
+        ));
+    }
+    let checks = || harnesses.iter().flat_map(|h| h.checks.iter());
+    // Allocation pulls in constructs Kani can't model (the alloc-error handler,
+    // caller_location); Kani proves them unreachable and marks them SUCCESS.
+    // Only a *failed* unsupported-construct check (a reachable one) disqualifies.
+    if let Some(c) = checks().find(|c| {
+        c.failed()
+            && (c.name.contains("unsupported_construct")
+                || c.description.contains("not currently supported"))
+    }) {
+        return Ok(skipped(
+            "heap".into(),
+            format!("kani does not support: {}", c.description),
+        ));
+    }
+    if checks().any(|c| c.failed() && c.name.contains(".unwind.")) {
+        return Ok(skipped(
+            "heap".into(),
+            format!("a loop needs more than unwind={} iterations", opts.unwind),
+        ));
+    }
+    if let Some(c) = checks().find(|c| c.status == "UNDETERMINED") {
+        return Ok(skipped(
+            "heap".into(),
+            format!("kani could not decide `{}`", c.description),
+        ));
+    }
+    if let Some(c) = harnesses
+        .iter()
+        .find_map(|h| unexplained(h).first().copied())
+    {
+        return Ok(skipped(
+            "heap".into(),
+            format!(
+                "kani reported `{}`, a possible difference the heap path can't yet confirm natively",
+                c.description
+            ),
+        ));
+    }
+    if let Some(h) = harnesses.iter().find(|h| {
+        h.checks.is_empty() || h.verified != Some(!h.checks.iter().any(kani::Check::failed))
+    }) {
+        return Ok(skipped(
+            "heap".into(),
+            format!("kani's output for {} could not be parsed", h.name),
+        ));
+    }
+    Ok(Status::Proved {
+        bounded: true,
+        unwind: opts.unwind,
+    })
 }
 
 /// Build the native runner; `Ok(Err(..))` if the crate doesn't compile.
