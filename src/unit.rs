@@ -295,6 +295,16 @@ pub(crate) fn std_path_skip(segs: &[String]) -> Option<Skip> {
     }
 }
 
+/// The C allocation and memory functions Kani models directly, so the heap
+/// path may call them. Others (e.g. `strlen`, `printf`) need FFI models or
+/// stubs and stay out of scope for now.
+fn is_modelled_c_fn(name: &str) -> bool {
+    matches!(
+        name,
+        "malloc" | "calloc" | "realloc" | "free" | "memcpy" | "memmove" | "memset" | "memcmp"
+    )
+}
+
 /// Finds constructs that are out of scope in a self-contained unit.
 struct BodyChecker {
     skip: Option<Skip>,
@@ -324,19 +334,40 @@ impl<'ast> Visit<'ast> for BodyChecker {
         ));
     }
 
-    fn visit_item_foreign_mod(&mut self, _: &'ast syn::ItemForeignMod) {
-        self.set(Skip::new("foreign call", "declares foreign items"));
+    fn visit_item_foreign_mod(&mut self, m: &'ast syn::ItemForeignMod) {
+        // On the heap path, foreign declarations of the C allocation and memory
+        // functions Kani models are allowed; any other foreign item is not.
+        for item in &m.items {
+            let ok = self.allow_pointers
+                && matches!(item, syn::ForeignItem::Fn(f) if is_modelled_c_fn(&f.sig.ident.to_string()));
+            if !ok {
+                let what = match item {
+                    syn::ForeignItem::Fn(f) => format!("foreign function `{}`", f.sig.ident),
+                    _ => "a foreign item".to_owned(),
+                };
+                self.set(Skip::new("foreign call", format!("declares {what}")));
+            }
+        }
     }
 
     fn visit_path(&mut self, path: &'ast syn::Path) {
         let segs = scalar::idents(path);
         if segs.first().map(String::as_str) == Some("libc") {
-            self.set(Skip::new(
-                "foreign call",
-                format!("uses `{}`", segs.join("::")),
-            ));
+            // On the heap path, `libc::malloc` and friends that Kani models are
+            // allowed, like the equivalent extern declarations.
+            let modelled = self.allow_pointers && segs.len() == 2 && is_modelled_c_fn(&segs[1]);
+            if !modelled {
+                self.set(Skip::new(
+                    "foreign call",
+                    format!("uses `{}`", segs.join("::")),
+                ));
+            }
         } else if let Some(skip) = std_path_skip(&segs) {
-            self.set(skip);
+            // The heap path allows `core::ptr::*` (null, offset, copy, ...),
+            // which Kani models; IO and the rest still put it out of scope.
+            if !(self.allow_pointers && skip.category == "raw pointer") {
+                self.set(skip);
+            }
         }
         syn::visit::visit_path(self, path);
     }
@@ -368,5 +399,56 @@ impl<'ast> Visit<'ast> for FloatFinder {
         ) {
             self.found = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unit(function: &str, callees: &[&str]) -> FnUnit {
+        FnUnit::parse(function, callees).unwrap()
+    }
+
+    #[test]
+    fn heap_body_allows_modelled_allocators() {
+        let u = unit(
+            "pub unsafe fn f(p: *mut u8) -> *mut u8 { realloc(p, 8) }",
+            &["extern \"C\" { fn realloc(p: *mut u8, n: usize) -> *mut u8; }"],
+        );
+        assert!(u.heap_body_in_scope().is_ok());
+    }
+
+    #[test]
+    fn heap_body_rejects_other_foreign_calls() {
+        let u = unit(
+            "pub unsafe fn f() { printf(); }",
+            &["extern \"C\" { fn printf(); }"],
+        );
+        let skip = u.heap_body_in_scope().unwrap_err();
+        assert_eq!(skip.category, "foreign call");
+        assert!(skip.detail.contains("printf"));
+    }
+
+    #[test]
+    fn heap_body_allows_pointers_but_scalar_validate_does_not() {
+        let u = unit("pub unsafe fn f(p: *mut i32) -> i32 { *p }", &[]);
+        // The heap path accepts the pointer; the scalar path rejects it (its
+        // signature check runs first and sees a non-scalar argument).
+        assert!(u.heap_body_in_scope().is_ok());
+        assert!(u.validate().is_err());
+    }
+
+    #[test]
+    fn body_checker_rejects_a_raw_pointer_on_the_scalar_path() {
+        // A pointer buried in a callee's body (not the signature) is caught by
+        // the body checker as a raw-pointer use on the scalar path.
+        let u = unit(
+            "pub fn f() -> i32 { g() }",
+            &["pub fn g() -> i32 { let p: *const i32 = core::ptr::null(); unsafe { if p.is_null() { 0 } else { *p } } }"],
+        );
+        let skip = u.validate().unwrap_err();
+        assert_eq!(skip.category, "raw pointer");
+        assert!(u.heap_body_in_scope().is_ok());
     }
 }
