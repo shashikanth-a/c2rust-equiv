@@ -19,6 +19,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use quote::ToTokens;
+
 use crate::crate_index::{CrateIndex, Kind};
 use crate::scalar;
 
@@ -188,6 +190,87 @@ pub fn generate(
         comparer: comparer(struct_name, old, new, &fields),
         referenced,
     })
+}
+
+/// How one argument or return value is supplied to the two versions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Shape {
+    /// A scalar: `kani::any()`, copied across unchanged.
+    Scalar,
+    /// A raw pointer to a named struct: built with `gen_<T>` and cloned with
+    /// `clone_<T>`, compared with `same_<T>`.
+    Heap(String),
+}
+
+/// The shapes of a function's arguments and return value for the heap path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SigShapes {
+    pub args: Vec<Shape>,
+    pub ret: Shape,
+    /// The structs named directly in the signature, so the caller knows which
+    /// builders to generate (then closed over each one's `referenced` set).
+    pub structs: BTreeSet<String>,
+}
+
+/// Classify a function signature for the heap path: every argument and the
+/// return value must be a scalar or a raw pointer to a struct the generator
+/// supports. The `()` return becomes [`Shape::Scalar`] (nothing to compare).
+///
+/// Type aliases aren't followed here (a later step): a pointer written through
+/// a typedef is reported unsupported rather than silently mishandled.
+pub fn signature_shapes(
+    index: &CrateIndex,
+    sig: &syn::Signature,
+) -> Result<SigShapes, Unsupported> {
+    let table = struct_table(index);
+    let names: BTreeSet<&String> = table.keys().collect();
+    let mut structs = BTreeSet::new();
+
+    let shape_of = |ty: &syn::Type, structs: &mut BTreeSet<String>| -> Result<Shape, String> {
+        // An empty tuple return is unit: a scalar here, with nothing to compare.
+        if let syn::Type::Tuple(t) = ty {
+            if t.elems.is_empty() {
+                return Ok(Shape::Scalar);
+            }
+        }
+        match classify(ty, &names)? {
+            Field::Scalar(_) => Ok(Shape::Scalar),
+            Field::Pointer(target) => {
+                structs.insert(target.clone());
+                Ok(Shape::Heap(target))
+            }
+        }
+    };
+
+    let mut args = Vec::new();
+    for input in &sig.inputs {
+        let syn::FnArg::Typed(pat_ty) = input else {
+            return Err(Unsupported {
+                struct_name: String::new(),
+                field: "self".to_owned(),
+                detail: "method with a receiver".to_owned(),
+            });
+        };
+        let shape = shape_of(&pat_ty.ty, &mut structs).map_err(|detail| Unsupported {
+            struct_name: String::new(),
+            field: pat_ty.pat.to_token_stream().to_string(),
+            detail,
+        })?;
+        args.push(shape);
+    }
+
+    let ret = match &sig.output {
+        syn::ReturnType::Default => Shape::Scalar,
+        syn::ReturnType::Type(_, ty) => {
+            shape_of(ty, &mut structs).map_err(|detail| Unsupported {
+                struct_name: String::new(),
+                field: "<return>".to_owned(),
+                detail,
+            })?
+        }
+    };
+
+    Ok(SigShapes { args, ret, structs })
 }
 
 /// `gen_<T>(depth) -> *mut old::T`: null below the bound or by a symbolic
@@ -372,5 +455,43 @@ mod tests {
         let src = "pub struct S { pub f: Option<unsafe extern \"C\" fn()> }";
         let err = generate(&index(src), "S", "old", "new").unwrap_err();
         assert_eq!(err.field, "f");
+    }
+
+    fn sig(s: &str) -> syn::Signature {
+        let f: syn::ItemFn = syn::parse_str(&format!("{s} {{ unimplemented!() }}")).unwrap();
+        f.sig
+    }
+
+    #[test]
+    fn signature_mixing_scalars_and_heap_pointers() {
+        let idx = index("pub struct T { pub v: i32, pub next: *mut T }");
+        let s = signature_shapes(&idx, &sig("fn f(n: *mut T, k: i32) -> *mut T")).unwrap();
+        assert_eq!(s.args, vec![Shape::Heap("T".to_owned()), Shape::Scalar]);
+        assert_eq!(s.ret, Shape::Heap("T".to_owned()));
+        assert_eq!(s.structs, ["T".to_owned()].into_iter().collect());
+    }
+
+    #[test]
+    fn scalar_only_signature_names_no_structs() {
+        let idx = index("pub struct T { pub v: i32 }");
+        let s = signature_shapes(&idx, &sig("fn f(a: c_int) -> size_t")).unwrap();
+        assert_eq!(s.args, vec![Shape::Scalar]);
+        assert_eq!(s.ret, Shape::Scalar);
+        assert!(s.structs.is_empty());
+    }
+
+    #[test]
+    fn unit_return_is_a_scalar_shape() {
+        let idx = index("pub struct T { pub v: i32 }");
+        let s = signature_shapes(&idx, &sig("fn f(a: i32)")).unwrap();
+        assert_eq!(s.ret, Shape::Scalar);
+    }
+
+    #[test]
+    fn pointer_to_unknown_struct_in_signature_is_unsupported() {
+        let idx = index("pub struct T { pub v: i32 }");
+        let err = signature_shapes(&idx, &sig("fn f(p: *mut FILE)")).unwrap_err();
+        assert_eq!(err.field, "p");
+        assert!(err.detail.contains("FILE"));
     }
 }
