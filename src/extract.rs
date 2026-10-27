@@ -113,11 +113,18 @@ fn extract_in(index: &CrateIndex, entry: usize, heap: bool) -> Result<FnUnit, Sk
         queue.extend(analyzer.found);
     }
 
+    // Drop closure entries c2rust duplicated identically across files, keeping
+    // one per name; a true collision (same name, different definition) is still
+    // an error. The function being extracted is always kept.
     let mut names: HashMap<(bool, String), usize> = HashMap::new();
+    let mut keep: Vec<usize> = Vec::new();
     for &e in &closure {
         let entry = &index.entries[e];
         let key = (entry.kind == Kind::TypeAlias, entry.name.clone());
         if let Some(&other) = names.get(&key) {
+            if same_item(&index.entries[other].item, &entry.item) {
+                continue;
+            }
             return Err(Skip::new(
                 "name collision",
                 format!(
@@ -128,11 +135,12 @@ fn extract_in(index: &CrateIndex, entry: usize, heap: bool) -> Result<FnUnit, Sk
             ));
         }
         names.insert(key, e);
+        keep.push(e);
     }
 
     let mut function = None;
     let mut callees = Vec::new();
-    for &e in &closure {
+    for &e in &keep {
         let mut item = index.entries[e]
             .item
             .clone()
@@ -275,6 +283,17 @@ impl Resolver<'_> {
             // A function and a foreign declaration of it in the same module.
             candidates.retain(|&i| index.entries[i].kind != Kind::ForeignFn);
         }
+        if candidates.len() > 1 {
+            // c2rust emits identical type/const definitions in many files; if
+            // every candidate is the same definition, they're interchangeable.
+            let first = &index.entries[candidates[0]].item;
+            if candidates[1..]
+                .iter()
+                .all(|&i| same_item(&index.entries[i].item, first))
+            {
+                candidates.truncate(1);
+            }
+        }
         match candidates.as_slice() {
             [] => {
                 if !prefix.is_empty() {
@@ -336,6 +355,19 @@ impl Resolver<'_> {
                 }
             }
         }
+    }
+}
+
+/// Whether two stored items are the same definition, by token text. Used to
+/// treat c2rust's identical per-file duplicate definitions as one.
+fn same_item(a: &Option<syn::Item>, b: &Option<syn::Item>) -> bool {
+    use quote::ToTokens;
+    match (a, b) {
+        (Some(x), Some(y)) => {
+            x.to_token_stream().to_string() == y.to_token_stream().to_string()
+        }
+        (None, None) => true,
+        _ => false,
     }
 }
 
