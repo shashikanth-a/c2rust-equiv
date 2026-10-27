@@ -234,6 +234,56 @@ fn tagged_union_path_does_not_prove_a_wrong_rewrite() {
     );
 }
 
+// A string-argument external (`note`) traced by content: both versions must
+// pass the same string bytes, not the same address.
+const NOTE_DECL: &str = "extern \"C\" { fn note(_: *const core::ffi::c_char); }";
+
+const NOTE_OLD: &str = r#"
+pub unsafe fn g(s: *const core::ffi::c_char) {
+    if s.is_null() { return; }
+    note(s);
+}
+"#;
+
+const NOTE_OK: &str = r#"
+pub unsafe fn g(s: *const core::ffi::c_char) {
+    if !s.is_null() { note(s); }
+}
+"#;
+
+const NOTE_BAD: &str = r#"
+pub unsafe fn g(s: *const core::ffi::c_char) {
+    if s.is_null() || *s == 0 { return; }
+    note(s.add(1));
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn string_arg_trace_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(NOTE_OLD, &[NOTE_DECL]).unwrap();
+    let new = FnUnit::parse(NOTE_OK, &[NOTE_DECL]).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn string_arg_trace_catches_different_content() {
+    let old = FnUnit::parse(NOTE_OLD, &[NOTE_DECL]).unwrap();
+    let new = FnUnit::parse(NOTE_BAD, &[NOTE_DECL]).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "different string content proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 // A side-effecting external (`emit`) modelled as an observable trace call:
 // both versions must make the same calls in the same order, catching a
 // divergence that the return value alone would miss.

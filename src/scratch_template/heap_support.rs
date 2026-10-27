@@ -128,33 +128,43 @@ pub static mut ORACLE: Oracle = Oracle {
 /// must replay it exactly, so both make the same calls in the same order.
 pub const TRACE_CAP: usize = 256;
 
-/// One recorded external call: its function id, up to three argument words
-/// (scalars by value, pointers by address, floats by bit pattern), and the
-/// symbolic result handed back (shared, so both versions see the same result).
+/// One recorded external call: its function id, up to three argument words,
+/// each argument's kind (0 scalar/float by value, 1 NUL-terminated string by
+/// content, 2 pointer by heap bijection, 3 unused), and the symbolic result
+/// handed back (shared, so both versions see the same result).
 #[derive(Clone, Copy, Default)]
 pub struct Call {
     pub id: u64,
     pub args: [u128; 3],
+    pub kinds: [u8; 3],
     pub ret: u128,
 }
 
-/// The shared external-call trace and its record/replay state.
+/// The shared external-call trace, its record/replay state, and a partial
+/// bijection between the two versions' pointer arguments (the SimuLiris/WhyRel
+/// approach: equal pointers are those that correspond, not those with equal
+/// addresses).
 pub struct Trace {
     pub calls: [Call; TRACE_CAP],
     pub len: usize,
     pub cursor: usize,
     pub recording: bool,
+    pub bij: [(u128, u128); TRACE_CAP],
+    pub blen: usize,
 }
 
 pub static mut TRACE: Trace = Trace {
     calls: [Call {
         id: 0,
         args: [0; 3],
+        kinds: [0; 3],
         ret: 0,
     }; TRACE_CAP],
     len: 0,
     cursor: 0,
     recording: true,
+    bij: [(0, 0); TRACE_CAP],
+    blen: 0,
 };
 
 impl Trace {
@@ -162,7 +172,27 @@ impl Trace {
     pub fn record(&mut self) {
         self.len = 0;
         self.cursor = 0;
+        self.blen = 0;
         self.recording = true;
+    }
+    /// Link a recorded (first-version) pointer to a replayed (second-version)
+    /// one, keeping the correspondence functional and injective. Returns false
+    /// on a conflict (the pointers don't correspond), i.e. a divergence.
+    fn link(&mut self, a: u128, b: u128) -> bool {
+        for i in 0..self.blen {
+            let (x, y) = self.bij[i];
+            if x == a && y == b {
+                return true;
+            }
+            if x == a || y == b {
+                return false;
+            }
+        }
+        if self.blen < TRACE_CAP {
+            self.bij[self.blen] = (a, b);
+            self.blen += 1;
+        }
+        true
     }
     /// Begin replaying them against the second version.
     pub fn replay(&mut self) {
@@ -179,23 +209,39 @@ impl Trace {
     /// One external call. While recording, append it with a fresh symbolic
     /// result; while replaying, require it matches the recorded call and return
     /// that call's result, so both versions make identical observable calls.
-    pub fn step(&mut self, id: u64, args: [u128; 3]) -> u128 {
+    pub fn step(&mut self, id: u64, args: [u128; 3], kinds: [u8; 3]) -> u128 {
         if self.recording {
             assert!(self.len < TRACE_CAP, "trace exceeds TRACE_CAP");
             let ret: u128 = kani::any();
-            self.calls[self.len] = Call { id, args, ret };
+            self.calls[self.len] = Call { id, args, kinds, ret };
             self.len += 1;
             ret
         } else {
             assert!(self.cursor < self.len, "second version makes more external calls");
             let c = self.calls[self.cursor];
-            // Compare element-wise: `[u128; 3]` equality lowers to `memcmp`,
-            // whose byte loop would need a large unwind bound.
-            let same = c.id == id
-                && c.args[0] == args[0]
-                && c.args[1] == args[1]
-                && c.args[2] == args[2];
-            assert!(same, "external call sequence differs");
+            assert!(c.id == id, "external call sequence differs");
+            let mut i = 0;
+            while i < 3 {
+                let (a, b) = (c.args[i], args[i]);
+                let ok = match kinds[i] {
+                    // Scalar/float: equal by value.
+                    0 => a == b,
+                    // NUL-terminated string: equal by content (first version's
+                    // buffer is still live during replay).
+                    1 => unsafe {
+                        same_cstr(
+                            a as usize as *const core::ffi::c_char,
+                            b as usize as *const core::ffi::c_char,
+                        )
+                    },
+                    // Pointer: equal iff it corresponds in the heap bijection.
+                    2 => self.link(a, b),
+                    // Unused argument slot.
+                    _ => true,
+                };
+                assert!(ok, "external call arguments differ");
+                i += 1;
+            }
             self.cursor += 1;
             c.ret
         }

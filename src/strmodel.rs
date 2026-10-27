@@ -72,10 +72,32 @@ fn is_trace_sig(sig: &syn::Signature) -> bool {
     if matches!(&sig.output, syn::ReturnType::Type(_, t) if matches!(&**t, syn::Type::Never(_))) {
         return false;
     }
+    // Each argument must be recordable: a scalar/float (by value), or a pointer
+    // (compared by content for strings, by heap bijection otherwise).
     sig.inputs.iter().all(|a| match a {
-        syn::FnArg::Typed(pt) => scalar_or_float(&pt.ty.to_token_stream().to_string()),
+        syn::FnArg::Typed(pt) => {
+            matches!(&*pt.ty, syn::Type::Ptr(_))
+                || scalar_or_float(&pt.ty.to_token_stream().to_string())
+        }
         syn::FnArg::Receiver(_) => false,
     })
+}
+
+/// How a trace argument is recorded: its bit expression and kind tag
+/// (0 scalar/float, 1 NUL-terminated string, 2 pointer by bijection).
+fn arg_kind_bits(name: &str, ty: &str) -> (String, u8) {
+    let t = ty.trim();
+    if t.starts_with('*') {
+        // A pointer: a `c_char`/`c_uchar` pointee is a string (compared by
+        // content), anything else is compared through the heap bijection.
+        let pointee = t.rsplit("::").next().unwrap_or(t).trim();
+        let kind = if pointee == "c_char" || pointee == "c_uchar" { 1 } else { 2 };
+        (format!("({name} as usize as u128)"), kind)
+    } else if float_width(ty).is_some() {
+        (format!("({name}.to_bits() as u128)"), 0)
+    } else {
+        (format!("({name} as u128)"), 0)
+    }
 }
 
 /// Whether a type's spelling is a scalar or float the trace records by value.
@@ -91,16 +113,16 @@ fn scalar_or_float(ty: &str) -> bool {
 /// return the shared symbolic result, rebuilt to the return type.
 fn trace_body(name: &str, args: &[(String, String)], ret: &str) -> String {
     let mut slots = [String::from("0u128"), String::from("0u128"), String::from("0u128")];
+    let mut kinds = [3u8, 3, 3];
     for (i, (n, t)) in args.iter().enumerate() {
-        slots[i] = match float_width(t) {
-            Some(_) => format!("({n}.to_bits() as u128)"),
-            None => format!("({n} as u128)"),
-        };
+        let (bits, kind) = arg_kind_bits(n, t);
+        slots[i] = bits;
+        kinds[i] = kind;
     }
     let id = oracle_id(name);
     let v = format!(
-        "(*core::ptr::addr_of_mut!(crate::support::TRACE)).step({id}u64, [{}, {}, {}])",
-        slots[0], slots[1], slots[2]
+        "(*core::ptr::addr_of_mut!(crate::support::TRACE)).step({id}u64, [{}, {}, {}], [{}u8, {}u8, {}u8])",
+        slots[0], slots[1], slots[2], kinds[0], kinds[1], kinds[2]
     );
     let result = match float_width(ret) {
         Some(32) => format!("f32::from_bits({v} as u32) as {ret}"),
