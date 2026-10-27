@@ -122,14 +122,16 @@ this tool.
 | Rewrites | Checked | Proved (bounded) | Counterexamples | Tested only | Skipped | Median / p95 time |
 |---|---|---|---|---|---|---|
 | Unit tests, larger model | 19 | 19 | 0 | 0 | 0 | 1.8 s / 2.0 s |
-| SQLite, larger model | 34 | 30 | 0 | 3 | 1 | 1.8 s / 13.2 s |
-| SQLite, smaller model | 33 | 30 | 0 | 3 | 0 | 2.1 s / 14.2 s |
+| SQLite, larger model | 34 | 30 | 0 | 3 | 1 | 2.4 s / 17.7 s |
+| SQLite, smaller model | 33 | 30 | 0 | 3 | 0 | 2.1 s / 13.4 s |
 
 None of these rewrites changed behaviour. Several looked risky but turned out
 correct, for example `wrapping_rem` replaced with `%` on unsigned values, or an
 `abs` that maps `i32::MIN` to `i32::MAX` replaced with `saturating_abs()`. Of
 the tested-only functions, two are floating-point functions where Kani hit the
 20-second float timeout, and one has a loop that needs more than 8 iterations.
+With a 300-second timeout and an unwinding bound of 12, the loop is proved in
+4 seconds, but both float functions still time out.
 The skip uses an unstable intrinsic. A second run with `--cache` hit the cache
 for every checked function, and took 5 seconds instead of 2 minutes 16.
 
@@ -137,9 +139,13 @@ for every checked function, and took 5 seconds instead of 2 minutes 16.
 mutation was applied to each SQLite function that had an obvious place for one
 (`<` to `<=`, a constant plus one, `wrapping_add` to `+`, `&` to `|`, and so on):
 
-| Mutants | Counterexamples (all found by Kani) | Proved |
-|---|---|---|
-| 25 | 24 | 1 |
+| Mutants | Method | Counterexamples | Tested only | Proved |
+|---|---|---|---|---|
+| 25 | Kani, then testing | 24 (all by Kani) | 0 | 1 |
+| 25 | Testing only (`--no-kani`) | 21 | 4 | 0 |
+
+Testing alone misses three real bugs, each of which changes the result for a
+single boundary input, such as `allowedOp(58)` when `>` becomes `>=`.
 
 The proved one doesn't change behaviour: it turns `n.wrapping_add(8)` into
 `n + 8` in a branch where `n` is at most 9. Some counterexamples:
