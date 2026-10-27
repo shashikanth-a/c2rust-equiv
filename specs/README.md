@@ -12,16 +12,29 @@ specs/check_alloy.py path/to/alloy.jar specs/Heap.als  # Alloy 6.2.0
 ```
 
 - `Verdict.tla`: the verdict logic in `src/check.rs`. Old and new are arbitrary
-  functions from a small input domain to a value or a panic, and Kani's choice
+  functions from a small input domain to a value, a panic, or undefined
+  behaviour, and they are equivalent when they agree wherever old is defined.
+  A panic ends Kani's path; a memory-safety violation doesn't. Kani's choice
   of printed inputs, timeouts and lost output are nondeterministic.
-  - `Verdict.cfg`: a `proved` verdict implies equivalence, and every reported
-    counterexample is real.
+  - `Verdict.cfg`, `VerdictUninstrumented.cfg`: a `proved` verdict implies
+    equivalence and every counterexample is real, with or without the
+    instrumentation below. Only a panic in the version a harness calls first
+    may be ignored.
   - `VerdictNoGuard.cfg` (must fail): without the check that Kani's verdict
     agrees with the parsed checks, lost output reads as a proof.
   - `VerdictLimits.cfg` (must fail): without targeted reruns, a difference
     Kani found can come back as a fallback to testing.
-  - `VerdictTargeted.cfg`: with targeted reruns, every difference Kani finds is
-    reported as a counterexample.
+  - `VerdictFull.cfg`: the design for pointer inputs is sound **and** complete
+    for runs that finish. It combines:
+    - one targeted rerun per unexplained check;
+    - old's memory accesses instrumented as assumptions, so its undefined
+      behaviour excludes the input;
+    - new's memory accesses instrumented to set a flag, which the main
+      harnesses assume is clear and a third harness checks;
+    - Miri to confirm undefined behaviour in new.
+  - `VerdictOldUB.cfg`, `VerdictNoNewUBFlag.cfg`, `VerdictNoMiri.cfg` (must
+    fail): without each of those, equivalent functions fall back, or
+    differences go unreported.
 - `Oracle.tla`: shared memoized stubs for unchanged callees. A memoized stub
   is an arbitrary function of its key, so "old and new agree under every
   stub" implies "they agree under every real callee" only when the key
