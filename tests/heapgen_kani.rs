@@ -21,7 +21,7 @@ fn heap_support() -> String {
     support[start..].to_owned()
 }
 
-const DEF: &str = "pub struct Node { pub v: i32, pub next: *mut Node }";
+const DEF: &str = "pub struct Node { pub v: i32, pub tag: [u8; 2], pub next: *mut Node }";
 
 // The two modules: each defines its own `Node` (distinct types, as the two
 // crates would be) and one version of "return the last node of the list"
@@ -29,7 +29,7 @@ const DEF: &str = "pub struct Node { pub v: i32, pub next: *mut Node }";
 // are equivalent, so Kani must prove it.
 const VERSIONS: &str = r#"
 pub mod old {
-    pub struct Node { pub v: i32, pub next: *mut Node }
+    pub struct Node { pub v: i32, pub tag: [u8; 2], pub next: *mut Node }
     pub unsafe fn last(mut p: *mut Node) -> *mut Node {
         if p.is_null() { return core::ptr::null_mut(); }
         while !(*p).next.is_null() { p = (*p).next; }
@@ -37,7 +37,7 @@ pub mod old {
     }
 }
 pub mod new {
-    pub struct Node { pub v: i32, pub next: *mut Node }
+    pub struct Node { pub v: i32, pub tag: [u8; 2], pub next: *mut Node }
     pub unsafe fn last(p: *mut Node) -> *mut Node {
         if p.is_null() { return core::ptr::null_mut(); }
         let mut c = p;

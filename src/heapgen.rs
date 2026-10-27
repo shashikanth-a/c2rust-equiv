@@ -40,6 +40,10 @@ enum Field {
     /// A raw pointer to a named struct: built recursively, compared through
     /// the correspondence map.
     Pointer(String),
+    /// A fixed-size array of a scalar (e.g. `[c_char; 32]`): each element
+    /// `kani::any()`, copied whole (arrays of scalars are `Copy`), compared
+    /// with `==` (arrays are `PartialEq` for every length).
+    ScalarArray,
 }
 
 /// The generated builder, cloner and comparer for one struct, plus the structs
@@ -139,6 +143,18 @@ fn classify(ty: &syn::Type, structs: &BTreeSet<&String>) -> Result<Field, String
         }
         return Err("pointer to a non-struct type".to_owned());
     }
+    // A fixed-size array of a scalar.
+    if let syn::Type::Array(arr) = ty {
+        if let Some(name) = last_segment(&arr.elem) {
+            if scalar::primitive(&name).is_some()
+                || scalar::c_type(&name).is_some()
+                || scalar::libc_typedef(&name).is_some()
+            {
+                return Ok(Field::ScalarArray);
+            }
+        }
+        return Err("array of a non-scalar element type".to_owned());
+    }
     Err(format!(
         "type `{}` is not a scalar or a pointer to a struct",
         last_segment(ty).unwrap_or_else(|| "?".to_owned())
@@ -234,7 +250,7 @@ pub fn signature_shapes(
             }
         }
         match classify(ty, &names)? {
-            Field::Scalar(_) => Ok(Shape::Scalar),
+            Field::Scalar(_) | Field::ScalarArray => Ok(Shape::Scalar),
             Field::Pointer(target) => {
                 structs.insert(target.clone());
                 Ok(Shape::Heap(target))
@@ -281,6 +297,7 @@ fn builder(struct_name: &str, old: &str, fields: &[(String, Field)]) -> String {
     for (name, field) in fields {
         let value = match field {
             Field::Scalar(_) => "kani::any()".to_owned(),
+            Field::ScalarArray => "core::array::from_fn(|_| kani::any())".to_owned(),
             Field::Pointer(target) => format!("gen_{target}(depth - 1)"),
         };
         inits += &format!("            {name}: {value},\n");
@@ -308,7 +325,10 @@ fn cloner(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)]) -
     let mut links = String::new();
     for (name, field) in fields {
         match field {
-            Field::Scalar(_) => inits += &format!("        {name}: (*src).{name},\n"),
+            // Scalars and scalar arrays are `Copy`: copy them in the initializer.
+            Field::Scalar(_) | Field::ScalarArray => {
+                inits += &format!("        {name}: (*src).{name},\n")
+            }
             Field::Pointer(target) => {
                 inits += &format!("        {name}: core::ptr::null_mut(),\n");
                 links += &format!("    (*dst).{name} = clone_{target}((*src).{name}, map);\n");
@@ -343,7 +363,10 @@ fn comparer(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)])
     let mut checks = String::new();
     for (name, field) in fields {
         let line = match field {
-            Field::Scalar(_) => format!("    if (*a).{name} != (*b).{name} {{ return false; }}\n"),
+            // Arrays of scalars are `PartialEq` for every length, like scalars.
+            Field::Scalar(_) | Field::ScalarArray => {
+                format!("    if (*a).{name} != (*b).{name} {{ return false; }}\n")
+            }
             Field::Pointer(target) => format!(
                 "    if !same_{target}((*a).{name}, (*b).{name}, corr) {{ return false; }}\n",
             ),
@@ -430,6 +453,31 @@ mod tests {
             .find("(*dst).next = clone_N((*src).next, map);")
             .unwrap();
         assert!(map_at < link_at, "must register before recursing");
+    }
+
+    #[test]
+    fn scalar_array_field_builds_clones_and_compares_elementwise() {
+        let src = "pub struct S { pub buf: [c_char; 32], pub n: i32 }";
+        let g = generate(&index(src), "S", "old", "new").unwrap();
+        assert!(g.referenced.is_empty());
+        // Built per element, so elements are independently symbolic.
+        assert!(g
+            .builder
+            .contains("buf: core::array::from_fn(|_| kani::any()),"));
+        // Copied whole (arrays of scalars are Copy).
+        assert!(g.cloner.contains("buf: (*src).buf,"));
+        // Compared with `==` (arrays are PartialEq for every length).
+        assert!(g
+            .comparer
+            .contains("if (*a).buf != (*b).buf { return false; }"));
+    }
+
+    #[test]
+    fn array_of_non_scalar_is_unsupported() {
+        let src = "pub struct S { pub kids: [*mut S; 4] }";
+        let err = generate(&index(src), "S", "old", "new").unwrap_err();
+        assert_eq!(err.field, "kids");
+        assert!(err.detail.contains("array"));
     }
 
     #[test]
