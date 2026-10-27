@@ -7,6 +7,7 @@
 
 mod allocmodel;
 pub mod cache;
+mod compose;
 mod modref;
 mod summary;
 pub mod check;
