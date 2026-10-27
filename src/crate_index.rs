@@ -163,19 +163,35 @@ impl CrateIndex {
                 }
                 syn::Item::ForeignMod(m) => {
                     for foreign in &m.items {
+                        // Store each foreign item as its own one-item `extern`
+                        // block, so it can be pulled into a unit (and emitted
+                        // as a valid declaration) when the heap path models it.
+                        let wrap = |fi: syn::ForeignItem| {
+                            syn::Item::ForeignMod(syn::ItemForeignMod {
+                                attrs: vec![],
+                                unsafety: m.unsafety,
+                                abi: m.abi.clone(),
+                                brace_token: m.brace_token,
+                                items: vec![fi],
+                            })
+                        };
                         match foreign {
                             syn::ForeignItem::Fn(f) => {
                                 let name = f.sig.ident.to_string();
                                 let symbol = link_name(&f.attrs).unwrap_or_else(|| name.clone());
-                                self.push(module, name, Kind::ForeignFn, None, Some(symbol));
+                                let item = wrap(syn::ForeignItem::Fn(f.clone()));
+                                self.push(module, name, Kind::ForeignFn, Some(item), Some(symbol));
                             }
-                            syn::ForeignItem::Static(s) => self.push(
-                                module,
-                                s.ident.to_string(),
-                                Kind::ForeignStatic,
-                                None,
-                                None,
-                            ),
+                            syn::ForeignItem::Static(s) => {
+                                let item = wrap(syn::ForeignItem::Static(s.clone()));
+                                self.push(
+                                    module,
+                                    s.ident.to_string(),
+                                    Kind::ForeignStatic,
+                                    Some(item),
+                                    None,
+                                );
+                            }
                             _ => {}
                         }
                     }

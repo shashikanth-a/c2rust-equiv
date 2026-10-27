@@ -100,8 +100,10 @@ fn eligibility_lists_every_function() {
         .iter()
         .find(|r| r["id"] == "src/math.rs::read")
         .unwrap();
-    assert_eq!(read["eligible"], false);
-    assert_eq!(read["category"], "raw pointer");
+    // `read(p: *const i32)` reads a single scalar through a pointer, so the
+    // heap path takes it as a scalar cell.
+    assert_eq!(read["eligible"], true);
+    assert_eq!(read["path"], "heap");
 }
 
 #[test]

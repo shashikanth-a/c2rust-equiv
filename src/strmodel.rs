@@ -20,7 +20,19 @@ use std::collections::BTreeMap;
 /// that write through a destination pointer (`strcpy`, `strcat`) are excluded,
 /// because the destination's bounds aren't modelled.
 pub fn is_str_model(name: &str) -> bool {
-    matches!(name, "strlen" | "strcmp" | "strncmp" | "strchr" | "strrchr")
+    matches!(
+        name,
+        "strlen"
+            | "strcmp"
+            | "strncmp"
+            | "strchr"
+            | "strrchr"
+            // The assertion handler and errno accessor also get Rust bodies.
+            | "__assert_rtn"
+            | "__assert_fail"
+            | "__error"
+            | "__errno_location"
+    )
 }
 
 /// Replace every `extern` declaration of a modelled C string function with a
@@ -116,6 +128,16 @@ fn body(name: &str, a: &[&str], ret: &str) -> Option<String> {
                if *p as u8 == {c} as u8 {{ last = p as {ret}; }} \
                if *p == 0 {{ return last; }} p = p.add(1); }} }}"
         ),
+        // A failed assertion aborts in C; model it as a panic, which Kani
+        // treats as cutting the path (so it never counts as a divergence).
+        ("__assert_rtn" | "__assert_fail", _) => {
+            "{ panic!(\"assertion failed\") }".to_owned()
+        }
+        // errno: a single per-run cell, zero-initialised. Both versions get
+        // their own, so errno-dependent behaviour stays consistent in-run.
+        ("__error" | "__errno_location", []) => {
+            "{ static mut ERRNO: core::ffi::c_int = 0; core::ptr::addr_of_mut!(ERRNO) as _ }".to_owned()
+        }
         _ => return None,
     };
     Some(block)

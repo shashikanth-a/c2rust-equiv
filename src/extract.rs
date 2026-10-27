@@ -321,6 +321,10 @@ impl Resolver<'_> {
                 let symbol = entry.symbol.as_deref().unwrap_or(&entry.name);
                 match self.index.defs_by_symbol(symbol).as_slice() {
                     [def] => Res::Item(*def),
+                    // On the heap path, a C memory or string function Kani can
+                    // model (or `strmodel` defines) is pulled in as its own
+                    // declaration rather than rejected as a foreign call.
+                    [] if self.heap && crate::unit::is_modelled_c_fn(&entry.name) => Res::Item(e),
                     [] => Res::Skip(Skip::new(
                         "foreign call",
                         format!("calls foreign function `{shown}`"),
@@ -473,7 +477,23 @@ impl<'ast> Visit<'ast> for Analyzer<'_> {
         ));
     }
 
-    fn visit_item_foreign_mod(&mut self, _: &'ast syn::ItemForeignMod) {
+    fn visit_item_foreign_mod(&mut self, m: &'ast syn::ItemForeignMod) {
+        // On the heap path, an `extern` block declaring only functions Kani
+        // models (or that `strmodel` defines) and the modelled allocator
+        // globals is kept; anything else is still out of scope.
+        if self.resolver.heap
+            && m.items.iter().all(|it| match it {
+                syn::ForeignItem::Fn(f) => {
+                    crate::unit::is_modelled_c_fn(&f.sig.ident.to_string())
+                }
+                syn::ForeignItem::Static(s) => {
+                    crate::allocmodel::is_alloc_global(&s.ident.to_string())
+                }
+                _ => false,
+            })
+        {
+            return;
+        }
         self.skip
             .get_or_insert(Skip::new("foreign call", "declares foreign items"));
     }
