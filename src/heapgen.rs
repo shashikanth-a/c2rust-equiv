@@ -4,7 +4,9 @@
 //! from the [`CrateIndex`], emit Kani code that
 //!
 //! - builds a bounded symbolic instance on the heap (`gen_<T>`), with each
-//!   pointer field null or a fresh object one level down, to a depth bound, and
+//!   pointer field null or a fresh object one level down, to a depth bound,
+//! - deep-copies that instance from `old`'s layout into `new`'s (`clone_<T>`),
+//!   preserving sharing and cycles, so both versions get isomorphic inputs, and
 //! - compares two instances structurally (`same_<T>`), following pointers
 //!   through a correspondence map that must stay functional and injective, so
 //!   that an object shared by two fields is distinguished from two equal
@@ -38,11 +40,14 @@ enum Field {
     Pointer(String),
 }
 
-/// The generated builder and comparer for one struct, plus the structs it
-/// points to (which the caller must also generate).
+/// The generated builder, cloner and comparer for one struct, plus the structs
+/// it points to (which the caller must also generate).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Generated {
     pub builder: String,
+    /// A deep copy from `old`'s layout into `new`'s, preserving sharing and
+    /// cycles, so both versions receive isomorphic symbolic heaps.
+    pub cloner: String,
     pub comparer: String,
     /// Structs this one points to, so the caller can close the set.
     pub referenced: BTreeSet<String>,
@@ -138,14 +143,17 @@ fn classify(ty: &syn::Type, structs: &BTreeSet<&String>) -> Result<Field, String
     ))
 }
 
-/// Generate the builder and comparer for one struct.
+/// Generate the builder, cloner and comparer for one struct.
 ///
-/// `module` is the module path the struct lives under in the scratch crate
-/// (`old` or `new`), so generated code names `old::T` or `new::T`.
+/// `old` and `new` are the module paths the two crates live under in the
+/// scratch crate. Equivalence harnesses build a symbolic heap of `old::T`
+/// (`gen_<T>`), clone it into an isomorphic `new::T` (`clone_<T>`), run both
+/// versions, then compare the two heaps structurally (`same_<T>`).
 pub fn generate(
     index: &CrateIndex,
     struct_name: &str,
-    module: &str,
+    old: &str,
+    new: &str,
 ) -> Result<Generated, Unsupported> {
     let table = struct_table(index);
     let names: BTreeSet<&String> = table.keys().collect();
@@ -175,35 +183,31 @@ pub fn generate(
     }
 
     Ok(Generated {
-        builder: builder(struct_name, module, &fields),
-        comparer: comparer(struct_name, module, &fields),
+        builder: builder(struct_name, old, &fields),
+        cloner: cloner(struct_name, old, new, &fields),
+        comparer: comparer(struct_name, old, new, &fields),
         referenced,
     })
 }
 
-fn fn_suffix(module: &str, struct_name: &str) -> String {
-    format!("{module}_{struct_name}")
-}
-
-/// `gen_<module>_<T>(depth) -> *mut module::T`: null below the bound or by a
-/// symbolic choice, else a fresh object with symbolic scalars and recursively
-/// built pointees.
-fn builder(struct_name: &str, module: &str, fields: &[(String, Field)]) -> String {
-    let suffix = fn_suffix(module, struct_name);
+/// `gen_<T>(depth) -> *mut old::T`: null below the bound or by a symbolic
+/// choice, else a fresh object with symbolic scalars and recursively built
+/// pointees.
+fn builder(struct_name: &str, old: &str, fields: &[(String, Field)]) -> String {
     let mut inits = String::new();
     for (name, field) in fields {
         let value = match field {
             Field::Scalar(_) => "kani::any()".to_owned(),
-            Field::Pointer(target) => format!("gen_{}(depth - 1)", fn_suffix(module, target)),
+            Field::Pointer(target) => format!("gen_{target}(depth - 1)"),
         };
         inits += &format!("            {name}: {value},\n");
     }
     format!(
-        "pub unsafe fn gen_{suffix}(depth: usize) -> *mut {module}::{struct_name} {{\n\
+        "pub unsafe fn gen_{struct_name}(depth: usize) -> *mut {old}::{struct_name} {{\n\
          \x20   if depth == 0 || kani::any() {{\n\
          \x20       return core::ptr::null_mut();\n\
          \x20   }}\n\
-         \x20   let obj = {module}::{struct_name} {{\n\
+         \x20   let obj = {old}::{struct_name} {{\n\
          {inits}\
          \x20   }};\n\
          \x20   Box::into_raw(Box::new(obj))\n\
@@ -211,17 +215,54 @@ fn builder(struct_name: &str, module: &str, fields: &[(String, Field)]) -> Strin
     )
 }
 
-/// `same_<module>_<T>(a, b, corr) -> bool`: equal scalars, matching null-ness,
-/// and corresponding pointees, with `corr` kept functional and injective.
-fn comparer(struct_name: &str, module: &str, fields: &[(String, Field)]) -> String {
-    let suffix = fn_suffix(module, struct_name);
+/// `clone_<T>(src, map) -> *mut new::T`: a deep copy from `old`'s layout into
+/// `new`'s. The pointer is registered in `map` before the fields recurse, so
+/// shared objects become shared and cycles terminate instead of looping.
+fn cloner(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)]) -> String {
+    // Scalars are copied in the initializer; pointer fields start null and are
+    // filled after the object is registered, so a cycle back to it resolves.
+    let mut inits = String::new();
+    let mut links = String::new();
+    for (name, field) in fields {
+        match field {
+            Field::Scalar(_) => inits += &format!("        {name}: (*src).{name},\n"),
+            Field::Pointer(target) => {
+                inits += &format!("        {name}: core::ptr::null_mut(),\n");
+                links += &format!("    (*dst).{name} = clone_{target}((*src).{name}, map);\n");
+            }
+        }
+    }
+    format!(
+        "pub unsafe fn clone_{struct_name}(\n\
+         \x20   src: *const {old}::{struct_name},\n\
+         \x20   map: &mut CloneMap,\n\
+         ) -> *mut {new}::{struct_name} {{\n\
+         \x20   if src.is_null() {{\n\
+         \x20       return core::ptr::null_mut();\n\
+         \x20   }}\n\
+         \x20   if let Some(dst) = map.get(src as *const ()) {{\n\
+         \x20       return dst as *mut {new}::{struct_name};\n\
+         \x20   }}\n\
+         \x20   let dst = Box::into_raw(Box::new({new}::{struct_name} {{\n\
+         {inits}\
+         \x20   }}));\n\
+         \x20   map.insert(src as *const (), dst as *const ());\n\
+         {links}\
+         \x20   dst\n\
+         }}\n"
+    )
+}
+
+/// `same_<T>(a, b, corr) -> bool`: equal scalars across `old::T` and `new::T`,
+/// matching null-ness, and corresponding pointees, with `corr` kept functional
+/// and injective.
+fn comparer(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)]) -> String {
     let mut checks = String::new();
     for (name, field) in fields {
         let line = match field {
             Field::Scalar(_) => format!("    if (*a).{name} != (*b).{name} {{ return false; }}\n"),
             Field::Pointer(target) => format!(
-                "    if !same_{}((*a).{name}, (*b).{name}, corr) {{ return false; }}\n",
-                fn_suffix(module, target)
+                "    if !same_{target}((*a).{name}, (*b).{name}, corr) {{ return false; }}\n",
             ),
         };
         checks += &line;
@@ -230,9 +271,9 @@ fn comparer(struct_name: &str, module: &str, fields: &[(String, Field)]) -> Stri
     // pair would break functionality (a already mapped elsewhere) or
     // injectivity (b already mapped from elsewhere).
     format!(
-        "pub unsafe fn same_{suffix}(\n\
-         \x20   a: *const {module}::{struct_name},\n\
-         \x20   b: *const {module}::{struct_name},\n\
+        "pub unsafe fn same_{struct_name}(\n\
+         \x20   a: *const {old}::{struct_name},\n\
+         \x20   b: *const {new}::{struct_name},\n\
          \x20   corr: &mut Corr,\n\
          ) -> bool {{\n\
          \x20   if a.is_null() || b.is_null() {{\n\
@@ -261,29 +302,57 @@ mod tests {
 
     #[test]
     fn scalar_only_struct() {
-        let g = generate(&index("pub struct P { pub x: i32, pub y: u8 }"), "P", "old").unwrap();
+        let g = generate(
+            &index("pub struct P { pub x: i32, pub y: u8 }"),
+            "P",
+            "old",
+            "new",
+        )
+        .unwrap();
         assert!(g.referenced.is_empty());
-        assert!(g.builder.contains("gen_old_P(depth: usize) -> *mut old::P"));
+        assert!(g.builder.contains("gen_P(depth: usize) -> *mut old::P"));
         assert!(g.builder.contains("x: kani::any(),"));
+        // The comparer spans the two modules.
+        assert!(g.comparer.contains("a: *const old::P,"));
+        assert!(g.comparer.contains("b: *const new::P,"));
         assert!(g.comparer.contains("if (*a).x != (*b).x { return false; }"));
         assert!(g.comparer.contains("corr.link("));
+        // Scalars are copied straight across in the cloner.
+        assert!(g.cloner.contains("-> *mut new::P"));
+        assert!(g.cloner.contains("x: (*src).x,"));
     }
 
     #[test]
     fn pointer_field_recurses_and_is_referenced() {
         let src = "pub struct N { pub v: i32, pub next: *mut N }";
-        let g = generate(&index(src), "N", "new").unwrap();
+        let g = generate(&index(src), "N", "old", "new").unwrap();
         assert_eq!(g.referenced, ["N".to_owned()].into_iter().collect());
-        assert!(g.builder.contains("next: gen_new_N(depth - 1),"));
+        assert!(g.builder.contains("next: gen_N(depth - 1),"));
         assert!(g
             .comparer
-            .contains("if !same_new_N((*a).next, (*b).next, corr) { return false; }"));
+            .contains("if !same_N((*a).next, (*b).next, corr) { return false; }"));
+    }
+
+    #[test]
+    fn cloner_registers_before_recursing_and_nulls_pointers() {
+        let src = "pub struct N { pub v: i32, pub next: *mut N }";
+        let g = generate(&index(src), "N", "old", "new").unwrap();
+        // The pointer field is null in the initializer...
+        assert!(g.cloner.contains("next: core::ptr::null_mut(),"));
+        // ...the object is registered in the map...
+        let map_at = g.cloner.find("map.insert(src").unwrap();
+        // ...and only then is the pointer field linked, so cycles terminate.
+        let link_at = g
+            .cloner
+            .find("(*dst).next = clone_N((*src).next, map);")
+            .unwrap();
+        assert!(map_at < link_at, "must register before recursing");
     }
 
     #[test]
     fn c_type_and_typedef_fields_are_scalars() {
         let src = "pub struct S { pub a: c_int, pub b: size_t, pub c: f64 }";
-        let g = generate(&index(src), "S", "old").unwrap();
+        let g = generate(&index(src), "S", "old", "new").unwrap();
         assert!(g.referenced.is_empty());
         // Three field initializers (the null-guard also calls `kani::any()`).
         assert_eq!(g.builder.matches("kani::any(),").count(), 3);
@@ -292,7 +361,7 @@ mod tests {
     #[test]
     fn pointer_to_unknown_type_is_unsupported() {
         let src = "pub struct S { pub p: *mut FILE }";
-        let err = generate(&index(src), "S", "old").unwrap_err();
+        let err = generate(&index(src), "S", "old", "new").unwrap_err();
         assert_eq!(err.field, "p");
         assert!(err.detail.contains("FILE"));
     }
@@ -301,7 +370,7 @@ mod tests {
     fn unsupported_field_type_bails() {
         // A function pointer field: not yet handled.
         let src = "pub struct S { pub f: Option<unsafe extern \"C\" fn()> }";
-        let err = generate(&index(src), "S", "old").unwrap_err();
+        let err = generate(&index(src), "S", "old", "new").unwrap_err();
         assert_eq!(err.field, "f");
     }
 }
