@@ -234,6 +234,59 @@ fn tagged_union_path_does_not_prove_a_wrong_rewrite() {
     );
 }
 
+// A `sprintf` into a destination buffer: the output is modelled as a shared
+// symbolic string, and the format arguments are recorded.
+const SPRINTF_DECL: &str =
+    "extern \"C\" { fn sprintf(_: *mut core::ffi::c_char, _: *const core::ffi::c_char, ...) -> core::ffi::c_int; }";
+
+const SP_OLD: &str = r#"
+pub unsafe fn w(d: *mut core::ffi::c_char, p: *const i32) {
+    if d.is_null() || p.is_null() { return; }
+    sprintf(d, b"%d\0".as_ptr() as *const core::ffi::c_char, *p);
+}
+"#;
+
+const SP_OK: &str = r#"
+pub unsafe fn w(d: *mut core::ffi::c_char, p: *const i32) {
+    if d.is_null() || p.is_null() { return; }
+    let v = *p;
+    sprintf(d, b"%d\0".as_ptr() as *const core::ffi::c_char, v);
+}
+"#;
+
+const SP_BAD: &str = r#"
+pub unsafe fn w(d: *mut core::ffi::c_char, p: *const i32) {
+    if d.is_null() || p.is_null() { return; }
+    sprintf(d, b"%d\0".as_ptr() as *const core::ffi::c_char, *p + 1);
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn sprintf_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(SP_OLD, &[SPRINTF_DECL]).unwrap();
+    let new = FnUnit::parse(SP_OK, &[SPRINTF_DECL]).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn sprintf_catches_different_argument() {
+    let old = FnUnit::parse(SP_OLD, &[SPRINTF_DECL]).unwrap();
+    let new = FnUnit::parse(SP_BAD, &[SPRINTF_DECL]).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a different sprintf argument proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 // A variadic `printf` call, rewritten into observable trace events: both
 // versions must print the same format with the same arguments.
 const PRINTF_DECL: &str =

@@ -27,9 +27,19 @@ fn variadic_ret(name: &str) -> Option<&'static str> {
     })
 }
 
+/// A formatting function that writes into a destination buffer (the argument at
+/// the given index), rather than to a stream. Its output is modelled as a
+/// shared symbolic string. Returns the destination argument index.
+fn variadic_dst(name: &str) -> Option<usize> {
+    match name {
+        "sprintf" | "vsprintf" | "snprintf" | "vsnprintf" => Some(0),
+        _ => None,
+    }
+}
+
 /// Whether a call to `name` is a modelled variadic external.
 pub fn is_variadic_modelled(name: &str) -> bool {
-    variadic_ret(name).is_some()
+    variadic_ret(name).is_some() || variadic_dst(name).is_some()
 }
 
 /// A stable 64-bit id for a call name (FNV-1a), matching `strmodel::oracle_id`
@@ -61,12 +71,44 @@ impl VisitMut for Rewrite {
         let Some(name) = p.path.segments.last().map(|s| s.ident.to_string()) else {
             return;
         };
-        let Some(ret) = variadic_ret(&name) else { return };
-        if p.path.segments.len() != 1 {
+        if p.path.segments.len() != 1 || !is_variadic_modelled(&name) {
             return;
         }
-        *e = syn::parse_str(&block(&name, ret, &call.args)).expect("variadic trace block parses");
+        let src = match variadic_dst(&name) {
+            Some(dst) => dst_block(&name, dst, &call.args),
+            None => block(&name, variadic_ret(&name).unwrap(), &call.args),
+        };
+        *e = syn::parse_str(&src).expect("variadic trace block parses");
     }
+}
+
+/// The replacement block for a buffer-writing formatter (`sprintf` etc.):
+/// record every argument but the destination, then fill the destination with
+/// the shared symbolic output.
+fn dst_block(name: &str, dst_idx: usize, args: &syn::punctuated::Punctuated<syn::Expr, syn::token::Comma>) -> String {
+    let call_id = id(name);
+    let mut binds = String::new();
+    let mut steps = String::new();
+    let mut dst_bind = String::from("core::ptr::null_mut()");
+    for (i, arg) in args.iter().enumerate() {
+        binds += &format!("let __a{i} = {};\n", arg.to_token_stream());
+        if i == dst_idx {
+            dst_bind = format!("__a{i} as *mut core::ffi::c_char");
+        } else {
+            steps += &format!(
+                "(*__t).step({call_id}u64, \
+                 [crate::support::TraceArg::bits(&__a{i}), 0, 0], \
+                 [crate::support::TraceArg::kind(&__a{i}), 3u8, 3u8]);\n"
+            );
+        }
+    }
+    let fill_id = call_id.wrapping_add(2);
+    let ret_id = call_id.wrapping_add(1);
+    format!(
+        "{{ let __t = core::ptr::addr_of_mut!(crate::support::TRACE); {binds} {steps} \
+         (*__t).fill_cstr({fill_id}u64, {dst_bind}); \
+         (*__t).step({ret_id}u64, [0, 0, 0], [3u8, 3u8, 3u8]) as ::core::ffi::c_int }}"
+    )
 }
 
 /// The replacement block: bind each argument, record it as a trace event, and

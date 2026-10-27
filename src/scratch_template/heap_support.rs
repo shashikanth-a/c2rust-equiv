@@ -251,6 +251,25 @@ impl Trace {
     /// One external call. While recording, append it with a fresh symbolic
     /// result; while replaying, require it matches the recorded call and return
     /// that call's result, so both versions make identical observable calls.
+    /// Model a formatting function's output: write a shared, bounded,
+    /// NUL-terminated symbolic string into `dst`. The bytes come from the trace
+    /// (keyed by position), so both versions produce the same output -- the
+    /// formatted result modelled as a deterministic function of the call. `dst`
+    /// must have room for `CSTR_CAP` bytes, else the write is out of bounds and
+    /// Kani reports a failure (the function is then not proved).
+    pub unsafe fn fill_cstr(&mut self, id: u64, dst: *mut core::ffi::c_char) {
+        if dst.is_null() {
+            return;
+        }
+        let mut i = 0usize;
+        while i < CSTR_CAP - 1 {
+            let b = self.step(id, [i as u128, 0, 0], [0, 3, 3]) as u8;
+            *dst.add(i) = b as core::ffi::c_char;
+            i += 1;
+        }
+        *dst.add(CSTR_CAP - 1) = 0;
+    }
+
     pub fn step(&mut self, id: u64, args: [u128; 3], kinds: [u8; 3]) -> u128 {
         if self.recording {
             assert!(self.len < TRACE_CAP, "trace exceeds TRACE_CAP");
