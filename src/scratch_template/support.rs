@@ -329,18 +329,35 @@ pub enum Link {
     Conflict,
 }
 
+/// The most objects either heap can hold. Symbolic heaps are bounded (by the
+/// builder's depth), and native replay runs those same bounded inputs, so a
+/// fixed capacity avoids `Vec` -- whose heap allocation and growth made Kani an
+/// order of magnitude slower -- in both. Overflowing it is a bug in the bound,
+/// not a heap difference, so it panics rather than returning a verdict.
+pub const HEAP_CAP: usize = 128;
+
 /// A correspondence between the two heaps' objects, kept functional (each `a`
 /// maps to one `b`) and injective (each `b` from one `a`). `specs/Heap.als`
 /// shows both directions are needed: without injectivity, two distinct objects
 /// on one side sharing a partner on the other would wrongly compare equal.
-#[derive(Default)]
 pub struct Corr {
-    pairs: Vec<(*const (), *const ())>,
+    pairs: [(*const (), *const ()); HEAP_CAP],
+    len: usize,
+}
+
+impl Default for Corr {
+    fn default() -> Self {
+        Corr {
+            pairs: [(core::ptr::null(), core::ptr::null()); HEAP_CAP],
+            len: 0,
+        }
+    }
 }
 
 impl Corr {
     pub fn link(&mut self, a: *const (), b: *const ()) -> Link {
-        for &(x, y) in &self.pairs {
+        for i in 0..self.len {
+            let (x, y) = self.pairs[i];
             if x == a && y == b {
                 return Link::Seen;
             }
@@ -348,7 +365,9 @@ impl Corr {
                 return Link::Conflict;
             }
         }
-        self.pairs.push((a, b));
+        assert!(self.len < HEAP_CAP, "heap exceeds HEAP_CAP");
+        self.pairs[self.len] = (a, b);
+        self.len += 1;
         Link::New
     }
 }
@@ -356,16 +375,32 @@ impl Corr {
 /// A map from each cloned source object to its copy, so that a deep copy
 /// preserves sharing (two fields pointing at one object stay shared) and
 /// terminates on cycles (a back-edge resolves to the registered copy).
-#[derive(Default)]
 pub struct CloneMap {
-    pairs: Vec<(*const (), *const ())>,
+    pairs: [(*const (), *const ()); HEAP_CAP],
+    len: usize,
+}
+
+impl Default for CloneMap {
+    fn default() -> Self {
+        CloneMap {
+            pairs: [(core::ptr::null(), core::ptr::null()); HEAP_CAP],
+            len: 0,
+        }
+    }
 }
 
 impl CloneMap {
     pub fn get(&self, a: *const ()) -> Option<*const ()> {
-        self.pairs.iter().find(|&&(x, _)| x == a).map(|&(_, y)| y)
+        for i in 0..self.len {
+            if self.pairs[i].0 == a {
+                return Some(self.pairs[i].1);
+            }
+        }
+        None
     }
     pub fn insert(&mut self, a: *const (), b: *const ()) {
-        self.pairs.push((a, b));
+        assert!(self.len < HEAP_CAP, "heap exceeds HEAP_CAP");
+        self.pairs[self.len] = (a, b);
+        self.len += 1;
     }
 }
