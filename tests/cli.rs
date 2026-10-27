@@ -4,14 +4,18 @@ use std::path::Path;
 use std::process::Command;
 
 fn run(args: &[&str]) -> (i32, serde_json::Value) {
-    let dir = tempfile::tempdir().unwrap();
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    run_on(&fixtures.join("old"), &fixtures.join("new"), args)
+}
+
+fn run_on(old: &Path, new: &Path, args: &[&str]) -> (i32, serde_json::Value) {
+    let dir = tempfile::tempdir().unwrap();
     let report = dir.path().join("report.json");
     let status = Command::new(env!("CARGO_BIN_EXE_c2rust-equiv"))
         .arg("--old")
-        .arg(fixtures.join("old"))
+        .arg(old)
         .arg("--new")
-        .arg(fixtures.join("new"))
+        .arg(new)
         .arg("--report")
         .arg(&report)
         .arg("--work-dir")
@@ -114,4 +118,25 @@ fn relative_work_dir() {
         .status()
         .unwrap();
     assert_eq!(status.code(), Some(0));
+}
+
+#[test]
+fn function_missing_from_the_rewrite_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = dir.path().join("old");
+    let new = dir.path().join("new");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::create_dir_all(&new).unwrap();
+    std::fs::write(
+        old.join("lib.rs"),
+        "pub fn kept(x: u8) -> u8 { x }\npub fn gone(x: u8) -> u8 { x }\n",
+    )
+    .unwrap();
+    std::fs::write(new.join("lib.rs"), "pub fn kept(x: u8) -> u8 { x }\n").unwrap();
+    let (code, report) = run_on(&old, &new, &[]);
+    assert_eq!(code, 2);
+    assert_eq!(
+        statuses(&report),
+        [("lib.rs::gone".to_owned(), "error".to_owned())]
+    );
 }

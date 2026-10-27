@@ -29,7 +29,8 @@ struct Cli {
     #[arg(long)]
     markdown: Option<PathBuf>,
     /// Check this function: an ID like `src/a.rs::f`, or a bare name.
-    /// Repeatable. [default: every function whose code differs]
+    /// Repeatable. [default: every function whose code differs, or that the
+    /// rewrite lacks]
     #[arg(long = "function")]
     functions: Vec<String>,
     /// A file with one function ID or name per line, as for `--function`.
@@ -190,14 +191,17 @@ fn run(cli: &Cli) -> Result<u8, Box<dyn std::error::Error>> {
 }
 
 /// Function IDs to check: those matching `queries`, or by default every
-/// function in both crates whose code differs.
+/// function in the original crate whose code differs in the rewrite, or that
+/// the rewrite lacks.
 fn select(old: &CrateIndex, new: &CrateIndex, queries: &[String]) -> Vec<String> {
     let mut ids = BTreeSet::new();
     if queries.is_empty() {
         for e in old.functions() {
             let id = old.id(e);
-            if let [n] = new.find_functions(&id).as_slice() {
-                if code(old, e) != code(new, *n) {
+            match new.find_functions(&id).as_slice() {
+                [n] if code(old, e) == code(new, *n) => {}
+                // Missing from the rewrite: reported as an error by `check_one`.
+                _ => {
                     ids.insert(id);
                 }
             }

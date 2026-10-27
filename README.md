@@ -20,7 +20,8 @@ c2rust-equiv --old original/src --new rewritten/src --report report.json
 ```
 
 This checks every function whose code differs between the two crates (or the
-ones named with `--function`), and writes `report.json` and `report.md`.
+ones named with `--function`), and writes `report.json` and `report.md`. A
+function missing from the rewrite is an error.
 `--cache cache.json` skips functions whose code, callees and options haven't
 changed. `--eligibility out.jsonl` lists which functions are in scope, and why
 the others aren't. See `--help` for timeouts, the unwinding bound and the seed.
