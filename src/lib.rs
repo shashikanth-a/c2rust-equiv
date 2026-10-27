@@ -9,6 +9,7 @@ pub mod cache;
 pub mod check;
 pub mod crate_index;
 pub mod extract;
+pub mod heapgen;
 pub mod kani;
 mod process;
 pub mod report;
