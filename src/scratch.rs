@@ -232,12 +232,14 @@ fn heap_lib_source(
                 heap_args.push((i, name));
             }
             // A read-only C string: both versions get identical bytes, and
-            // there's no post-state to compare.
+            // there's no post-state to compare. `gen_cstr` yields `*mut c_char`;
+            // cast at the call to the argument's declared pointer type (e.g.
+            // `*const c_uchar` for libxml2's `xmlChar`).
             Shape::CStr => {
                 build += &format!("        let a{i} = gen_cstr();\n");
                 clone += &format!("        let b{i} = clone_cstr(a{i});\n");
-                old_args.push(format!("a{i}"));
-                new_args.push(format!("b{i}"));
+                old_args.push(format!("a{i} as {}", qualify(arg_types[i], "old")));
+                new_args.push(format!("b{i} as {}", qualify(arg_types[i], "new")));
             }
         }
     }

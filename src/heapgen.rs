@@ -207,12 +207,14 @@ fn classify(
         // struct (or `c_char`) it ultimately names.
         let elem = resolve_alias(&ptr.elem, aliases);
         if let Some(name) = last_segment(&elem) {
-            // A read-only C string. `*mut c_char` is excluded: it may be an
-            // output buffer this doesn't compare, so treating it as input-only
-            // could call a divergent rewrite equivalent.
-            if name == "c_char" {
+            // A read-only C string: `*const c_char`, or `*const c_uchar`
+            // (libxml2's `xmlChar`), both NUL-terminated by convention. `*mut`
+            // is excluded: it may be an output buffer this doesn't compare, so
+            // treating it as input-only could call a divergent rewrite
+            // equivalent.
+            if name == "c_char" || name == "c_uchar" {
                 if ptr.mutability.is_some() {
-                    return Err("`*mut c_char` may be an output buffer".to_owned());
+                    return Err(format!("`*mut {name}` may be an output buffer"));
                 }
                 return Ok(Field::CStr);
             }
@@ -986,6 +988,14 @@ mod tests {
         assert_eq!(s.ret, Shape::Scalar);
         assert!(s.structs.is_empty());
         assert!(s.needs_heap());
+    }
+
+    #[test]
+    fn const_c_uchar_argument_is_a_c_string_shape() {
+        // libxml2's `xmlChar` is `c_uchar`; a `*const c_uchar` is a C string.
+        let idx = index("pub struct T { pub v: i32 }");
+        let s = signature_shapes(&idx, &sig("fn f(s: *const c_uchar) -> c_int")).unwrap();
+        assert_eq!(s.args, vec![Shape::CStr]);
     }
 
     #[test]
