@@ -214,6 +214,9 @@ impl Resolver<'_> {
         let first = all[0].as_str();
         if matches!(first, "std" | "core" | "alloc") {
             return match std_path_skip(&all) {
+                // The heap path handles `core::ptr::*` (null, offset, ...),
+                // which Kani models; keep them rather than rejecting.
+                Some(skip) if self.heap && skip.category == "raw pointer" => Res::External(None),
                 Some(skip) => Res::Skip(skip),
                 None => Res::External(None),
             };
