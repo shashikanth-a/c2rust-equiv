@@ -31,6 +31,15 @@ impl Check {
     pub fn failed(&self) -> bool {
         self.status == "FAILURE"
     }
+
+    /// The kind of check, from its name: `assertion` for Rust panics
+    /// (including overflow and bounds checks), `pointer_dereference`,
+    /// `safety_check` and others for undefined behaviour, `unwind`, and so on.
+    pub fn class(&self) -> &str {
+        let mut parts = self.name.rsplitn(3, '.');
+        parts.next();
+        parts.next().unwrap_or("")
+    }
 }
 
 pub enum Run {
@@ -209,6 +218,23 @@ Check 1: proofs::old_then_new.assertion.1
 
 VERIFICATION:- SUCCESSFUL
 "#;
+
+    #[test]
+    fn check_class() {
+        let check = |name: &str| Check {
+            name: name.into(),
+            ..Default::default()
+        };
+        assert_eq!(check("old::f.assertion.1").class(), "assertion");
+        assert_eq!(
+            check("new::f.pointer_dereference.5").class(),
+            "pointer_dereference"
+        );
+        assert_eq!(
+            check("<usize as std::slice::SliceIndex<[u8]>>::get_unchecked.assume.1").class(),
+            "assume"
+        );
+    }
 
     #[test]
     fn parses_checks_verdicts_and_playbacks() {

@@ -41,11 +41,14 @@ publish = false
 [lints.rust]
 unexpected_cfgs = {{ level = "allow", check-cfg = ["cfg(kani)"] }}
 
-# Overflow checks match Kani, which always enables them.
+# Overflow checks match Kani, which always enables them. Debug assertions
+# stay off: with them, the standard library aborts on undefined-behaviour
+# preconditions (as in `get_unchecked`), which would end a replay of
+# several inputs instead of showing what each version does.
 [profile.release]
 opt-level = 1
 overflow-checks = true
-debug-assertions = true
+debug-assertions = false
 "#
         ),
     )?;

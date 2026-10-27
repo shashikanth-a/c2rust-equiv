@@ -43,6 +43,11 @@ const MASKED_OLD: &str = "fn f(x: u32) -> u32 { if x < 1000 { panic!() } x }";
 const MASKED_NEW: &str =
     "fn f(x: u32) -> u32 { if x < 1000 { panic!() } if x == 123456789 { 0 } else { x } }";
 
+/// For `i >= 3` the old version panics on an out-of-bounds index, and the
+/// rewrite reads out of bounds with no check: undefined behaviour, not a panic.
+const UNCHECKED_OLD: &str = "fn f(i: usize) -> u8 { [10u8, 20, 30][i] }";
+const UNCHECKED_NEW: &str = "fn f(i: usize) -> u8 { unsafe { *[10u8, 20, 30].get_unchecked(i) } }";
+
 /// Equivalent, but the loop runs up to 255 times, beyond Kani's unwinding bound.
 const SUM_OLD: &str = r#"fn f(n: u8) -> u32 {
     let mut s = 0u32;
@@ -235,6 +240,20 @@ fn kani_difference_behind_identical_panics() {
         unreachable!()
     };
     assert_eq!(inputs, "(123456789)");
+}
+
+#[test]
+fn kani_undefined_behaviour_in_new_is_not_proved() {
+    if !have_kani() {
+        return;
+    }
+    let status = run(UNCHECKED_OLD, UNCHECKED_NEW, true);
+    // Natively, the old version panics and the rewrite returns a value.
+    assert_eq!(found_by(&status), Some(Method::Kani), "{status}");
+    let Status::Counterexample { old_out, .. } = status else {
+        unreachable!()
+    };
+    assert!(old_out.starts_with("panicked"), "{old_out}");
 }
 
 #[test]

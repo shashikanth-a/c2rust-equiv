@@ -385,10 +385,11 @@ fn kani_decision(
 
 /// Failed checks that aren't a panic of the version the harness calls first.
 ///
-/// That panic cuts the path before the other version runs, and the other
-/// harness covers the input. CBMC's own floating-point NaN checks aren't Rust
-/// behaviour. Any other failure means both versions returned and differ, or
-/// the first returned and the second panicked: a real difference.
+/// A panic ends the path before the other version runs, and the other
+/// harness covers the input. Nothing else is ignored: undefined behaviour
+/// doesn't end the path in Kani, and it may be reported in a standard library
+/// file rather than the version's own (specs/Verdict.tla). CBMC's own
+/// floating-point NaN checks aren't Rust behaviour.
 fn unexplained(h: &kani::Harness) -> Vec<&kani::Check> {
     let first = if h.name == scratch::OLD_FIRST {
         scratch::OLD_FILE
@@ -398,7 +399,8 @@ fn unexplained(h: &kani::Harness) -> Vec<&kani::Check> {
     h.checks
         .iter()
         .filter(|c| {
-            c.failed() && c.file.as_deref() != Some(first) && !c.description.starts_with("NaN on ")
+            let first_panicked = c.file.as_deref() == Some(first) && c.class() == "assertion";
+            c.failed() && !first_panicked && !c.description.starts_with("NaN on ")
         })
         .collect()
 }
