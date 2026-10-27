@@ -163,6 +163,77 @@ fn c_string_path_does_not_prove_a_wrong_rewrite() {
     );
 }
 
+// A tagged union, in the shape c2rust emits: a newtype discriminant, a union,
+// a struct pairing them, and an accessor the inference mines for the map.
+const TU_DEFS: &[&str] = &[
+    "#[derive(Copy, Clone, PartialEq, Eq)] pub struct Tag(pub u32);",
+    "impl Tag { pub const A: Self = Self(0); pub const B: Self = Self(1); }",
+    "#[derive(Copy, Clone)] #[repr(C)] pub union U { pub a: i32, pub b: i64 }",
+    "#[repr(C)] pub struct Obj { pub t: Tag, pub d: U }",
+];
+
+// The accessor reads the live union field per the discriminant; it is both the
+// function under test and the evidence the tag-map inference mines.
+const TU_OLD: &str = r#"
+pub unsafe fn val(o: *const Obj) -> i64 {
+    if o.is_null() { return -1; }
+    match (*o).t {
+        Tag::A => (*o).d.a as i64,
+        Tag::B => (*o).d.b,
+        _ => -2,
+    }
+}
+"#;
+
+// An equivalent rewrite that compares the tag instead of matching.
+const TU_OK: &str = r#"
+pub unsafe fn val(o: *const Obj) -> i64 {
+    if o.is_null() { return -1; }
+    let t = (*o).t;
+    if t == Tag::A { (*o).d.a as i64 }
+    else if t == Tag::B { (*o).d.b }
+    else { -2 }
+}
+"#;
+
+// A wrong rewrite: under tag A it adds one.
+const TU_BAD: &str = r#"
+pub unsafe fn val(o: *const Obj) -> i64 {
+    if o.is_null() { return -1; }
+    match (*o).t {
+        Tag::A => (*o).d.a as i64 + 1,
+        Tag::B => (*o).d.b,
+        _ => -2,
+    }
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn tagged_union_path_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(TU_OLD, TU_DEFS).unwrap();
+    let new = FnUnit::parse(TU_OK, TU_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn tagged_union_path_does_not_prove_a_wrong_rewrite() {
+    let old = FnUnit::parse(TU_OLD, TU_DEFS).unwrap();
+    let new = FnUnit::parse(TU_BAD, TU_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a wrong rewrite was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 // A single-field union: unambiguous, so the heap path builds it like a struct.
 const BOX1: &str = "#[derive(Copy, Clone)] #[repr(C)] pub union Box1 { pub v: i32 }";
 

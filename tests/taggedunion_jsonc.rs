@@ -39,3 +39,25 @@ fn infers_json_object_tag_map_from_real_source() {
     );
     eprintln!("inferred json_object tag map: {:#?}", m.variants);
 }
+
+#[test]
+fn json_object_still_blocked_after_union_support() {
+    // Even with the tag map inferred, json_object does not yet build. The first
+    // blocker is a crate-local typedef: the `boolean` variant's field is
+    // `json_bool` (an alias for `c_int`), which the generator doesn't resolve.
+    // Behind that lie the object/array variants' `lh_table`/`array_list` (whose
+    // fields need `void**`/function-pointer support) and json_object's own
+    // function-pointer (`_delete`) and `c_void` (`_userdata`) fields.
+    if !Path::new(JSONC).exists() {
+        eprintln!("skipping: {JSONC} not present");
+        return;
+    }
+    let mut index = CrateIndex::default();
+    index.add_source(JSONC, &std::fs::read_to_string(JSONC).unwrap()).unwrap();
+    let err = c2rust_equiv::heapgen::generate(&index, "json_object", "old", "new")
+        .expect_err("json_object should still be unsupported");
+    eprintln!("json_object blocked by: field `{}`: {}", err.field, err.detail);
+    // The tag map is inferred, so the failure is a non-buildable field, not the
+    // discriminant.
+    assert!(!err.detail.contains("infer"), "unexpected: {}", err.detail);
+}

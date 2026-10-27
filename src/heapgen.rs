@@ -227,9 +227,23 @@ pub fn generate(
         });
     }
 
-    let mut fields = Vec::new();
     let mut referenced = BTreeSet::new();
+    // A by-value multi-field union field, if any, is handled as a tagged union
+    // (its discriminant inferred); its tag and union fields are then built
+    // together rather than as independent fields.
+    let tagged = tagged_union(index, def, &table, &mut referenced)?;
+    let skip: BTreeSet<&str> = match &tagged {
+        Some(tu) => [tu.tag_field.as_str(), tu.union_field.as_str()]
+            .into_iter()
+            .collect(),
+        None => BTreeSet::new(),
+    };
+
+    let mut fields = Vec::new();
     for (name, ty) in &def.fields {
+        if skip.contains(name.as_str()) {
+            continue;
+        }
         match classify(ty, &table) {
             Ok(Field::Pointer(target)) => {
                 referenced.insert(target.clone());
@@ -246,12 +260,86 @@ pub fn generate(
         }
     }
 
+    let tu = tagged.as_ref();
     Ok(Generated {
-        builder: builder(struct_name, old, &fields),
-        cloner: cloner(struct_name, old, new, &fields),
-        comparer: comparer(struct_name, old, new, &fields),
+        builder: builder(struct_name, old, &fields, tu),
+        cloner: cloner(struct_name, old, new, &fields, tu),
+        comparer: comparer(struct_name, old, new, &fields, tu),
         referenced,
     })
+}
+
+/// If `def` has a by-value field of a multi-field union, describe it as a
+/// tagged union by inferring its discriminant from the crate's accessors and
+/// classifying each live sub-field. Returns `Ok(None)` when there's no such
+/// field, and `Err` when the discriminant can't be inferred or a variant's
+/// field type isn't buildable, so the struct falls back to unsupported.
+fn tagged_union(
+    index: &CrateIndex,
+    def: &StructDef,
+    table: &BTreeMap<String, StructDef>,
+    referenced: &mut BTreeSet<String>,
+) -> Result<Option<TaggedUnion>, Unsupported> {
+    let unsupported = |field: &str, detail: String| Unsupported {
+        struct_name: def.name.clone(),
+        field: field.to_owned(),
+        detail,
+    };
+
+    // Find the (single) by-value multi-field union field.
+    let mut found: Option<(&String, &StructDef)> = None;
+    for (name, ty) in &def.fields {
+        let Some(u) = last_segment(ty).and_then(|n| table.get(&n)) else {
+            continue;
+        };
+        if u.is_union && u.fields.len() > 1 {
+            if found.is_some() {
+                return Err(unsupported(name, "more than one union field".to_owned()));
+            }
+            found = Some((name, u));
+        }
+    }
+    let Some((union_field, udef)) = found else {
+        return Ok(None);
+    };
+
+    let subnames: Vec<String> = udef.fields.iter().map(|(n, _)| n.clone()).collect();
+    let map = crate::taggedunion::mine_accessors(index, union_field, &subnames)
+        .ok_or_else(|| unsupported(union_field, "could not infer the union's discriminant".to_owned()))?;
+    if !def.fields.iter().any(|(n, _)| n == &map.tag_field) {
+        return Err(unsupported(
+            union_field,
+            format!("inferred tag `{}` is not a field of the struct", map.tag_field),
+        ));
+    }
+
+    let mut variants = Vec::new();
+    for (disc, sub) in &map.variants {
+        let classified = match sub {
+            None => None,
+            Some(s) => {
+                let ty = udef
+                    .fields
+                    .iter()
+                    .find(|(n, _)| n == s)
+                    .map(|(_, t)| t)
+                    .expect("mined sub-field is a union field");
+                let field = classify(ty, table).map_err(|d| unsupported(s, d))?;
+                if let Field::Pointer(t) = &field {
+                    referenced.insert(t.clone());
+                }
+                Some((s.clone(), field))
+            }
+        };
+        variants.push((disc.clone(), classified));
+    }
+
+    Ok(Some(TaggedUnion {
+        tag_field: map.tag_field,
+        union_field: union_field.clone(),
+        union_type: udef.name.clone(),
+        variants,
+    }))
 }
 
 /// Generate the builder, cloner and comparer for every struct reachable from
@@ -392,25 +480,109 @@ pub fn signature_shapes(
     Ok(SigShapes { args, ret, structs })
 }
 
+/// A tagged union inside a struct: the union-typed field, the discriminant
+/// field, and, per discriminant (as a path like `json_type::json_type_boolean`),
+/// the live sub-field and its classification. A discriminant with no payload
+/// (a null variant) carries `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaggedUnion {
+    tag_field: String,
+    union_field: String,
+    union_type: String,
+    variants: Vec<(String, Option<(String, Field)>)>,
+}
+
+impl TaggedUnion {
+    /// A variant with a payload, used to fill the union for null discriminants
+    /// (never read) and as the `_` fallback of exhaustive matches.
+    fn filler(&self) -> &(String, Field) {
+        self.variants
+            .iter()
+            .find_map(|(_, v)| v.as_ref())
+            .expect("a tagged union has at least one payload variant")
+    }
+}
+
+/// The expression that builds a symbolic value for one field.
+fn build_value(field: &Field) -> String {
+    match field {
+        Field::Scalar(_) => "kani::any()".to_owned(),
+        Field::ScalarArray => "core::array::from_fn(|_| kani::any())".to_owned(),
+        Field::CStr => "gen_cstr()".to_owned(),
+        Field::Pointer(target) => format!("gen_{target}(depth - 1)"),
+    }
+}
+
+/// The expression that clones one field from source access `src` into `new`.
+fn clone_value(field: &Field, src: &str) -> String {
+    match field {
+        Field::Scalar(_) | Field::ScalarArray => src.to_owned(),
+        Field::CStr => format!("clone_cstr({src})"),
+        Field::Pointer(target) => format!("clone_{target}({src}, map)"),
+    }
+}
+
+/// A statement comparing one field across accesses `a` and `b`, returning
+/// `false` on a difference.
+fn compare_stmt(field: &Field, a: &str, b: &str) -> String {
+    match field {
+        Field::Scalar(_) | Field::ScalarArray => {
+            format!("    if {a} != {b} {{ return false; }}\n")
+        }
+        Field::CStr => format!("    if !same_cstr({a}, {b}) {{ return false; }}\n"),
+        Field::Pointer(target) => {
+            format!("    if !same_{target}({a}, {b}, corr) {{ return false; }}\n")
+        }
+    }
+}
+
 /// `gen_<T>(depth) -> *mut old::T`: null below the bound or by a symbolic
 /// choice, else a fresh object with symbolic scalars and recursively built
-/// pointees.
-fn builder(struct_name: &str, old: &str, fields: &[(String, Field)]) -> String {
+/// pointees. A tagged union field picks a symbolic discriminant and builds the
+/// matching variant, so the tag and the live union field are consistent.
+fn builder(struct_name: &str, old: &str, fields: &[(String, Field)], tu: Option<&TaggedUnion>) -> String {
     let mut inits = String::new();
     for (name, field) in fields {
-        let value = match field {
-            Field::Scalar(_) => "kani::any()".to_owned(),
-            Field::ScalarArray => "core::array::from_fn(|_| kani::any())".to_owned(),
-            Field::CStr => "gen_cstr()".to_owned(),
-            Field::Pointer(target) => format!("gen_{target}(depth - 1)"),
-        };
-        inits += &format!("            {name}: {value},\n");
+        inits += &format!("            {name}: {},\n", build_value(field));
+    }
+    let mut pre = String::new();
+    if let Some(tu) = tu {
+        let n = tu.variants.len();
+        let filler = tu.filler();
+        let mut arms = String::new();
+        for (i, (disc, variant)) in tu.variants.iter().enumerate() {
+            let (sub, field) = variant.as_ref().unwrap_or(filler);
+            arms += &format!(
+                "        {i}usize => ({old}::{disc}, {old}::{} {{ {sub}: {} }}),\n",
+                tu.union_type,
+                build_value(field),
+            );
+        }
+        // `__k` is bounded, so the fallback arm is unreachable; it reuses
+        // variant 0 only to make the match exhaustive.
+        let (fd, ff) = tu.variants[0].1.as_ref().unwrap_or(filler);
+        arms += &format!(
+            "        _ => ({old}::{}, {old}::{} {{ {fd}: {} }}),\n",
+            tu.variants[0].0,
+            tu.union_type,
+            build_value(ff),
+        );
+        pre = format!(
+            "    let __k: usize = kani::any();\n\
+             \x20   kani::assume(__k < {n});\n\
+             \x20   let (__tag, __uni) = match __k {{\n\
+             {arms}\
+             \x20   }};\n"
+        );
+        inits += &format!("            {}: __tag,\n", tu.tag_field);
+        inits += &format!("            {}: __uni,\n", tu.union_field);
     }
     format!(
         "pub unsafe fn gen_{struct_name}(depth: usize) -> *mut {old}::{struct_name} {{\n\
          \x20   if depth == 0 || kani::any() {{\n\
          \x20       return core::ptr::null_mut();\n\
          \x20   }}\n\
+         {pre}\
          \x20   let obj = {old}::{struct_name} {{\n\
          {inits}\
          \x20   }};\n\
@@ -422,7 +594,7 @@ fn builder(struct_name: &str, old: &str, fields: &[(String, Field)]) -> String {
 /// `clone_<T>(src, map) -> *mut new::T`: a deep copy from `old`'s layout into
 /// `new`'s. The pointer is registered in `map` before the fields recurse, so
 /// shared objects become shared and cycles terminate instead of looping.
-fn cloner(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)]) -> String {
+fn cloner(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)], tu: Option<&TaggedUnion>) -> String {
     // Scalars are copied in the initializer; pointer fields start null and are
     // filled after the object is registered, so a cycle back to it resolves.
     let mut inits = String::new();
@@ -442,6 +614,41 @@ fn cloner(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)]) -
                 links += &format!("    (*dst).{name} = clone_{target}((*src).{name}, map);\n");
             }
         }
+    }
+    if let Some(tu) = tu {
+        // The discriminant maps old -> new directly. The union is zeroed in the
+        // initializer and filled after registration, so a pointer variant that
+        // cycles back resolves through the map like any other pointer field.
+        let tf = &tu.tag_field;
+        let uf = &tu.union_field;
+        let mut tag_arms = String::new();
+        let mut uni_arms = String::new();
+        for (disc, variant) in &tu.variants {
+            tag_arms += &format!("        {old}::{disc} => {new}::{disc},\n");
+            if let Some((sub, field)) = variant {
+                let src = format!("(*src).{uf}.{sub}");
+                uni_arms += &format!(
+                    "        {old}::{disc} => {new}::{} {{ {sub}: {} }},\n",
+                    tu.union_type,
+                    clone_value(field, &src),
+                );
+            }
+        }
+        let (fsub, ffield) = tu.filler();
+        let fsrc = format!("(*src).{uf}.{fsub}");
+        let fallback = format!(
+            "{new}::{} {{ {fsub}: {} }}",
+            tu.union_type,
+            clone_value(ffield, &fsrc),
+        );
+        inits += &format!(
+            "        {tf}: match (*src).{tf} {{\n{tag_arms}            _ => {new}::{},\n        }},\n",
+            tu.variants[0].0,
+        );
+        inits += &format!("        {uf}: core::mem::zeroed(),\n");
+        links += &format!(
+            "    (*dst).{uf} = match (*src).{tf} {{\n{uni_arms}        _ => {fallback},\n    }};\n"
+        );
     }
     format!(
         "pub unsafe fn clone_{struct_name}(\n\
@@ -467,23 +674,37 @@ fn cloner(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)]) -
 /// `same_<T>(a, b, corr) -> bool`: equal scalars across `old::T` and `new::T`,
 /// matching null-ness, and corresponding pointees, with `corr` kept functional
 /// and injective.
-fn comparer(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)]) -> String {
+fn comparer(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)], tu: Option<&TaggedUnion>) -> String {
     let mut checks = String::new();
     for (name, field) in fields {
-        let line = match field {
-            // Arrays of scalars are `PartialEq` for every length, like scalars.
-            Field::Scalar(_) | Field::ScalarArray => {
-                format!("    if (*a).{name} != (*b).{name} {{ return false; }}\n")
+        checks += &compare_stmt(field, &format!("(*a).{name}"), &format!("(*b).{name}"));
+    }
+    if let Some(tu) = tu {
+        // Compare the discriminants by variant index (the tag types differ
+        // across the two crates), then compare the live variant's field.
+        let tf = &tu.tag_field;
+        let uf = &tu.union_field;
+        let mut idx_a = String::new();
+        let mut idx_b = String::new();
+        let mut arms = String::new();
+        for (i, (disc, variant)) in tu.variants.iter().enumerate() {
+            idx_a += &format!("        {old}::{disc} => {i}usize,\n");
+            idx_b += &format!("        {new}::{disc} => {i}usize,\n");
+            if let Some((sub, field)) = variant {
+                let stmt = compare_stmt(
+                    field,
+                    &format!("(*a).{uf}.{sub}"),
+                    &format!("(*b).{uf}.{sub}"),
+                );
+                arms += &format!("        {old}::{disc} => {{\n    {stmt}        }}\n");
             }
-            // Compare C strings by content up to the first NUL.
-            Field::CStr => {
-                format!("    if !same_cstr((*a).{name}, (*b).{name}) {{ return false; }}\n")
-            }
-            Field::Pointer(target) => format!(
-                "    if !same_{target}((*a).{name}, (*b).{name}, corr) {{ return false; }}\n",
-            ),
-        };
-        checks += &line;
+        }
+        checks += &format!(
+            "    let __ia = match (*a).{tf} {{\n{idx_a}        _ => usize::MAX,\n    }};\n\
+             \x20   let __ib = match (*b).{tf} {{\n{idx_b}        _ => usize::MAX,\n    }};\n\
+             \x20   if __ia != __ib {{ return false; }}\n\
+             \x20   match (*a).{tf} {{\n{arms}        _ => {{}}\n    }}\n"
+        );
     }
     // `corr` is the correspondence map; `link` returns false when adding the
     // pair would break functionality (a already mapped elsewhere) or
@@ -727,6 +948,50 @@ mod tests {
         assert!(gu
             .comparer
             .contains("if (*a).only != (*b).only { return false; }"));
+    }
+
+    #[test]
+    fn tagged_union_struct_builds_tag_and_variant_consistently() {
+        // A struct with a discriminant and a union, plus an accessor the
+        // inference mines, as c2rust emits.
+        let src = r#"
+            pub struct Obj { pub t: Tag, pub d: U, pub extra: i32 }
+            pub union U { pub a: i32, pub b: f64 }
+            pub unsafe fn val(o: *const Obj) -> i64 {
+                match (*o).t {
+                    Tag::A => (*o).d.a as i64,
+                    Tag::B => (*o).d.b as i64,
+                    _ => -1,
+                }
+            }
+        "#;
+        let g = generate(&index(src), "Obj", "old", "new").unwrap();
+        // The builder picks a symbolic discriminant and builds the matching
+        // variant, keeping the tag and union consistent.
+        assert!(g.builder.contains("kani::assume(__k <"));
+        assert!(g.builder.contains("old::Tag::A, old::U { a:"));
+        assert!(g.builder.contains("old::Tag::B, old::U { b:"));
+        assert!(g.builder.contains("t: __tag,"));
+        assert!(g.builder.contains("d: __uni,"));
+        // The cloner maps the discriminant and fills the union after
+        // registration (so a cyclic pointer variant would resolve).
+        assert!(g.cloner.contains("old::Tag::A => new::Tag::A"));
+        assert!(g.cloner.contains("d: core::mem::zeroed(),"));
+        assert!(g.cloner.contains("(*dst).d = match (*src).t"));
+        // The comparer checks the discriminant matches, then the live field.
+        assert!(g.comparer.contains("if __ia != __ib { return false; }"));
+        assert!(g.comparer.contains("(*a).d.a != (*b).d.a"));
+        // The ordinary field is still compared.
+        assert!(g.comparer.contains("(*a).extra != (*b).extra"));
+    }
+
+    #[test]
+    fn tagged_union_without_inferable_discriminant_is_unsupported() {
+        // No accessor matches on the tag, so the discriminant can't be inferred.
+        let src = "pub struct Obj { pub t: Tag, pub d: U }\npub union U { pub a: i32, pub b: f64 }";
+        let err = generate(&index(src), "Obj", "old", "new").unwrap_err();
+        assert_eq!(err.field, "d");
+        assert!(err.detail.contains("infer"), "got: {}", err.detail);
     }
 
     #[test]
