@@ -58,9 +58,9 @@ For every input, both versions return the same value, or both panic.
    then new, and asserts the results are equal; the other calls new first. Kani
    treats a panic as a failed check that ends the path, so a panic in the
    version called first only means "this input is covered by the other
-   harness". Each failed check comes with a concrete input, which is replayed
-   natively; a difference there is reported as a counterexample. If there are
-   no failures, the result is `proved(bounded, unwind=N)`. Kani's unwinding
+   harness". Kani gives a concrete input for each failing harness, which is
+   replayed natively; a difference there is reported as a counterexample. If
+   there are no failures, the result is `proved(bounded, unwind=N)`. Kani's unwinding
    checks are on, so this also means no loop needed more than `N` iterations.
 4. **Fall back** to differential testing when Kani times out, doesn't support a
    construct, needs more loop iterations than the bound, or reports a failure

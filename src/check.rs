@@ -356,6 +356,17 @@ fn kani_decision(
             c.file.as_deref().unwrap_or("an unknown location")
         )));
     }
+    // A verdict that disagrees with the checks means the output wasn't parsed
+    // as expected, and a missed failure would otherwise read as a proof.
+    if let Some(h) = harnesses.iter().find(|h| {
+        h.checks.is_empty() || h.verified != Some(!h.checks.iter().any(kani::Check::failed))
+    }) {
+        return Ok(Decision::Fallback(format!(
+            "kani's output for {} could not be parsed",
+            h.name
+        )));
+    }
+
     Ok(Decision::Proved)
 }
 

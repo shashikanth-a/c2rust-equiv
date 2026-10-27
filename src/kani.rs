@@ -10,8 +10,11 @@ use crate::process;
 pub struct Harness {
     pub name: String,
     pub checks: Vec<Check>,
-    /// Inputs from concrete playback, one per failed check: one byte string per
-    /// `kani::any()` value, little-endian.
+    /// Kani's verdict: `Some(true)` for `VERIFICATION:- SUCCESSFUL`.
+    pub verified: Option<bool>,
+    /// Inputs from concrete playback: one byte string per `kani::any()` value,
+    /// little-endian. Kani prints one input per failing harness, not one per
+    /// failed check, so some failures come without an input.
     pub playbacks: Vec<Vec<Vec<u8>>>,
 }
 
@@ -106,6 +109,10 @@ pub fn parse(output: &str) -> Vec<Harness> {
             if let Some(c) = harnesses.last_mut().and_then(|h| h.checks.last_mut()) {
                 c.file = rest.split(':').next().map(str::to_owned);
             }
+        } else if let Some(rest) = trimmed.strip_prefix("VERIFICATION:- ") {
+            if let Some(h) = harnesses.last_mut() {
+                h.verified = Some(rest == "SUCCESSFUL");
+            }
         } else if let Some(rest) = line.strip_prefix("Concrete playback unit test for `") {
             playback_for = rest.split('`').next().map(str::to_owned);
         } else if trimmed.starts_with("let concrete_vals") {
@@ -132,4 +139,58 @@ pub fn parse(output: &str) -> Vec<Harness> {
         }
     }
     harnesses
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LOG: &str = r#"Checking harness proofs::new_then_old...
+RESULTS:
+Check 1: proofs::new_then_old.assertion.1
+	 - Status: FAILURE
+	 - Description: ""results differ""
+	 - Location: src/lib.rs:41:9 in function proofs::new_then_old
+
+Check 2: new::f.arithmetic_overflow.1
+	 - Status: SUCCESS
+	 - Description: "attempt to add with overflow"
+	 - Location: src/new.rs:3:5 in function new::f
+
+VERIFICATION:- FAILED
+Concrete playback unit test for `proofs::new_then_old`:
+```
+fn kani_concrete_playback_new_then_old_1() {
+    let concrete_vals: Vec<Vec<u8>> = vec![
+        // 58
+        vec![58, 0, 0, 0],
+    ];
+    kani::concrete_playback_run(concrete_vals, new_then_old);
+}
+```
+Checking harness proofs::old_then_new...
+RESULTS:
+Check 1: proofs::old_then_new.assertion.1
+	 - Status: SUCCESS
+	 - Description: ""results differ""
+	 - Location: src/lib.rs:32:9 in function proofs::old_then_new
+
+VERIFICATION:- SUCCESSFUL
+"#;
+
+    #[test]
+    fn parses_checks_verdicts_and_playbacks() {
+        let h = parse(LOG);
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0].name, "proofs::new_then_old");
+        assert_eq!(h[0].verified, Some(false));
+        assert_eq!(h[0].checks.len(), 2);
+        assert!(h[0].checks[0].failed());
+        assert_eq!(h[0].checks[0].description, "results differ");
+        assert_eq!(h[0].checks[0].file.as_deref(), Some("src/lib.rs"));
+        assert_eq!(h[0].checks[1].name, "new::f.arithmetic_overflow.1");
+        assert_eq!(h[0].playbacks, vec![vec![vec![58, 0, 0, 0]]]);
+        assert_eq!(h[1].verified, Some(true));
+        assert!(h[1].playbacks.is_empty());
+    }
 }
