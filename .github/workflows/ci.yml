@@ -28,6 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: cargo install --locked kani-verifier
+      # The output parser is tested against this version.
+      - run: cargo install --locked kani-verifier --version 0.68.0
       - run: cargo kani setup
       - run: cargo test
