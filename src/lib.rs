@@ -16,6 +16,7 @@ pub mod report;
 mod scalar;
 mod scratch;
 mod strmodel;
+pub mod taggedunion;
 pub mod unit;
 
 pub use check::{check, heap_eligible, Method, Options, Outcome, Status};
