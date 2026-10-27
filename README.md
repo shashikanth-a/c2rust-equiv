@@ -75,6 +75,15 @@ Each function gets one status: `proved(bounded, unwind=N)`,
 `counterexample(inputs, old_out, new_out)`, `tested(n_cases, seed)`,
 `skipped(reason)` or `error(reason)`.
 
+## Design specs
+
+`specs/` has a TLA+ model of the verdict logic, checked in CI with TLC. It
+shows that `proved` implies equivalence and every counterexample is real, for
+every pair of functions on a small domain and every choice Kani can make. It
+also shows why the tool reruns Kani on only the unexplained checks: Kani prints
+one input per failing harness, and without the rerun that input can be a panic
+both versions share, hiding the real difference. See `specs/README.md`.
+
 ## Scope and limitations
 
 - Only functions with scalar arguments and return values (integers, floats,
