@@ -992,3 +992,20 @@ fn fn_ptr_field_catches_a_clobbered_callback() {
         outcome.status
     );
 }
+
+// Subsystem B end-to-end: `check` proves an equivalent straight-line scalar
+// rewrite algebraically (equality saturation), with no Kani run at all -- so
+// this test needs no `cargo kani` and is not ignored.
+#[test]
+fn algebraic_backend_proves_without_kani() {
+    let old = FnUnit::parse("pub fn g(x: i64, y: i64) -> i64 { x + y }", &[]).unwrap();
+    let new = FnUnit::parse("pub fn g(x: i64, y: i64) -> i64 { y + x }", &[]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { bounded: false, unwind: 0 }),
+        "expected an algebraic proof, got {:?}",
+        outcome.status
+    );
+    // The algebraic pre-check short-circuits before any Kani invocation.
+    assert_eq!(outcome.kani_ms, None);
+}

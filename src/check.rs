@@ -114,6 +114,9 @@ impl Status {
     /// A one-line summary, e.g. `proved(bounded, unwind=8)`.
     pub fn label(&self) -> String {
         match self {
+            // An algebraic equality-saturation proof (Subsystem B) is unbounded
+            // and holds for all inputs; a Kani proof is bounded by the unwind.
+            Status::Proved { bounded: false, unwind: 0 } => "proved(algebraic)".to_owned(),
             Status::Proved { unwind, .. } => format!("proved(bounded, unwind={unwind})"),
             Status::Counterexample {
                 inputs,
@@ -154,6 +157,22 @@ pub fn check(old: &FnUnit, new: &FnUnit, opts: &Options) -> Outcome {
     let start = Instant::now();
     let mut kani_ms = None;
     let mut test_ms = None;
+    // Subsystem B: try an environment-independent algebraic proof by equality
+    // saturation first (no Kani, no environment model, and unbounded -- it holds
+    // for all inputs, not only within an unwinding bound). It is sound: a
+    // `Some(true)` is a real proof; anything else falls through to the Kani /
+    // differential path below.
+    if let Some(true) = crate::peg::equivalent(&old.function, &new.function) {
+        return Outcome {
+            status: Status::Proved {
+                bounded: false,
+                unwind: 0,
+            },
+            kani_ms: None,
+            test_ms: None,
+            total_ms: start.elapsed().as_millis() as u64,
+        };
+    }
     let status =
         run_check(old, new, opts, &mut kani_ms, &mut test_ms).unwrap_or_else(|e| Status::Error {
             reason: e.to_string(),
