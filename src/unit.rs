@@ -113,6 +113,12 @@ impl FnUnit {
             allow_pointers,
         };
         for item in self.items() {
+            // A generated summary shim is trusted code that only runs in the
+            // scratch template (it uses the trace support there); its body is
+            // not source under test, so it is exempt from the scope check.
+            if crate::summary::is_summary_shim(&item) {
+                continue;
+            }
             checker.visit_item(&item);
         }
         match checker.skip {

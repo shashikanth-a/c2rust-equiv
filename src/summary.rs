@@ -23,6 +23,30 @@ use quote::ToTokens;
 use crate::modref::WriteSet;
 use crate::strmodel::{arg_kind_bits, float_width, oracle_id};
 
+/// Doc marker on a generated summary shim. The shim's body uses the scratch
+/// template's trace support (`crate::support::TRACE`, `step`, `fill_cstr`),
+/// which only exists in that template, so the heap body scope check skips a
+/// callee carrying this marker -- it is trusted generated code, not source
+/// under test. See [`is_summary_shim`].
+pub(crate) const SUMMARY_MARKER: &str = "c2rust_equiv_summary_shim";
+
+/// Whether `item` is a generated summary shim (carries [`SUMMARY_MARKER`]).
+pub(crate) fn is_summary_shim(item: &syn::Item) -> bool {
+    let syn::Item::Fn(f) = item else { return false };
+    f.attrs.iter().any(|a| {
+        a.path().is_ident("doc")
+            && matches!(
+                &a.meta,
+                syn::Meta::NameValue(nv)
+                    if matches!(
+                        &nv.value,
+                        syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. })
+                            if s.value() == SUMMARY_MARKER
+                    )
+            )
+    })
+}
+
 /// Generate a summary shim for `name` with signature `sig` and write set `ws`,
 /// or `None` if it can't be summarised soundly (the caller then inlines it).
 pub fn summarize(name: &str, sig: &syn::Signature, ws: &WriteSet) -> Option<syn::ItemFn> {
@@ -109,7 +133,8 @@ pub fn summarize(name: &str, sig: &syn::Signature, ws: &WriteSet) -> Option<syn:
         .map(|(n, t)| format!("{n}: {t}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let src = format!("pub unsafe fn {name}({decl}) -> {ret} {{ {body} }}");
+    let src =
+        format!("#[doc = \"{SUMMARY_MARKER}\"] pub unsafe fn {name}({decl}) -> {ret} {{ {body} }}");
     syn::parse_str(&src).ok()
 }
 
