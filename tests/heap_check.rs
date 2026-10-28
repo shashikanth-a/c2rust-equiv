@@ -940,3 +940,55 @@ fn read_only_global_does_not_prove_a_wrong_rewrite() {
         outcome.status
     );
 }
+
+// A struct with a nullable function-pointer field (a callback), carried as
+// opaque data. Both versions get the same symbolic pointer, so leaving it
+// alone proves equivalent -- and a rewrite that clobbers the callback must be
+// caught (the field is compared by identity in the post-state).
+const CB_STRUCT: &str =
+    "pub struct S { pub cb: Option<unsafe extern \"C\" fn(i32) -> i32>, pub n: i32 }";
+
+const CB_OLD: &str = r#"
+pub unsafe fn bump(s: *mut S) {
+    if !s.is_null() { (*s).n += 1; }
+}
+"#;
+
+const CB_OK: &str = r#"
+pub unsafe fn bump(s: *mut S) {
+    if !s.is_null() { (*s).n = (*s).n + 1; }
+}
+"#;
+
+// A wrong rewrite: also clears the callback, changing observable heap state.
+const CB_BAD: &str = r#"
+pub unsafe fn bump(s: *mut S) {
+    if !s.is_null() { (*s).n += 1; (*s).cb = None; }
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn fn_ptr_field_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(CB_OLD, &[CB_STRUCT]).unwrap();
+    let new = FnUnit::parse(CB_OK, &[CB_STRUCT]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn fn_ptr_field_catches_a_clobbered_callback() {
+    let old = FnUnit::parse(CB_OLD, &[CB_STRUCT]).unwrap();
+    let new = FnUnit::parse(CB_BAD, &[CB_STRUCT]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a callback-clobbering rewrite was proved equivalent: {:?}",
+        outcome.status
+    );
+}

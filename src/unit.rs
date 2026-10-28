@@ -385,6 +385,22 @@ impl<'ast> Visit<'ast> for BodyChecker {
         syn::visit::visit_type_ptr(self, p);
     }
 
+    fn visit_expr_call(&mut self, c: &'ast syn::ExprCall) {
+        // A direct call names a function by path (`foo(...)`). Any other callee
+        // expression is an indirect call through a function pointer (e.g. a
+        // struct field `((*x).cb)(...)`), whose target is a symbolic address we
+        // can't model soundly -- so it's out of scope. This guards the opaque
+        // function-pointer field model: such a pointer may be carried, never
+        // invoked. Checked on the heap path (where fn-ptr fields are built).
+        if self.allow_pointers && !matches!(&*c.func, syn::Expr::Path(_)) {
+            self.set(Skip::new(
+                "indirect call",
+                "calls through a function pointer",
+            ));
+        }
+        syn::visit::visit_expr_call(self, c);
+    }
+
     fn visit_item_static(&mut self, s: &'ast syn::ItemStatic) {
         // On the heap path a scalar `static mut` is modelled (each version gets
         // its own copy, final values compared), so it is kept in scope.
@@ -506,6 +522,29 @@ mod tests {
         let skip = u.heap_body_in_scope().unwrap_err();
         assert_eq!(skip.category, "foreign call");
         assert!(skip.detail.contains("big"));
+    }
+
+    #[test]
+    fn heap_body_rejects_an_indirect_call() {
+        // A call through a function pointer (here a struct field) can't be
+        // modelled soundly, so it is out of scope -- this is what keeps the
+        // opaque fn-ptr-field model honest (the pointer is carried, not called).
+        let u = unit(
+            "pub unsafe fn f(s: *mut S) { ((*s).cb.unwrap())(s); }",
+            &["pub struct S { pub cb: Option<unsafe extern \"C\" fn(*mut S)> }"],
+        );
+        let skip = u.heap_body_in_scope().unwrap_err();
+        assert_eq!(skip.category, "indirect call");
+    }
+
+    #[test]
+    fn heap_body_allows_a_carried_fn_ptr_field() {
+        // Merely reading/storing a fn-ptr field (not calling it) is fine.
+        let u = unit(
+            "pub unsafe fn f(s: *mut S) -> bool { (*s).cb.is_some() }",
+            &["pub struct S { pub cb: Option<unsafe extern \"C\" fn(*mut S)> }"],
+        );
+        assert!(u.heap_body_in_scope().is_ok());
     }
 
     #[test]

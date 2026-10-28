@@ -53,6 +53,14 @@ enum Field {
     /// `gen_cell`, copied with `clone_cell`, compared (post-state) with
     /// `same_cell`.
     ScalarCell,
+    /// A nullable function-pointer field (`Option<extern "C" fn(...)>`), held as
+    /// opaque pointer-sized data: built symbolically over *all* values (a
+    /// transmuted `kani::any::<usize>()`, never a fixed default, so no input is
+    /// silently excluded), copied by value (it is `Copy`), compared by identity.
+    /// Sound only because a call *through* such a pointer is rejected by the
+    /// body scope check (a symbolic function address can't be called); the field
+    /// is therefore carried data, never invoked. The string is the field type.
+    OpaqueWord(String),
 }
 
 /// The generated builder, cloner and comparer for one struct, plus the structs
@@ -259,10 +267,55 @@ fn classify(
         }
         return Err("array of a non-scalar element type".to_owned());
     }
+    // A nullable function pointer (`Option<extern "C" fn(...)>`): opaque
+    // pointer-sized data, carried but never called (an indirect call is
+    // rejected by the body scope check). Built symbolically over all values.
+    if is_option_fn(ty, aliases) {
+        return Ok(Field::OpaqueWord(opaque_word_type(ty)));
+    }
     Err(format!(
         "type `{}` is not a scalar or a pointer to a struct",
         last_segment(ty).unwrap_or_else(|| "?".to_owned())
     ))
+}
+
+/// Whether `ty` is `Option<F>` where `F` resolves (through aliases) to a bare
+/// function pointer -- a nullable callback. Such an `Option` is guaranteed
+/// pointer-sized (null-niche), so every `usize` bit pattern is a valid value,
+/// which makes a symbolic build over all values sound.
+/// The field type text for an opaque fn-ptr word, as the transmute target. The
+/// scratch crate strips the ABI off bare fn types (so `extern "C" fn` becomes a
+/// plain `fn`), so strip it here too for the transmute's output type to match
+/// the emitted struct field exactly.
+fn opaque_word_type(ty: &syn::Type) -> String {
+    use syn::visit_mut::VisitMut;
+    struct StripAbi;
+    impl VisitMut for StripAbi {
+        fn visit_type_bare_fn_mut(&mut self, f: &mut syn::TypeBareFn) {
+            f.abi = None;
+            syn::visit_mut::visit_type_bare_fn_mut(self, f);
+        }
+    }
+    let mut ty = ty.clone();
+    StripAbi.visit_type_mut(&mut ty);
+    ty.to_token_stream().to_string()
+}
+
+fn is_option_fn(ty: &syn::Type, aliases: &BTreeMap<String, syn::Type>) -> bool {
+    let syn::Type::Path(p) = ty else { return false };
+    let Some(seg) = p.path.segments.last() else {
+        return false;
+    };
+    if seg.ident != "Option" {
+        return false;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return false;
+    };
+    let [syn::GenericArgument::Type(inner)] = args.args.iter().collect::<Vec<_>>().as_slice() else {
+        return false;
+    };
+    matches!(resolve_alias(inner, aliases), syn::Type::BareFn(_))
 }
 
 /// Generate the builder, cloner and comparer for one struct.
@@ -508,6 +561,9 @@ pub fn signature_shapes(
                 structs.insert(target.clone());
                 Ok(Shape::Heap(target))
             }
+            // A function-pointer *argument* isn't built (no `kani::any` for it);
+            // the opaque-word model applies only to carried struct fields.
+            Field::OpaqueWord(_) => Err("function-pointer argument".to_owned()),
         }
     };
 
@@ -579,13 +635,19 @@ fn build_value(field: &Field) -> String {
         Field::CStr => "gen_cstr() as _".to_owned(),
         Field::ScalarCell => "gen_cell()".to_owned(),
         Field::Pointer(target) => format!("gen_{target}(depth - 1)"),
+        // A symbolic pointer-sized word reinterpreted as the field's own
+        // nullable-fn-ptr type: covers null and every address, no value fixed.
+        Field::OpaqueWord(ty) => {
+            format!("core::mem::transmute::<usize, {ty}>(kani::any::<usize>())")
+        }
     }
 }
 
 /// The expression that clones one field from source access `src` into `new`.
 fn clone_value(field: &Field, src: &str) -> String {
     match field {
-        Field::Scalar(_) | Field::ScalarArray => src.to_owned(),
+        // `Copy` values (scalars, arrays, and the opaque fn-ptr word) copy over.
+        Field::Scalar(_) | Field::ScalarArray | Field::OpaqueWord(_) => src.to_owned(),
         Field::CStr => format!("clone_cstr({src} as *const core::ffi::c_char) as _"),
         Field::ScalarCell => format!("clone_cell({src})"),
         Field::Pointer(target) => format!("clone_{target}({src}, map)"),
@@ -596,7 +658,8 @@ fn clone_value(field: &Field, src: &str) -> String {
 /// `false` on a difference.
 fn compare_stmt(field: &Field, a: &str, b: &str) -> String {
     match field {
-        Field::Scalar(_) | Field::ScalarArray => {
+        // Scalars, arrays, and the opaque fn-ptr word compare by value/identity.
+        Field::Scalar(_) | Field::ScalarArray | Field::OpaqueWord(_) => {
             format!("    if {a} != {b} {{ return false; }}\n")
         }
         Field::CStr => format!(
@@ -674,8 +737,9 @@ fn cloner(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)], t
     let mut links = String::new();
     for (name, field) in fields {
         match field {
-            // Scalars and scalar arrays are `Copy`: copy them in the initializer.
-            Field::Scalar(_) | Field::ScalarArray => {
+            // Scalars, scalar arrays, and the opaque fn-ptr word are `Copy`:
+            // copy them in the initializer.
+            Field::Scalar(_) | Field::ScalarArray | Field::OpaqueWord(_) => {
                 inits += &format!("        {name}: (*src).{name},\n")
             }
             // A C string is copied whole; it can't form cycles, so no linking.
@@ -924,10 +988,23 @@ mod tests {
 
     #[test]
     fn unsupported_field_type_bails() {
-        // A function pointer field: not yet handled.
-        let src = "pub struct S { pub f: Option<unsafe extern \"C\" fn()> }";
+        // A bare (non-nullable) function pointer: not pointer-sized-nullable, so
+        // not modellable as an opaque word -- still unsupported.
+        let src = "pub struct S { pub f: unsafe extern \"C\" fn() }";
         let err = generate(&index(src), "S", "old", "new").unwrap_err();
         assert_eq!(err.field, "f");
+    }
+
+    #[test]
+    fn nullable_fn_ptr_field_is_an_opaque_word() {
+        // `Option<extern fn>` is a nullable callback: built as an opaque,
+        // symbolic, pointer-sized word (transmuted `kani::any`), never a fixed
+        // value, and copied/compared by identity.
+        let src = "pub struct S { pub cb: Option<unsafe extern \"C\" fn(i32) -> i32>, pub n: i32 }";
+        let g = generate(&index(src), "S", "old", "new").unwrap();
+        assert!(g.builder.contains("transmute::<usize"), "symbolic word: {}", g.builder);
+        assert!(!g.builder.contains("None"), "never a fixed default: {}", g.builder);
+        assert!(g.comparer.contains("(*a).cb != (*b).cb"), "compared by identity: {}", g.comparer);
     }
 
     fn sig(s: &str) -> syn::Signature {

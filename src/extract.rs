@@ -736,6 +736,32 @@ impl Analyzer<'_> {
 }
 
 impl<'ast> Visit<'ast> for Analyzer<'_> {
+    fn visit_expr_call(&mut self, c: &'ast syn::ExprCall) {
+        // An indirect call -- through a function pointer held in a local (c2rust
+        // emits `if let Some(cb) = (*x).field { cb(..) }`) or any non-path callee
+        // -- targets a symbolic address on the heap path and can't be modelled
+        // soundly, so it is out of scope. This guards the opaque fn-ptr-field
+        // model: such a pointer may be carried, never invoked. A direct call
+        // names a crate/external function by path.
+        if self.resolver.heap {
+            let indirect = match &*c.func {
+                syn::Expr::Path(p) if p.qself.is_none() => matches!(
+                    self.resolver
+                        .resolve(self.module, &self.locals, &p.path, Ns::Value),
+                    Res::Local
+                ),
+                _ => true,
+            };
+            if indirect {
+                self.skip.get_or_insert(Skip::new(
+                    "indirect call",
+                    "calls through a function pointer",
+                ));
+            }
+        }
+        syn::visit::visit_expr_call(self, c);
+    }
+
     fn visit_expr_path(&mut self, e: &'ast syn::ExprPath) {
         match &e.qself {
             Some(q) => self.visit_type(&q.ty),
@@ -1023,6 +1049,19 @@ mod tests {
         let idx = index(src);
         let e = idx.find_functions("f")[0];
         assert_eq!(extract_heap(&idx, e).unwrap_err().category, "global");
+    }
+
+    // An indirect call through a function pointer read into a local (the shape
+    // c2rust emits for a nullable callback) is rejected during extraction,
+    // where the local is known -- so the opaque fn-ptr-field model stays sound.
+    #[test]
+    fn indirect_call_through_local_fn_ptr_is_rejected() {
+        let src = "pub struct S { pub cb: Option<unsafe extern \"C\" fn(*mut S)> }\n\
+                   pub unsafe fn f(s: *mut S) { if let Some(cb) = (*s).cb { cb(s); } }";
+        let idx = index(src);
+        let e = idx.find_functions("f")[0];
+        let skip = extract_heap(&idx, e).unwrap_err();
+        assert_eq!(skip.category, "indirect call", "{skip:?}");
     }
 
     // A pointer hidden behind a crate typedef (c2rust emits these everywhere)
