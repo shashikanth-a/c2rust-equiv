@@ -321,6 +321,30 @@ pub(crate) fn is_scalar_mut_static(s: &syn::ItemStatic) -> bool {
     false
 }
 
+/// Whether a static is a read-only "data" global the heap path can pull into a
+/// unit as an identical per-version copy: an array of scalars, a raw-pointer
+/// table, or an immutable scalar (a lookup table or string constant). Unlike a
+/// scalar `static mut` -- modelled with a final-value comparison -- these carry
+/// no comparison, so they are sound only when the unit never writes them, which
+/// the extractor checks before keeping them.
+pub(crate) fn is_data_static(s: &syn::ItemStatic) -> bool {
+    !is_scalar_mut_static(s) && is_data_type(&s.ty)
+}
+
+fn is_data_type(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::Array(a) => is_data_type(&a.elem),
+        syn::Type::Ptr(_) => true,
+        syn::Type::Path(p) => p.path.segments.last().is_some_and(|seg| {
+            let n = seg.ident.to_string();
+            crate::scalar::primitive(&n).is_some()
+                || crate::scalar::c_type(&n).is_some()
+                || crate::scalar::libc_typedef(&n).is_some()
+        }),
+        _ => false,
+    }
+}
+
 pub(crate) fn is_modelled_c_fn(name: &str) -> bool {
     matches!(
         name,
@@ -364,7 +388,10 @@ impl<'ast> Visit<'ast> for BodyChecker {
     fn visit_item_static(&mut self, s: &'ast syn::ItemStatic) {
         // On the heap path a scalar `static mut` is modelled (each version gets
         // its own copy, final values compared), so it is kept in scope.
-        if self.allow_pointers && is_scalar_mut_static(s) {
+        // A read-only data global (lookup table / string constant) is also
+        // kept: the extractor only pulls one in after checking the unit never
+        // writes it, so each version's identical copy is read identically.
+        if self.allow_pointers && (is_scalar_mut_static(s) || is_data_static(s)) {
             return;
         }
         self.set(Skip::new(

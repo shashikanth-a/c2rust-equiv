@@ -189,6 +189,27 @@ fn extract_in(
     }
     let function = function.expect("the function is in its own closure");
 
+    // Write-guard for read-only data globals: a data global is kept only if the
+    // unit never writes it, so each version's identical copy is read
+    // identically (no final comparison is emitted for it). If the unit does
+    // write one, it isn't read-only -- reject rather than risk a silent miss.
+    let data_statics: BTreeSet<String> = callees
+        .iter()
+        .filter_map(|c| match c {
+            syn::Item::Static(s) if crate::unit::is_data_static(s) => Some(s.ident.to_string()),
+            _ => None,
+        })
+        .collect();
+    if !data_statics.is_empty() {
+        let written = written_data_globals(&function, &callees, &data_statics);
+        if let Some(g) = written.iter().next() {
+            return Err(Skip::new(
+                "global",
+                format!("writes data global `{g}` (not read-only)"),
+            ));
+        }
+    }
+
     // Append the summary shim for every summarised callee the unit actually
     // calls. A summarised callee was resolved to a bare `External` call (not
     // inlined, so not in the closure), so its definition must come from the
@@ -380,6 +401,18 @@ impl Resolver<'_> {
         }
     }
 
+    /// A crate `static` definition of `name` that the heap path can model (a
+    /// scalar `static mut` or a data global), for resolving an `extern`
+    /// reference to its in-crate definition. `None` if there is no such def.
+    fn static_def(&self, name: &str) -> Option<usize> {
+        (0..self.index.entries.len()).find(|&i| {
+            let en = &self.index.entries[i];
+            en.kind == Kind::Static
+                && en.name == name
+                && (is_scalar_mut_static(&en.item) || is_data_static_item(&en.item))
+        })
+    }
+
     fn entry(&self, e: usize, shown: &str) -> Res {
         let entry = &self.index.entries[e];
         match entry.kind {
@@ -400,6 +433,20 @@ impl Resolver<'_> {
             // mutable state, but in isolation it starts from its initializer --
             // a real execution state -- which is sound (if incomplete).
             Kind::Static if self.heap && is_scalar_mut_static(&entry.item) => Res::Item(e),
+            // A read-only data global (lookup table / string constant) is
+            // pulled in too; the final write-guard in `extract_in` rejects the
+            // unit if any function actually writes it (then it isn't read-only).
+            Kind::Static if self.heap && is_data_static_item(&entry.item) => Res::Item(e),
+            // A reference through an `extern` declaration (c2rust emits one per
+            // file) resolves to the crate definition of the same name when that
+            // definition is a modellable global, so the data-global and
+            // scalar-`static mut` cases above apply to cross-file accesses too.
+            Kind::ForeignStatic if self.heap => {
+                match self.static_def(&entry.name) {
+                    Some(def) => self.entry(def, shown),
+                    None => Res::Skip(Skip::new("global", format!("accesses `{shown}`"))),
+                }
+            }
             Kind::Static | Kind::ForeignStatic => {
                 Res::Skip(Skip::new("global", format!("accesses `{shown}`")))
             }
@@ -445,6 +492,91 @@ impl Resolver<'_> {
 /// by giving each version its own identically-initialised copy).
 fn is_scalar_mut_static(item: &Option<syn::Item>) -> bool {
     matches!(item, Some(syn::Item::Static(s)) if crate::unit::is_scalar_mut_static(s))
+}
+
+/// Whether an item is a read-only data global the heap path can pull in (an
+/// array of scalars, a pointer table, or an immutable scalar). Soundness
+/// depends on the unit not writing it -- see the write-guard in `extract_in`.
+fn is_data_static_item(item: &Option<syn::Item>) -> bool {
+    matches!(item, Some(syn::Item::Static(s)) if crate::unit::is_data_static(s))
+}
+
+/// Names of data globals that `items` write (assign, take a `&mut`/`*mut` of,
+/// or `addr_of_mut!`). A data global absent here is read-only across the unit,
+/// so each version's identical copy is read identically -- sound without a
+/// final comparison. Any path to mutating a global must first name it on an
+/// assignment's left side or take its mutable address, so this is a sound
+/// over-approximation of "written".
+fn written_data_globals(
+    function: &syn::ItemFn,
+    callees: &[syn::Item],
+    names: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    struct Finder<'a> {
+        names: &'a BTreeSet<String>,
+        hit: BTreeSet<String>,
+    }
+    impl Finder<'_> {
+        fn mark(&mut self, e: &syn::Expr) {
+            if let Some(n) = base_name(e) {
+                if self.names.contains(&n) {
+                    self.hit.insert(n);
+                }
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for Finder<'_> {
+        fn visit_expr_assign(&mut self, a: &'ast syn::ExprAssign) {
+            self.mark(&a.left);
+            syn::visit::visit_expr_assign(self, a);
+        }
+        fn visit_expr_reference(&mut self, r: &'ast syn::ExprReference) {
+            if r.mutability.is_some() {
+                self.mark(&r.expr);
+            }
+            syn::visit::visit_expr_reference(self, r);
+        }
+        fn visit_expr_cast(&mut self, c: &'ast syn::ExprCast) {
+            if matches!(&*c.ty, syn::Type::Ptr(p) if p.mutability.is_some()) {
+                self.mark(&c.expr);
+            }
+            syn::visit::visit_expr_cast(self, c);
+        }
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            // `addr_of_mut!(X)` (bare or `core::ptr::addr_of_mut!`) takes a
+            // writable address of its argument -- treat it as a write.
+            if m.path.segments.last().is_some_and(|s| s.ident == "addr_of_mut") {
+                if let Ok(e) = m.parse_body::<syn::Expr>() {
+                    self.mark(&e);
+                }
+            }
+            syn::visit::visit_macro(self, m);
+        }
+    }
+    let mut f = Finder {
+        names,
+        hit: BTreeSet::new(),
+    };
+    f.visit_item_fn(function);
+    for c in callees {
+        f.visit_item(c);
+    }
+    f.hit
+}
+
+/// The root global name a place expression refers to, following field, index,
+/// deref, reference, cast and paren wrappers down to a leading path identifier.
+fn base_name(e: &syn::Expr) -> Option<String> {
+    match e {
+        syn::Expr::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
+        syn::Expr::Field(f) => base_name(&f.base),
+        syn::Expr::Index(i) => base_name(&i.expr),
+        syn::Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => base_name(&u.expr),
+        syn::Expr::Paren(p) => base_name(&p.expr),
+        syn::Expr::Reference(r) => base_name(&r.expr),
+        syn::Expr::Cast(c) => base_name(&c.expr),
+        _ => None,
+    }
 }
 
 /// Whether two stored items are the same definition, by token text. Used to
@@ -592,10 +724,13 @@ impl<'ast> Visit<'ast> for Analyzer<'_> {
     }
 
     fn visit_item_static(&mut self, s: &'ast syn::ItemStatic) {
-        // A scalar `static mut` is modelled on the heap path (included and
-        // compared); visit its initializer for references but don't reject it.
+        // A scalar `static mut` (modelled and compared) or a read-only data
+        // global is kept on the heap path; visit its initializer for references
+        // but don't reject it. A written data global is caught by the
+        // write-guard in `extract_in`, not here.
         if self.resolver.heap
-            && is_scalar_mut_static(&Some(syn::Item::Static(s.clone())))
+            && (is_scalar_mut_static(&Some(syn::Item::Static(s.clone())))
+                || is_data_static_item(&Some(syn::Item::Static(s.clone()))))
         {
             syn::visit::visit_item_static(self, s);
             return;
@@ -782,5 +917,62 @@ mod tests {
         // `helper` is the entry; its body stays, and no shim is appended.
         assert!(unit.function.to_token_stream().to_string().contains("* p = v"));
         assert!(!callees_src(&unit).contains("TRACE"));
+    }
+
+    // Data globals: a read-only lookup table is pulled into the unit, so each
+    // version gets an identical copy and reads it identically (sound).
+    #[test]
+    fn read_only_data_global_is_pulled_in() {
+        let src = "static mut TBL: [i32; 3] = [1i32, 2i32, 3i32];\n\
+                   pub unsafe fn f(p: *mut i32) { *p = TBL[1]; }";
+        let idx = index(src);
+        let e = idx.find_functions("f")[0];
+        let unit = extract_heap(&idx, e).unwrap();
+        assert!(callees_src(&unit).contains("static mut TBL"), "table pulled in");
+    }
+
+    // A data global the unit *writes* is not read-only: no final comparison is
+    // emitted for it, so keeping it would risk a silent divergence -- reject.
+    #[test]
+    fn written_data_global_is_rejected() {
+        let src = "static mut TBL: [i32; 3] = [1i32, 2i32, 3i32];\n\
+                   pub unsafe fn f(p: *mut i32) { TBL[0] = *p; }";
+        let idx = index(src);
+        let e = idx.find_functions("f")[0];
+        let skip = extract_heap(&idx, e).unwrap_err();
+        assert_eq!(skip.category, "global", "{skip:?}");
+    }
+
+    // Taking a mutable reference to a data global also counts as a write (the
+    // alias could be written through), so it is rejected too.
+    #[test]
+    fn mut_ref_to_data_global_is_rejected() {
+        let src = "static mut TBL: [i32; 3] = [0i32; 3];\n\
+                   pub unsafe fn f(p: *mut i32) { let r = &mut TBL; r[0] = *p; }";
+        let idx = index(src);
+        let e = idx.find_functions("f")[0];
+        assert_eq!(extract_heap(&idx, e).unwrap_err().category, "global");
+    }
+
+    // A cross-file access goes through an `extern` declaration (c2rust emits
+    // one per file); it must resolve to the crate definition so the data-global
+    // model applies, not be rejected as an opaque foreign static.
+    #[test]
+    fn extern_ref_to_data_global_resolves_to_definition() {
+        let mut idx = CrateIndex::default();
+        idx.add_source("a.rs", "static mut TBL: [i32; 3] = [1i32, 2i32, 3i32];")
+            .unwrap();
+        idx.add_source(
+            "b.rs",
+            "extern \"C\" { static mut TBL: [i32; 3]; }\n\
+             pub unsafe fn g(p: *mut i32) { *p = TBL[2]; }",
+        )
+        .unwrap();
+        let e = idx.find_functions("g")[0];
+        let unit = extract_heap(&idx, e).unwrap();
+        assert!(
+            callees_src(&unit).contains("static mut TBL"),
+            "definition pulled in across files"
+        );
     }
 }

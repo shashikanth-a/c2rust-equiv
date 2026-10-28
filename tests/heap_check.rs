@@ -882,3 +882,61 @@ fn str_model_catches_a_wrong_length() {
         outcome.status
     );
 }
+
+// A read-only data global (a lookup table) read by both versions. Each version
+// gets its own identical copy of the `static`, so reads agree -- the tool must
+// prove equivalence, and must catch a rewrite that reads a different entry.
+const TABLE: &str = "static mut TBL: [i64; 4] = [10i64, 20i64, 30i64, 40i64];";
+
+const LOOKUP_OLD: &str = r#"
+pub unsafe fn lookup(out: *mut i64, i: i32) {
+    if out.is_null() { return; }
+    let k = (i & 3) as usize;
+    *out = TBL[k];
+}
+"#;
+
+// Idiomatic rewrite: same mapping, different shape.
+const LOOKUP_OK: &str = r#"
+pub unsafe fn lookup(out: *mut i64, i: i32) {
+    if out.is_null() { return; }
+    let k = (i & 3) as usize;
+    let v = TBL[k];
+    *out = v;
+}
+"#;
+
+// Wrong rewrite: reads the next entry (wraps), so results differ for some i.
+const LOOKUP_BAD: &str = r#"
+pub unsafe fn lookup(out: *mut i64, i: i32) {
+    if out.is_null() { return; }
+    let k = ((i + 1) & 3) as usize;
+    *out = TBL[k];
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn read_only_global_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(LOOKUP_OLD, &[TABLE]).unwrap();
+    let new = FnUnit::parse(LOOKUP_OK, &[TABLE]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn read_only_global_does_not_prove_a_wrong_rewrite() {
+    let old = FnUnit::parse(LOOKUP_OLD, &[TABLE]).unwrap();
+    let new = FnUnit::parse(LOOKUP_BAD, &[TABLE]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a wrong rewrite was proved equivalent: {:?}",
+        outcome.status
+    );
+}
