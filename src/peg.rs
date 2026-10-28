@@ -12,13 +12,16 @@
 //! a construct outside the supported fragment, so the function can't be decided
 //! by this backend and some other must.
 //!
-//! The rewrite rules are restricted to identities that hold at **every integer
-//! width** under two's-complement wrapping (commutativity, associativity,
-//! `x+0`, `x*1`, `x*0`, `x*2 = x+x`, `x-x = 0`, `a - b = a + (-b)`,
-//! distributivity). So proving equivalence here is sound even though the
-//! fragment ignores the specific scalar width. General constant folding is
-//! deliberately omitted: folding an overflowing constant is width-dependent and
-//! would not be sound across widths.
+//! The tool's semantics counts arithmetic **overflow as a panic** (as in a
+//! build with overflow checks -- Kani always checks), so two functions are
+//! equivalent only if they also panic on exactly the same inputs. That rules
+//! out any rewrite that moves where an overflow can occur: associativity,
+//! distributivity, `a-b = a+(-b)` and `-(-a) = a` are therefore **excluded**
+//! (e.g. `(a+b)+c` can overflow where `a+(b+c)` does not). The rules kept are
+//! only those that preserve both value and overflow behaviour on every input:
+//! commutativity of `+`/`*`, `x+0 = x`, `x*1 = x`, `x*0 = 0`, `x-x = 0`, and
+//! `x*2 = x+x` (which overflows exactly when `x+x` does). General constant
+//! folding is omitted too (folding an overflowing constant is width-dependent).
 //!
 //! Current fragment: straight-line integer functions -- `let` bindings and a
 //! final (or `return`) expression over `+`, `-`, `*`, unary `-`, integer
@@ -43,27 +46,24 @@ define_language! {
     }
 }
 
-/// The rewrite rules -- each a semantic identity valid at every integer width
-/// under wrapping arithmetic, so a proof of equivalence under them is sound.
+/// The rewrite rules. Each preserves BOTH the computed value AND the set of
+/// inputs on which the expression overflows (panics), so a proof of
+/// equivalence under them is sound under overflow-as-panic semantics. Rules
+/// that would move an overflow point (associativity, distributivity,
+/// sub-as-add-neg, neg-neg) are deliberately NOT included -- see module docs.
 fn rules() -> Vec<Rewrite<Peg, ()>> {
     vec![
-        rw!("comm-add";  "(+ ?a ?b)"        => "(+ ?b ?a)"),
-        rw!("comm-mul";  "(* ?a ?b)"        => "(* ?b ?a)"),
-        rw!("assoc-add"; "(+ (+ ?a ?b) ?c)" => "(+ ?a (+ ?b ?c))"),
-        rw!("assoc-add2";"(+ ?a (+ ?b ?c))" => "(+ (+ ?a ?b) ?c)"),
-        rw!("assoc-mul"; "(* (* ?a ?b) ?c)" => "(* ?a (* ?b ?c))"),
-        rw!("assoc-mul2";"(* ?a (* ?b ?c))" => "(* (* ?a ?b) ?c)"),
-        rw!("add-0";     "(+ ?a 0)"         => "?a"),
-        rw!("mul-1";     "(* ?a 1)"         => "?a"),
-        rw!("mul-0";     "(* ?a 0)"         => "0"),
-        rw!("sub-add-neg"; "(- ?a ?b)"      => "(+ ?a (neg ?b))"),
-        rw!("add-neg-sub"; "(+ ?a (neg ?b))"=> "(- ?a ?b)"),
-        rw!("neg-neg";   "(neg (neg ?a))"   => "?a"),
-        rw!("double";    "(* ?a 2)"         => "(+ ?a ?a)"),
-        rw!("double2";   "(+ ?a ?a)"        => "(* ?a 2)"),
-        rw!("sub-self";  "(- ?a ?a)"        => "0"),
-        rw!("distribute";"(* ?a (+ ?b ?c))" => "(+ (* ?a ?b) (* ?a ?c))"),
-        rw!("factor";    "(+ (* ?a ?b) (* ?a ?c))" => "(* ?a (+ ?b ?c))"),
+        // `a + b` and `b + a` compute the same sum and overflow together.
+        rw!("comm-add"; "(+ ?a ?b)" => "(+ ?b ?a)"),
+        rw!("comm-mul"; "(* ?a ?b)" => "(* ?b ?a)"),
+        // Identities that neither change the value nor introduce an overflow.
+        rw!("add-0"; "(+ ?a 0)" => "?a"),
+        rw!("mul-1"; "(* ?a 1)" => "?a"),
+        rw!("mul-0"; "(* ?a 0)" => "0"),
+        rw!("sub-self"; "(- ?a ?a)" => "0"),
+        // `a * 2` and `a + a` are the same value and overflow on the same inputs.
+        rw!("double";  "(* ?a 2)" => "(+ ?a ?a)"),
+        rw!("double2"; "(+ ?a ?a)" => "(* ?a 2)"),
     ]
 }
 
@@ -198,10 +198,29 @@ mod tests {
     }
 
     #[test]
-    fn let_bindings_and_distribution() {
+    fn let_bindings_are_inlined() {
+        // `let` bindings are threaded through; commutativity still proves these.
+        let a = f("fn g(x: i64, y: i64) -> i64 { let s = x + y; s }");
+        let b = f("fn g(x: i64, y: i64) -> i64 { y + x }");
+        assert_eq!(equivalent(&a, &b), Some(true));
+    }
+
+    #[test]
+    fn distribution_is_withheld_under_overflow_semantics() {
+        // x*(y+z) and x*y + x*z are equal only under wrapping arithmetic; with
+        // overflow-as-panic they panic on different inputs, so the backend must
+        // NOT prove them equivalent (it would be unsound).
         let a = f("fn g(x: i64, y: i64, z: i64) -> i64 { x * (y + z) }");
         let b = f("fn g(x: i64, y: i64, z: i64) -> i64 { let p = x * y; let q = x * z; p + q }");
-        assert_eq!(equivalent(&a, &b), Some(true));
+        assert_eq!(equivalent(&a, &b), Some(false));
+    }
+
+    #[test]
+    fn associativity_is_withheld_under_overflow_semantics() {
+        // (a+b)+c can overflow where a+(b+c) does not -- not provably equivalent.
+        let a = f("fn g(a: i64, b: i64, c: i64) -> i64 { (a + b) + c }");
+        let b = f("fn g(a: i64, b: i64, c: i64) -> i64 { a + (b + c) }");
+        assert_eq!(equivalent(&a, &b), Some(false));
     }
 
     #[test]
