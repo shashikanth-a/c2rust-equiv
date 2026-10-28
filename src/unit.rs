@@ -408,6 +408,7 @@ impl<'ast> Visit<'ast> for BodyChecker {
         if self.allow_pointers
             && crate::indirectmodel::is_indirect(c)
             && !self.type_env.indirect_is_modellable(c)
+            && !crate::allocmodel::is_alloc_hook_call(c)
         {
             self.set(Skip::new(
                 "indirect call",
@@ -444,7 +445,7 @@ impl<'ast> Visit<'ast> for BodyChecker {
         // functions Kani models are allowed; any other foreign item is not.
         for item in &m.items {
             let ok = self.allow_pointers
-                && matches!(item, syn::ForeignItem::Fn(f)
+                && (matches!(item, syn::ForeignItem::Fn(f)
                     if is_modelled_c_fn(&f.sig.ident.to_string())
                         || crate::varmodel::is_variadic_modelled(&f.sig.ident.to_string())
                         || crate::strmodel::is_trace_modellable(&Some(syn::Item::ForeignMod(
@@ -455,7 +456,11 @@ impl<'ast> Visit<'ast> for BodyChecker {
                                 brace_token: m.brace_token,
                                 items: vec![syn::ForeignItem::Fn(f.clone())],
                             },
-                        ))));
+                        ))))
+                    // An allocator-hook global (`static mut xmlMalloc: ..`) is
+                    // given a module-local modelled definition by allocmodel.
+                    || matches!(item, syn::ForeignItem::Static(s)
+                        if crate::allocmodel::is_alloc_global(&s.ident.to_string())));
             if !ok {
                 let what = match item {
                     syn::ForeignItem::Fn(f) => format!("foreign function `{}`", f.sig.ident),

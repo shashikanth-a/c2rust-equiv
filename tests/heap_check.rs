@@ -1247,3 +1247,66 @@ fn newtype_enum_arg_proves_equivalent_rewrite() {
         "expected Proved"
     );
 }
+
+// A call through libxml2's global allocator hooks (`xmlMalloc.expect("..")(n)`,
+// `xmlFree.expect("..")(p)`). allocmodel gives each hook a concrete definition
+// routing to Kani's modelled malloc/free, so the call works natively; the
+// eligibility gate now admits it instead of rejecting it as an indirect call.
+const AL_DEFS: &[&str] = &[
+    "pub type size_t = usize;",
+    "pub type xmlMallocFunc = Option<unsafe extern \"C\" fn(size_t) -> *mut ::core::ffi::c_void>;",
+    "pub type xmlFreeFunc = Option<unsafe extern \"C\" fn(*mut ::core::ffi::c_void) -> ()>;",
+    "extern \"C\" { static mut xmlMalloc: xmlMallocFunc; static mut xmlFree: xmlFreeFunc; }",
+];
+
+const AL_OLD: &str = r#"
+pub unsafe fn f(_d: *mut ::core::ffi::c_void, n: ::core::ffi::c_int) -> ::core::ffi::c_int {
+    let p = xmlMalloc.expect("non-null function pointer")(8 as size_t);
+    if p.is_null() { return 0; }
+    xmlFree.expect("non-null function pointer")(p);
+    n
+}
+"#;
+
+const AL_OK: &str = r#"
+pub unsafe fn f(_d: *mut ::core::ffi::c_void, n: ::core::ffi::c_int) -> ::core::ffi::c_int {
+    let sz: size_t = 8 as size_t;
+    let p = xmlMalloc.expect("non-null function pointer")(sz);
+    if p.is_null() { return 0; }
+    xmlFree.expect("non-null function pointer")(p);
+    let v = n;
+    v
+}
+"#;
+
+const AL_BAD: &str = r#"
+pub unsafe fn f(_d: *mut ::core::ffi::c_void, n: ::core::ffi::c_int) -> ::core::ffi::c_int {
+    let p = xmlMalloc.expect("non-null function pointer")(8 as size_t);
+    if p.is_null() { return 0; }
+    xmlFree.expect("non-null function pointer")(p);
+    n + 1
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn alloc_hook_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(AL_OLD, AL_DEFS).unwrap();
+    let new = FnUnit::parse(AL_OK, AL_DEFS).unwrap();
+    assert!(
+        matches!(check(&old, &new, &opts()).status, Status::Proved { .. }),
+        "expected Proved"
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn alloc_hook_catches_divergence() {
+    let old = FnUnit::parse(AL_OLD, AL_DEFS).unwrap();
+    let new = FnUnit::parse(AL_BAD, AL_DEFS).unwrap();
+    assert!(
+        !matches!(check(&old, &new, &opts()).status, Status::Proved { .. }),
+        "a +1 rewrite was proved equivalent"
+    );
+}
+

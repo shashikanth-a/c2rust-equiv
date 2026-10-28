@@ -26,6 +26,27 @@ pub fn is_alloc_global(name: &str) -> bool {
     GLOBALS.contains(&name)
 }
 
+/// Whether `call` is a call through a modelled allocator-hook global, i.e.
+/// `xmlMalloc.expect("..")(..)` / `xmlFree.unwrap()(..)`. Such a call is *not*
+/// a general indirect call to reject: [`inject`] gives the global a concrete
+/// `Some(shim)` definition pointing at Kani's modelled `malloc`/`realloc`/
+/// `free`, so the `.expect()` unwraps to a real function and the call works
+/// natively (and allocates valid memory). Both versions get the same
+/// definition, so they stay comparable. This gates the eligibility checks so
+/// such a call -- which dominates libxml2 -- is admitted.
+pub fn is_alloc_hook_call(call: &syn::ExprCall) -> bool {
+    let syn::Expr::MethodCall(mc) = &*call.func else {
+        return false;
+    };
+    if mc.method != "expect" && mc.method != "unwrap" {
+        return false;
+    }
+    match &*mc.receiver {
+        syn::Expr::Path(p) => p.path.get_ident().is_some_and(|id| is_alloc_global(&id.to_string())),
+        _ => false,
+    }
+}
+
 /// The shims and the modelled-allocator `extern` block, shared by the globals.
 const SHIMS: &str = r#"
 unsafe extern "C" fn __equiv_malloc(n: usize) -> *mut ::core::ffi::c_void {
@@ -74,6 +95,17 @@ pub fn inject(items: &mut Vec<syn::Item>) {
     if names.is_empty() {
         return;
     }
+    // Drop any `extern` declaration of an allocator global we're about to
+    // define module-locally, so the two don't collide; prune foreign blocks
+    // left empty.
+    for item in items.iter_mut() {
+        if let syn::Item::ForeignMod(m) = item {
+            m.items.retain(|it| {
+                !matches!(it, syn::ForeignItem::Static(s) if is_alloc_global(&s.ident.to_string()))
+            });
+        }
+    }
+    items.retain(|it| !matches!(it, syn::Item::ForeignMod(m) if m.items.is_empty()));
     for item in syn::parse_file(SHIMS).expect("shims parse").items {
         items.push(item);
     }

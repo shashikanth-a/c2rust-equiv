@@ -788,7 +788,10 @@ impl<'ast> Visit<'ast> for Analyzer<'_> {
             // is modelled as an observable/uninterpreted trace call keyed by the
             // callback value (see `crate::indirectmodel`), so it is admitted
             // when its shape fits. Any other indirect call is still out of scope.
-            if indirect && !self.type_env.indirect_is_modellable(c) {
+            if indirect
+                && !self.type_env.indirect_is_modellable(c)
+                && !crate::allocmodel::is_alloc_hook_call(c)
+            {
                 self.skip.get_or_insert(Skip::new(
                     "indirect call",
                     "calls through a function pointer",
