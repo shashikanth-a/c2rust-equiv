@@ -1071,3 +1071,54 @@ fn indirect_call_catches_different_argument() {
         outcome.status
     );
 }
+
+// A function-pointer *argument* (not a struct field): built as an opaque
+// symbolic word and passed to both versions, then called via the modelled
+// indirect call. Proves equivalent when both call it with the same argument;
+// catches a changed argument. Exercises Shape::OpaqueArg + indirectmodel.
+const FA_DEFS: &[&str] = &["pub type cb_t = unsafe extern \"C\" fn(i64) -> i64;"];
+
+const FA_OLD: &str = r#"
+pub unsafe fn apply(cb: Option<cb_t>, x: i64) -> i64 {
+    cb.expect("non-null function pointer")(x)
+}
+"#;
+
+const FA_OK: &str = r#"
+pub unsafe fn apply(cb: Option<cb_t>, x: i64) -> i64 {
+    let v = x;
+    cb.expect("non-null function pointer")(v)
+}
+"#;
+
+const FA_BAD: &str = r#"
+pub unsafe fn apply(cb: Option<cb_t>, x: i64) -> i64 {
+    cb.expect("non-null function pointer")(x.wrapping_add(1))
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn fn_ptr_arg_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(FA_OLD, FA_DEFS).unwrap();
+    let new = FnUnit::parse(FA_OK, FA_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn fn_ptr_arg_catches_different_argument() {
+    let old = FnUnit::parse(FA_OLD, FA_DEFS).unwrap();
+    let new = FnUnit::parse(FA_BAD, FA_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a different argument to the callback was proved equivalent: {:?}",
+        outcome.status
+    );
+}

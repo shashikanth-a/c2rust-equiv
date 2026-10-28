@@ -579,6 +579,12 @@ pub enum Shape {
     /// A `*mut T`/`*const T` argument to a single scalar: one heap cell, whose
     /// post-state is compared (a divergent write through `*mut T` is caught).
     ScalarCell,
+    /// A nullable function-pointer argument (`Option<extern "C" fn(..)>`), built
+    /// as an opaque symbolic word (a transmuted `kani::any::<usize>()`, over all
+    /// values) and passed identically to both versions -- carried data, sound
+    /// because a call *through* it is modelled as an observable trace call (see
+    /// `crate::indirectmodel`). The string is the ABI-stripped field type.
+    OpaqueArg(String),
 }
 
 /// The shapes of a function's arguments and return value for the heap path.
@@ -630,9 +636,11 @@ pub fn signature_shapes(
                 structs.insert(target.clone());
                 Ok(Shape::Heap(target))
             }
-            // A function-pointer *argument* isn't built (no `kani::any` for it);
-            // the opaque-word model applies only to carried struct fields.
-            Field::OpaqueWord(_) => Err("function-pointer argument".to_owned()),
+            // A function-pointer argument: built as an opaque symbolic word and
+            // passed to both versions, sound because calls through it are
+            // modelled (`crate::indirectmodel`). The type is ABI-stripped and
+            // alias-resolved so it names what the scratch crate emits.
+            Field::OpaqueWord(ty) => Ok(Shape::OpaqueArg(ty)),
         }
     };
 

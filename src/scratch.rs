@@ -257,6 +257,19 @@ fn heap_lib_source(
                 new_args.push(format!("b{i}"));
                 cell_args.push(i);
             }
+            // A function-pointer argument: an opaque symbolic word over all
+            // values (null-niche `Option<fn>` makes every `usize` valid),
+            // passed by value to both versions. It is carried data (a call
+            // through it is a modelled trace call), so there is no post-state
+            // to compare -- both versions hold the same value.
+            Shape::OpaqueArg(ty) => {
+                build += &format!(
+                    "        let a{i}: {ty} = \
+                     unsafe {{ core::mem::transmute::<usize, {ty}>(kani::any::<usize>()) }};\n"
+                );
+                old_args.push(format!("a{i}"));
+                new_args.push(format!("a{i}"));
+            }
         }
     }
     let old_call = format!("old::{old_name}({})", old_args.join(", "));
@@ -277,6 +290,10 @@ fn heap_lib_source(
         Shape::ScalarCell => {
             "        assert!(same_cell(o, n), \"results differ\");\n".to_owned()
         }
+        // A returned function pointer: compared by identity (its word value).
+        Shape::OpaqueArg(_) => "        assert!(unsafe { core::mem::transmute::<_, usize>(o) } \
+             == unsafe { core::mem::transmute::<_, usize>(n) }, \"results differ\");\n"
+            .to_owned(),
     };
     let mut arg_cmp = String::new();
     for (i, name) in &heap_args {
