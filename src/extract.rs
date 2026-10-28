@@ -139,12 +139,20 @@ fn extract_in(
             .item
             .as_ref()
             .expect("closure entries have items");
+        // The variable/field type environment for recognising a modellable
+        // indirect call in this item (fields from the whole index, variables
+        // from this function's signature and annotated locals).
+        let mut type_env = crate::indirectmodel::TypeEnv::from_index(index);
+        if let syn::Item::Fn(f) = item {
+            type_env.with_fn(f);
+        }
         let mut analyzer = Analyzer {
             resolver: &resolver,
             module: index.entries[e].module,
             locals: locals(item, &resolver, index.entries[e].module),
             found: vec![],
             skip: None,
+            type_env,
         };
         analyzer.visit_item(item);
         if let Some(skip) = analyzer.skip {
@@ -718,6 +726,9 @@ struct Analyzer<'a> {
     locals: HashSet<String>,
     found: Vec<usize>,
     skip: Option<Skip>,
+    /// Struct-field and current-function variable types, so a modellable
+    /// indirect (function-pointer) call can be recognised and admitted.
+    type_env: crate::indirectmodel::TypeEnv,
 }
 
 impl Analyzer<'_> {
@@ -752,7 +763,11 @@ impl<'ast> Visit<'ast> for Analyzer<'_> {
                 ),
                 _ => true,
             };
-            if indirect {
+            // A function-pointer call c2rust emits as `field.expect("..")(args)`
+            // is modelled as an observable/uninterpreted trace call keyed by the
+            // callback value (see `crate::indirectmodel`), so it is admitted
+            // when its shape fits. Any other indirect call is still out of scope.
+            if indirect && !self.type_env.indirect_is_modellable(c) {
                 self.skip.get_or_insert(Skip::new(
                     "indirect call",
                     "calls through a function pointer",

@@ -271,7 +271,7 @@ fn classify(
     // pointer-sized data, carried but never called (an indirect call is
     // rejected by the body scope check). Built symbolically over all values.
     if is_option_fn(ty, aliases) {
-        return Ok(Field::OpaqueWord(opaque_word_type(ty)));
+        return Ok(Field::OpaqueWord(opaque_word_type(ty, aliases)));
     }
     Err(format!(
         "type `{}` is not a scalar or a pointer to a struct",
@@ -283,12 +283,23 @@ fn classify(
 /// function pointer -- a nullable callback. Such an `Option` is guaranteed
 /// pointer-sized (null-niche), so every `usize` bit pattern is a valid value,
 /// which makes a symbolic build over all values sound.
-/// The field type text for an opaque fn-ptr word, as the transmute target. The
-/// scratch crate strips the ABI off bare fn types (so `extern "C" fn` becomes a
-/// plain `fn`), so strip it here too for the transmute's output type to match
-/// the emitted struct field exactly.
-fn opaque_word_type(ty: &syn::Type) -> String {
+/// The field type text for an opaque fn-ptr word, as the transmute target. Two
+/// adjustments make it match what the harness can name and what the scratch
+/// crate emits: crate type aliases are resolved away (a field typed
+/// `Option<MyCallback>` would otherwise name `MyCallback`, which is not in the
+/// harness's scope), and the ABI is stripped off bare fn types (the scratch
+/// crate rewrites `extern "C" fn` to a plain `fn`).
+fn opaque_word_type(ty: &syn::Type, aliases: &BTreeMap<String, syn::Type>) -> String {
     use syn::visit_mut::VisitMut;
+    // Resolve aliases everywhere in the type: the outer type and, for the
+    // `Option<F>` callback shape, its inner `F`.
+    struct ResolveAliases<'a>(&'a BTreeMap<String, syn::Type>);
+    impl VisitMut for ResolveAliases<'_> {
+        fn visit_type_mut(&mut self, t: &mut syn::Type) {
+            *t = resolve_alias(t, self.0);
+            syn::visit_mut::visit_type_mut(self, t);
+        }
+    }
     struct StripAbi;
     impl VisitMut for StripAbi {
         fn visit_type_bare_fn_mut(&mut self, f: &mut syn::TypeBareFn) {
@@ -296,7 +307,8 @@ fn opaque_word_type(ty: &syn::Type) -> String {
             syn::visit_mut::visit_type_bare_fn_mut(self, f);
         }
     }
-    let mut ty = ty.clone();
+    let mut ty = resolve_alias(ty, aliases);
+    ResolveAliases(aliases).visit_type_mut(&mut ty);
     StripAbi.visit_type_mut(&mut ty);
     ty.to_token_stream().to_string()
 }

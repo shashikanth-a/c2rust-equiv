@@ -108,18 +108,22 @@ impl FnUnit {
     }
 
     fn body_in_scope(&self, allow_pointers: bool) -> Result<(), Skip> {
+        let items = self.items();
         let mut checker = BodyChecker {
             skip: None,
             allow_pointers,
+            // Field types come from every struct in the unit; variable types are
+            // filled in per function as the checker descends (see visit_item_fn).
+            type_env: crate::indirectmodel::TypeEnv::from_items(&items),
         };
-        for item in self.items() {
+        for item in &items {
             // A generated summary shim is trusted code that only runs in the
             // scratch template (it uses the trace support there); its body is
             // not source under test, so it is exempt from the scope check.
-            if crate::summary::is_summary_shim(&item) {
+            if crate::summary::is_summary_shim(item) {
                 continue;
             }
-            checker.visit_item(&item);
+            checker.visit_item(item);
         }
         match checker.skip {
             Some(skip) => Err(skip),
@@ -369,6 +373,9 @@ struct BodyChecker {
     /// The heap path handles raw pointers, so it allows them while still
     /// rejecting the rest (IO, globals, foreign calls, unsupported macros).
     allow_pointers: bool,
+    /// Struct-field and current-function variable types, so a modellable
+    /// indirect call (`field.expect("..")(args)`) can be recognised.
+    type_env: crate::indirectmodel::TypeEnv,
 }
 
 impl BodyChecker {
@@ -392,13 +399,23 @@ impl<'ast> Visit<'ast> for BodyChecker {
         // can't model soundly -- so it's out of scope. This guards the opaque
         // function-pointer field model: such a pointer may be carried, never
         // invoked. Checked on the heap path (where fn-ptr fields are built).
-        if self.allow_pointers && !matches!(&*c.func, syn::Expr::Path(_)) {
+        if self.allow_pointers
+            && crate::indirectmodel::is_indirect(c)
+            && !self.type_env.indirect_is_modellable(c)
+        {
             self.set(Skip::new(
                 "indirect call",
                 "calls through a function pointer",
             ));
         }
         syn::visit::visit_expr_call(self, c);
+    }
+
+    fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+        // Record this function's parameter and local types so an indirect call
+        // in its body can be typed, then check the body.
+        self.type_env.with_fn(f);
+        syn::visit::visit_item_fn(self, f);
     }
 
     fn visit_item_static(&mut self, s: &'ast syn::ItemStatic) {

@@ -23,6 +23,7 @@ mod scratch;
 mod strmodel;
 pub mod taggedunion;
 mod varmodel;
+mod indirectmodel;
 pub mod unit;
 
 pub use check::{check, heap_diagnose, heap_eligible, Method, Options, Outcome, Status};

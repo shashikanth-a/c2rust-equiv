@@ -1009,3 +1009,65 @@ fn algebraic_backend_proves_without_kani() {
     // The algebraic pre-check short-circuits before any Kani invocation.
     assert_eq!(outcome.kani_ms, None);
 }
+
+// An indirect (function-pointer) call through a nullable callback field, as
+// c2rust emits it (`field.expect("..")(args)`). The call is modelled as an
+// observable/uninterpreted trace call keyed by the callback value, so both
+// versions agree when they call the same callback with the same argument, and
+// a changed argument is caught. The callback field type is a typedef'd bare fn
+// (as c2rust emits), exercising alias resolution in the gate.
+const IC_DEFS: &[&str] = &[
+    "pub type cb_t = unsafe extern \"C\" fn(i64) -> i64;",
+    "#[repr(C)] pub struct S { pub cb: Option<cb_t>, pub x: i64 }",
+];
+
+const IC_OLD: &str = r#"
+pub unsafe fn run(s: *mut S) -> i64 {
+    if s.is_null() { return 0; }
+    (*s).cb.expect("non-null function pointer")((*s).x)
+}
+"#;
+
+// Equivalent: the argument is bound to a local first, same value passed.
+const IC_OK: &str = r#"
+pub unsafe fn run(s: *mut S) -> i64 {
+    if s.is_null() { return 0; }
+    let v = (*s).x;
+    (*s).cb.expect("non-null function pointer")(v)
+}
+"#;
+
+// Wrong: the callback is passed a different argument, so for some heaps the
+// (uninterpreted) callback returns a different value.
+const IC_BAD: &str = r#"
+pub unsafe fn run(s: *mut S) -> i64 {
+    if s.is_null() { return 0; }
+    (*s).cb.expect("non-null function pointer")((*s).x.wrapping_add(1))
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn indirect_call_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(IC_OLD, IC_DEFS).unwrap();
+    let new = FnUnit::parse(IC_OK, IC_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn indirect_call_catches_different_argument() {
+    let old = FnUnit::parse(IC_OLD, IC_DEFS).unwrap();
+    let new = FnUnit::parse(IC_BAD, IC_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a different callback argument was proved equivalent: {:?}",
+        outcome.status
+    );
+}
