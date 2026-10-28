@@ -331,7 +331,7 @@ pub(crate) fn is_data_static(s: &syn::ItemStatic) -> bool {
     !is_scalar_mut_static(s) && is_data_type(&s.ty)
 }
 
-fn is_data_type(ty: &syn::Type) -> bool {
+pub(crate) fn is_data_type(ty: &syn::Type) -> bool {
     match ty {
         syn::Type::Array(a) => is_data_type(&a.elem),
         syn::Type::Ptr(_) => true,

@@ -115,10 +115,19 @@ fn extract_in(
         .filter(|name| **name != index.entries[entry].name)
         .cloned()
         .collect();
+    // Crate type aliases, so a pointer hidden behind a typedef (c2rust emits
+    // many, e.g. `xmlMutexPtr = *mut xmlMutex`) is recognised as a pointer by
+    // the eligibility gates below and exposed in the assembled unit.
+    let aliases = if heap {
+        crate::heapgen::alias_table(index)
+    } else {
+        BTreeMap::new()
+    };
     let resolver = Resolver {
         index,
         heap,
         summaries: &summary_names,
+        aliases: &aliases,
     };
     let mut closure = BTreeSet::new();
     let mut queue = VecDeque::from([entry]);
@@ -187,7 +196,18 @@ fn extract_in(
             item => callees.push(item),
         }
     }
-    let function = function.expect("the function is in its own closure");
+    let mut function = function.expect("the function is in its own closure");
+
+    // Expose pointers hidden behind crate typedefs as concrete `*mut`/`*const`
+    // in the assembled unit, so the body scope check, the write-guard, and the
+    // trace-shim generator all classify them correctly without alias lookup.
+    if heap {
+        let mut inliner = PtrAliasInliner { aliases: &aliases };
+        inliner.visit_item_fn_mut(&mut function);
+        for c in &mut callees {
+            inliner.visit_item_mut(c);
+        }
+    }
 
     // Write-guard for read-only data globals: a data global is kept only if the
     // unit never writes it, so each version's identical copy is read
@@ -260,6 +280,9 @@ struct Resolver<'a> {
     /// A `Kind::Fn` whose name is here resolves to a bare `External` call; the
     /// shim definition is appended to the unit afterwards.
     summaries: &'a BTreeSet<String>,
+    /// Crate type aliases, for seeing through a typedef to a pointer/scalar
+    /// when classifying a foreign-call signature or a static's type.
+    aliases: &'a BTreeMap<String, syn::Type>,
 }
 
 impl Resolver<'_> {
@@ -409,8 +432,31 @@ impl Resolver<'_> {
             let en = &self.index.entries[i];
             en.kind == Kind::Static
                 && en.name == name
-                && (is_scalar_mut_static(&en.item) || is_data_static_item(&en.item))
+                && (is_scalar_mut_static(&en.item) || self.is_data_static_item(&en.item))
         })
+    }
+
+    /// Whether a static item is a modellable data global, seeing through crate
+    /// type aliases (so `static X: SomePtrTypedef` is recognised as a pointer).
+    fn is_data_static_item(&self, item: &Option<syn::Item>) -> bool {
+        let Some(syn::Item::Static(s)) = item else {
+            return false;
+        };
+        if crate::unit::is_scalar_mut_static(s) {
+            return false;
+        }
+        crate::unit::is_data_type(&inline_ptr_aliases(&s.ty, self.aliases))
+    }
+
+    /// Whether a foreign function can be modelled as an observable trace call,
+    /// seeing through crate type aliases on its argument and return types.
+    fn is_trace_modellable_item(&self, item: &Option<syn::Item>) -> bool {
+        let Some(syn::Item::ForeignMod(m)) = item else {
+            return false;
+        };
+        let mut m = m.clone();
+        PtrAliasInliner { aliases: self.aliases }.visit_item_foreign_mod_mut(&mut m);
+        crate::strmodel::is_trace_modellable(&Some(syn::Item::ForeignMod(m)))
     }
 
     fn entry(&self, e: usize, shown: &str) -> Res {
@@ -436,7 +482,7 @@ impl Resolver<'_> {
             // A read-only data global (lookup table / string constant) is
             // pulled in too; the final write-guard in `extract_in` rejects the
             // unit if any function actually writes it (then it isn't read-only).
-            Kind::Static if self.heap && is_data_static_item(&entry.item) => Res::Item(e),
+            Kind::Static if self.heap && self.is_data_static_item(&entry.item) => Res::Item(e),
             // A reference through an `extern` declaration (c2rust emits one per
             // file) resolves to the crate definition of the same name when that
             // definition is a modellable global, so the data-global and
@@ -464,7 +510,7 @@ impl Resolver<'_> {
                     // as its own declaration rather than rejected.
                     [] if self.heap
                         && (crate::unit::is_modelled_c_fn(&entry.name)
-                            || crate::strmodel::is_trace_modellable(&entry.item)) =>
+                            || self.is_trace_modellable_item(&entry.item)) =>
                     {
                         Res::Item(e)
                     }
@@ -494,11 +540,34 @@ fn is_scalar_mut_static(item: &Option<syn::Item>) -> bool {
     matches!(item, Some(syn::Item::Static(s)) if crate::unit::is_scalar_mut_static(s))
 }
 
-/// Whether an item is a read-only data global the heap path can pull in (an
-/// array of scalars, a pointer table, or an immutable scalar). Soundness
-/// depends on the unit not writing it -- see the write-guard in `extract_in`.
-fn is_data_static_item(item: &Option<syn::Item>) -> bool {
-    matches!(item, Some(syn::Item::Static(s)) if crate::unit::is_data_static(s))
+/// Resolve `ty` through crate type aliases and, if it stands for a pointer,
+/// return that pointer type; otherwise return `ty` unchanged. Only pointer
+/// aliases are inlined -- scalar typedefs are already classified elsewhere --
+/// so the common `*Typedef` hidden behind a name becomes a visible `*mut T`.
+fn inline_ptr_aliases(ty: &syn::Type, aliases: &BTreeMap<String, syn::Type>) -> syn::Type {
+    let resolved = crate::heapgen::resolve_alias(ty, aliases);
+    if matches!(resolved, syn::Type::Ptr(_)) {
+        resolved
+    } else {
+        ty.clone()
+    }
+}
+
+/// Rewrites every type that stands (through aliases) for a pointer into that
+/// pointer type, so downstream consumers (trace shims, body scope check,
+/// write-guard) see a concrete `*mut`/`*const` rather than an opaque typedef.
+struct PtrAliasInliner<'a> {
+    aliases: &'a BTreeMap<String, syn::Type>,
+}
+
+impl VisitMut for PtrAliasInliner<'_> {
+    fn visit_type_mut(&mut self, ty: &mut syn::Type) {
+        let inlined = inline_ptr_aliases(ty, self.aliases);
+        if &inlined != ty {
+            *ty = inlined;
+        }
+        syn::visit_mut::visit_type_mut(self, ty);
+    }
 }
 
 /// Names of data globals that `items` write (assign, take a `&mut`/`*mut` of,
@@ -730,7 +799,9 @@ impl<'ast> Visit<'ast> for Analyzer<'_> {
         // write-guard in `extract_in`, not here.
         if self.resolver.heap
             && (is_scalar_mut_static(&Some(syn::Item::Static(s.clone())))
-                || is_data_static_item(&Some(syn::Item::Static(s.clone()))))
+                || self
+                    .resolver
+                    .is_data_static_item(&Some(syn::Item::Static(s.clone()))))
         {
             syn::visit::visit_item_static(self, s);
             return;
@@ -749,7 +820,7 @@ impl<'ast> Visit<'ast> for Analyzer<'_> {
             && m.items.iter().all(|it| match it {
                 syn::ForeignItem::Fn(f) => {
                     crate::unit::is_modelled_c_fn(&f.sig.ident.to_string())
-                        || crate::strmodel::is_trace_modellable(&Some(syn::Item::ForeignMod(
+                        || self.resolver.is_trace_modellable_item(&Some(syn::Item::ForeignMod(
                             syn::ItemForeignMod {
                                 attrs: vec![],
                                 unsafety: None,
@@ -952,6 +1023,39 @@ mod tests {
         let idx = index(src);
         let e = idx.find_functions("f")[0];
         assert_eq!(extract_heap(&idx, e).unwrap_err().category, "global");
+    }
+
+    // A pointer hidden behind a crate typedef (c2rust emits these everywhere)
+    // is recognised as a data global and exposed as a concrete `*mut` in the
+    // unit, not rejected as an opaque global.
+    #[test]
+    fn pointer_typedef_global_is_recognized() {
+        let src = "pub type Handle = *mut i32;\n\
+                   static mut TBL: Handle = core::ptr::null_mut();\n\
+                   pub unsafe fn f(p: *mut i32) { *p = if TBL.is_null() { 0i32 } else { 1i32 }; }";
+        let idx = index(src);
+        let e = idx.find_functions("f")[0];
+        let unit = extract_heap(&idx, e).unwrap();
+        let callees = callees_src(&unit);
+        assert!(callees.contains("static mut TBL"), "typedef'd ptr global kept: {callees}");
+        // The alias is inlined to a concrete pointer in the unit.
+        assert!(callees.contains("* mut i32"), "alias inlined to pointer: {callees}");
+    }
+
+    // c2rust duplicates the same `type` alias in every file; identical copies
+    // must not be treated as ambiguous (which would defeat alias resolution).
+    #[test]
+    fn duplicate_identical_typedef_still_resolves() {
+        let mut idx = CrateIndex::default();
+        idx.add_source("a.rs", "pub type Handle = *mut i32;\n\
+                                static mut TBL: Handle = core::ptr::null_mut();")
+            .unwrap();
+        idx.add_source("b.rs", "pub type Handle = *mut i32;\n\
+                                pub unsafe fn g(p: *mut i32) { *p = (!TBL.is_null()) as i32; }")
+            .unwrap();
+        let e = idx.find_functions("g")[0];
+        let unit = extract_heap(&idx, e).unwrap();
+        assert!(callees_src(&unit).contains("static mut TBL"));
     }
 
     // A cross-file access goes through an `extern` declaration (c2rust emits

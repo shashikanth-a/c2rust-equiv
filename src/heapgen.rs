@@ -138,14 +138,20 @@ fn struct_table(index: &CrateIndex) -> BTreeMap<String, StructDef> {
 
 /// Crate-local type aliases (`type json_bool = c_int;`), by name. A name
 /// defined twice is dropped, like structs, since the target is then ambiguous.
-fn alias_table(index: &CrateIndex) -> BTreeMap<String, syn::Type> {
+pub(crate) fn alias_table(index: &CrateIndex) -> BTreeMap<String, syn::Type> {
+    use quote::ToTokens;
     let mut table: BTreeMap<String, syn::Type> = BTreeMap::new();
     let mut ambiguous: BTreeSet<String> = BTreeSet::new();
     for entry in &index.entries {
         if let Some(syn::Item::Type(t)) = &entry.item {
             let name = t.ident.to_string();
-            if table.contains_key(&name) {
-                ambiguous.insert(name.clone());
+            // c2rust emits an identical `type` alias in every file that uses it;
+            // those duplicates are interchangeable. Only a name aliased to two
+            // *different* targets is genuinely ambiguous and dropped.
+            if let Some(prev) = table.get(&name) {
+                if prev.to_token_stream().to_string() != t.ty.to_token_stream().to_string() {
+                    ambiguous.insert(name.clone());
+                }
             }
             table.insert(name, (*t.ty).clone());
         }
@@ -159,7 +165,7 @@ fn alias_table(index: &CrateIndex) -> BTreeMap<String, syn::Type> {
 /// Follow crate-local type aliases to the underlying type, so a typedef'd
 /// scalar or pointer is classified by what it stands for. Bounded, so an alias
 /// cycle terminates rather than looping.
-fn resolve_alias(ty: &syn::Type, aliases: &BTreeMap<String, syn::Type>) -> syn::Type {
+pub(crate) fn resolve_alias(ty: &syn::Type, aliases: &BTreeMap<String, syn::Type>) -> syn::Type {
     let mut ty = ty.clone();
     for _ in 0..16 {
         let Some(name) = last_segment(&ty) else { break };
