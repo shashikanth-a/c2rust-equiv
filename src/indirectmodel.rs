@@ -468,3 +468,44 @@ mod tests {
         all_indirect_calls_modellable(&f, &its)
     }
 }
+
+#[cfg(test)]
+mod sax_tests {
+    use super::*;
+
+    // The libxml2 SAX shape: `(*(*ctxt).sax).<cb>.expect("..")(args)`, a nested
+    // deref+field receiver through a type-aliased callback field.
+    const SRC: &str = r#"
+        pub type refSAX = Option<unsafe extern "C" fn(*mut c_void, *const u8) -> ()>;
+        pub struct _xmlSAXHandler { pub reference: refSAX, pub warning: Option<unsafe extern "C" fn(*mut c_void, *const i8, ...) -> ()> }
+        pub struct xmlParserCtxt { pub sax: *mut _xmlSAXHandler, pub ud: *mut c_void }
+        pub unsafe fn p(ctxt: *mut xmlParserCtxt, name: *const u8) {
+            (*(*ctxt).sax).reference.expect("non-null function pointer")((*ctxt).ud, name);
+        }
+        pub unsafe fn w(ctxt: *mut xmlParserCtxt) {
+            (*(*ctxt).sax).warning.expect("non-null function pointer")((*ctxt).ud);
+        }
+    "#;
+
+    fn env() -> (Vec<syn::Item>, TypeEnv) {
+        let its = syn::parse_file(SRC).unwrap().items;
+        let env = TypeEnv::from_items(&its);
+        (its, env)
+    }
+
+    #[test]
+    fn fixed_arg_nested_sax_callback_is_modellable() {
+        let (its, mut env) = env();
+        let f = its.iter().find_map(|i| match i { syn::Item::Fn(f) if f.sig.ident=="p" => Some(f.clone()), _=>None }).unwrap();
+        env.with_fn(&f);
+        assert!(all_indirect_calls_modellable(&f, &its), "fixed-arg nested SAX callback should be modellable");
+    }
+
+    #[test]
+    fn variadic_nested_sax_callback_is_not_modellable() {
+        let (its, mut env) = env();
+        let f = its.iter().find_map(|i| match i { syn::Item::Fn(f) if f.sig.ident=="w" => Some(f.clone()), _=>None }).unwrap();
+        env.with_fn(&f);
+        assert!(!all_indirect_calls_modellable(&f, &its), "variadic SAX callback must NOT be modellable");
+    }
+}

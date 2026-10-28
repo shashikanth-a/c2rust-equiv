@@ -1,6 +1,6 @@
 //! An index of the items in a crate's source files.
 
-use std::cell::OnceCell;
+use std::sync::OnceLock;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
@@ -60,7 +60,7 @@ pub struct CrateIndex {
     pub parse_errors: Vec<(String, String)>,
     /// The crate-wide union discriminant catalog, mined once on first use
     /// (expensive: it scans every function), then reused for every extraction.
-    union_catalog: OnceCell<BTreeMap<String, crate::taggedunion::TagMap>>,
+    union_catalog: OnceLock<BTreeMap<String, crate::taggedunion::TagMap>>,
 }
 
 impl CrateIndex {
