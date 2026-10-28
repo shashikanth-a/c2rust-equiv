@@ -1,7 +1,3 @@
-// Consumed by the extraction integration (Subsystem A, phase A3b) and the
-// check driver; exercised now by its own tests. Allow dead code until wired.
-#![allow(dead_code)]
-
 //! Compositional driver (Subsystem A, phase A3): decide which callees can be
 //! replaced by a summary when checking a function pair, so the caller needn't
 //! inline them.

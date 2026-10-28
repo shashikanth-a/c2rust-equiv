@@ -1,7 +1,3 @@
-// Consumed by the compositional driver (Subsystem A, phase A3); exercised now
-// by its own tests. Allow dead code until A3 lands.
-#![allow(dead_code)]
-
 //! Callee summaries (Subsystem A, phase A2): turn a callee that has been shown
 //! equivalent (or is unchanged) into a shim that stands in for it at call
 //! sites, so the caller needn't inline its body. A summary realises the

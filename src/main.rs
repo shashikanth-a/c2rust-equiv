@@ -127,6 +127,11 @@ fn run(cli: &Cli) -> Result<u8, Box<dyn std::error::Error>> {
         );
     }
 
+    // Unchanged, summarisable callees within `old` may be replaced by a shim
+    // instead of inlined, which lifts functions blocked only by an out-of-scope
+    // callee into heap scope (Subsystem A). Eligibility uses old-vs-old: a
+    // callee identical to itself is trivially equivalent, so its shim is sound.
+    let elig_summaries = c2rust_equiv::compose::summary_catalog(&old, &old);
     let total_functions = old.functions().count();
     let mut eligible_functions = 0;
     let mut heap_eligible_functions = 0;
@@ -141,7 +146,7 @@ fn run(cli: &Cli) -> Result<u8, Box<dyn std::error::Error>> {
                 // A scalar-ineligible function may still be in scope for the
                 // heap path (it passes or returns a pointer to a struct the
                 // generator supports).
-                let diag = c2rust_equiv::extract_heap(&old, e)
+                let diag = c2rust_equiv::extract_heap_composed(&old, e, &elig_summaries)
                     .map_err(|s| format!("extract:{} ({})", s.category, s.detail))
                     .and_then(|u| c2rust_equiv::heap_diagnose(&u));
                 let heap = diag.is_ok();
@@ -170,10 +175,13 @@ fn run(cli: &Cli) -> Result<u8, Box<dyn std::error::Error>> {
         fs::write(path, eligibility)?;
     }
 
+    // For the real checks, only callees that are unchanged *between* old and
+    // new may be summarised, so the catalog is built old-vs-new.
+    let summaries = c2rust_equiv::compose::summary_catalog(&old, &new);
     let selected = select(&old, &new, &queries);
     let mut results = Vec::new();
     for (i, id) in selected.iter().enumerate() {
-        let (outcome, cached) = check_one(&old, &new, id, &opts, cache.as_mut());
+        let (outcome, cached) = check_one(&old, &new, id, &opts, &summaries, cache.as_mut());
         eprintln!(
             "[{}/{}] {id}: {}{}",
             i + 1,
@@ -255,6 +263,7 @@ fn check_one(
     new: &CrateIndex,
     id: &str,
     opts: &Options,
+    summaries: &std::collections::BTreeMap<String, syn::ItemFn>,
     cache: Option<&mut cache::Cache>,
 ) -> (Outcome, bool) {
     let immediate = |status| {
@@ -282,7 +291,9 @@ fn check_one(
     // or, if that isn't viable, skips with the scalar reason.
     let extract_either = |idx: &CrateIndex, e: usize| match extract(idx, e) {
         Ok(u) => Ok(u),
-        Err(scalar_skip) => c2rust_equiv::extract_heap(idx, e).map_err(|_| scalar_skip),
+        Err(scalar_skip) => {
+            c2rust_equiv::extract_heap_composed(idx, e, summaries).map_err(|_| scalar_skip)
+        }
     };
     let old_unit = match extract_either(old, o) {
         Ok(u) => u,

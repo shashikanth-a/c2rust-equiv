@@ -7,7 +7,7 @@
 
 mod allocmodel;
 pub mod cache;
-mod compose;
+pub mod compose;
 mod modref;
 mod summary;
 pub mod check;
@@ -26,5 +26,5 @@ pub mod unit;
 
 pub use check::{check, heap_diagnose, heap_eligible, Method, Options, Outcome, Status};
 pub use crate_index::CrateIndex;
-pub use extract::{extract, extract_heap, extract_unvalidated};
+pub use extract::{extract, extract_heap, extract_heap_composed, extract_unvalidated};
 pub use unit::{FnUnit, Skip};

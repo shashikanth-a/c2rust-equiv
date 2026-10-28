@@ -1,8 +1,3 @@
-// Consumed by the compositional-summary driver (Subsystem A, phases A2/A3) and
-// the graph backend's memory model (Subsystem B); exercised now by its own
-// tests. Allow dead code until those callers land.
-#![allow(dead_code)]
-
 //! Mod/ref (frame) analysis: a conservative set of locations a function may
 //! write that are visible to its caller -- its `assigns` set. This is the
 //! soundness crux of compositional summaries (Subsystem A) and the memory

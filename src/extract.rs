@@ -1,6 +1,6 @@
 //! Extract a function and its callee closure from a crate into a self-contained [`FnUnit`].
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use proc_macro2::Span;
 use quote::ToTokens;
@@ -75,7 +75,7 @@ enum Res {
 /// Resolve a function into a self-contained unit (its callee closure) without
 /// checking whether it is in scope, so either path can apply its own checks.
 pub fn extract_unvalidated(index: &CrateIndex, entry: usize) -> Result<FnUnit, Skip> {
-    extract_in(index, entry, false)
+    extract_in(index, entry, false, &BTreeMap::new())
 }
 
 /// Like [`extract_unvalidated`], but in heap mode: raw pointers are allowed and
@@ -84,11 +84,42 @@ pub fn extract_unvalidated(index: &CrateIndex, entry: usize) -> Result<FnUnit, S
 /// unresolved or non-modelled foreign references during resolution; the heap
 /// body scope check (`FnUnit::heap_body_in_scope`) applies the rest.
 pub fn extract_heap(index: &CrateIndex, entry: usize) -> Result<FnUnit, Skip> {
-    extract_in(index, entry, true)
+    extract_in(index, entry, true, &BTreeMap::new())
 }
 
-fn extract_in(index: &CrateIndex, entry: usize, heap: bool) -> Result<FnUnit, Skip> {
-    let resolver = Resolver { index, heap };
+/// Like [`extract_heap`], but replacing each callee named in `summaries` with
+/// its summary shim instead of inlining the callee's body (Subsystem A, phase
+/// A3b). A summarised callee's call sites are kept as bare calls, and the
+/// referenced shims are appended to the unit's callees. The catalog comes from
+/// [`crate::compose::summary_catalog`], which only admits callees whose two
+/// versions are equivalent and whose write set is fully havocable, so the
+/// substitution is sound.
+pub fn extract_heap_composed(
+    index: &CrateIndex,
+    entry: usize,
+    summaries: &BTreeMap<String, syn::ItemFn>,
+) -> Result<FnUnit, Skip> {
+    extract_in(index, entry, true, summaries)
+}
+
+fn extract_in(
+    index: &CrateIndex,
+    entry: usize,
+    heap: bool,
+    summaries: &BTreeMap<String, syn::ItemFn>,
+) -> Result<FnUnit, Skip> {
+    // Never summarise the function under test itself: it (and its recursive
+    // calls) must be analysed in full. Only its callees may be replaced.
+    let summary_names: BTreeSet<String> = summaries
+        .keys()
+        .filter(|name| **name != index.entries[entry].name)
+        .cloned()
+        .collect();
+    let resolver = Resolver {
+        index,
+        heap,
+        summaries: &summary_names,
+    };
     let mut closure = BTreeSet::new();
     let mut queue = VecDeque::from([entry]);
     while let Some(e) = queue.pop_front() {
@@ -156,10 +187,36 @@ fn extract_in(index: &CrateIndex, entry: usize, heap: bool) -> Result<FnUnit, Sk
             item => callees.push(item),
         }
     }
-    let unit = FnUnit {
-        function: function.expect("the function is in its own closure"),
-        callees,
-    };
+    let function = function.expect("the function is in its own closure");
+
+    // Append the summary shim for every summarised callee the unit actually
+    // calls. A summarised callee was resolved to a bare `External` call (not
+    // inlined, so not in the closure), so its definition must come from the
+    // shim instead. Appending only referenced shims keeps the unit free of
+    // unused definitions.
+    if !summary_names.is_empty() {
+        let mut used = BTreeSet::new();
+        {
+            struct IdentUse<'a>(&'a mut BTreeSet<String>);
+            impl<'ast> Visit<'ast> for IdentUse<'_> {
+                fn visit_ident(&mut self, i: &'ast syn::Ident) {
+                    self.0.insert(i.to_string());
+                }
+            }
+            let mut v = IdentUse(&mut used);
+            v.visit_item_fn(&function);
+            for c in &callees {
+                v.visit_item(c);
+            }
+        }
+        for (name, shim) in summaries {
+            if summary_names.contains(name) && used.contains(name) {
+                callees.push(syn::Item::Fn(shim.clone()));
+            }
+        }
+    }
+
+    let unit = FnUnit { function, callees };
     Ok(unit)
 }
 
@@ -178,6 +235,10 @@ struct Resolver<'a> {
     /// unit (so the generator can build them) instead of rejecting them, and
     /// the analyzer allows raw pointers. The scalar path leaves this off.
     heap: bool,
+    /// Callees to replace by a summary shim rather than inline (phase A3b).
+    /// A `Kind::Fn` whose name is here resolves to a bare `External` call; the
+    /// shim definition is appended to the unit afterwards.
+    summaries: &'a BTreeSet<String>,
 }
 
 impl Resolver<'_> {
@@ -322,6 +383,9 @@ impl Resolver<'_> {
     fn entry(&self, e: usize, shown: &str) -> Res {
         let entry = &self.index.entries[e];
         match entry.kind {
+            // A summarised callee: keep the bare call and don't inline its
+            // body; its shim is appended to the unit afterwards.
+            Kind::Fn if self.summaries.contains(&entry.name) => Res::External(None),
             Kind::Fn | Kind::Const | Kind::TypeAlias => Res::Item(e),
             // libxml2's allocator-indirection globals are modelled on the heap
             // path (given a module-local definition by `allocmodel`); keep the
@@ -648,5 +712,75 @@ impl VisitMut for Rewriter<'_> {
                 mac.tokens = args.to_token_stream();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compose::summary_catalog;
+    use crate::crate_index::CrateIndex;
+
+    fn index(src: &str) -> CrateIndex {
+        let mut i = CrateIndex::default();
+        i.add_source("lib.rs", src).unwrap();
+        i
+    }
+
+    fn callees_src(unit: &FnUnit) -> String {
+        unit.callees
+            .iter()
+            .map(|c| c.to_token_stream().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // A3b: a summarisable, unchanged callee is replaced by its summary shim --
+    // which records on the shared TRACE and havocs the out-pointer -- instead
+    // of having its body (`*p = v`) inlined into the caller's closure.
+    #[test]
+    fn summarised_callee_is_replaced_by_its_shim() {
+        let src = "pub unsafe fn helper(p: *mut i32, v: i32) { *p = v; }\n\
+                   pub unsafe fn caller(p: *mut i32) { helper(p, 3i32); }";
+        let idx = index(src);
+        let cat = summary_catalog(&idx, &idx);
+        assert!(cat.contains_key("helper"));
+        let e = idx.find_functions("caller")[0];
+        let unit = extract_heap_composed(&idx, e, &cat).unwrap();
+        let callees = callees_src(&unit);
+        assert!(callees.contains("TRACE"), "shim appended: {callees}");
+        // The original deterministic body must NOT be inlined.
+        assert!(
+            !callees.contains("* p = v"),
+            "callee body not inlined: {callees}"
+        );
+    }
+
+    // Without a catalog, the same callee is inlined as before (its body is a
+    // kept callee, no TRACE shim) -- the summarisation is opt-in.
+    #[test]
+    fn without_catalog_callee_is_inlined() {
+        let src = "pub unsafe fn helper(p: *mut i32, v: i32) { *p = v; }\n\
+                   pub unsafe fn caller(p: *mut i32) { helper(p, 3i32); }";
+        let idx = index(src);
+        let e = idx.find_functions("caller")[0];
+        let unit = extract_heap(&idx, e).unwrap();
+        let callees = callees_src(&unit);
+        assert!(callees.contains("* p = v"), "body inlined: {callees}");
+    }
+
+    // The function under test is never summarised, even if it is itself in the
+    // catalog: a self/recursive call keeps the real body.
+    #[test]
+    fn entry_function_is_never_summarised() {
+        let src = "pub unsafe fn helper(p: *mut i32, v: i32) { *p = v; }";
+        let idx = index(src);
+        let cat = summary_catalog(&idx, &idx);
+        assert!(cat.contains_key("helper"));
+        let e = idx.find_functions("helper")[0];
+        let unit = extract_heap_composed(&idx, e, &cat).unwrap();
+        // `helper` is the entry; its body stays, and no shim is appended.
+        assert!(unit.function.to_token_stream().to_string().contains("* p = v"));
+        assert!(!callees_src(&unit).contains("TRACE"));
     }
 }
