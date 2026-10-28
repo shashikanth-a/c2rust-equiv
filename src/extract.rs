@@ -270,7 +270,7 @@ fn extract_in(
     // but only when the unit actually carries a multi-field union (otherwise it
     // is never consulted), to avoid scanning the whole crate for every function.
     let union_tags = if heap && has_multi_field_union(&callees) {
-        crate::heapgen::union_tag_catalog(index)
+        index.union_tag_catalog().clone()
     } else {
         Default::default()
     };

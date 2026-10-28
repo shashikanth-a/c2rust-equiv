@@ -1,6 +1,7 @@
 //! An index of the items in a crate's source files.
 
-use std::collections::HashMap;
+use std::cell::OnceCell;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -57,6 +58,18 @@ pub struct CrateIndex {
     pub entries: Vec<Entry>,
     /// Files that failed to parse, with the error.
     pub parse_errors: Vec<(String, String)>,
+    /// The crate-wide union discriminant catalog, mined once on first use
+    /// (expensive: it scans every function), then reused for every extraction.
+    union_catalog: OnceCell<BTreeMap<String, crate::taggedunion::TagMap>>,
+}
+
+impl CrateIndex {
+    /// The crate-wide union discriminant catalog, built once and cached. See
+    /// [`crate::heapgen::union_tag_catalog`].
+    pub fn union_tag_catalog(&self) -> &BTreeMap<String, crate::taggedunion::TagMap> {
+        self.union_catalog
+            .get_or_init(|| crate::heapgen::union_tag_catalog(self))
+    }
 }
 
 impl CrateIndex {
