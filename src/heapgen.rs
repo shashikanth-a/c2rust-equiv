@@ -250,6 +250,17 @@ fn classify(
                 {
                     return Ok(Field::ScalarCell)
                 }
+                // A `*mut/*const c_void`: an opaque handle (e.g. json-c's
+                // `_userdata`, a tmux `void*`). It has no inspectable pointee,
+                // so carry it as an opaque pointer-sized word (symbolic over
+                // every address, compared by identity) rather than build one.
+                // Sound: it is carried data, and if the body casts it to a
+                // concrete type and dereferences it, that reads an arbitrary
+                // address, which Kani flags as an invalid access -- "not
+                // proved", never a false proof.
+                None if name == "c_void" => {
+                    return Ok(Field::OpaqueWord(opaque_word_type(ty, aliases)));
+                }
                 None => return Err(format!("pointer to `{name}`, which is not a plain aggregate")),
             }
         }

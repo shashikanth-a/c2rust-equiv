@@ -1122,3 +1122,59 @@ fn fn_ptr_arg_catches_different_argument() {
         outcome.status
     );
 }
+
+// A `*mut c_void` opaque handle, carried in a struct field and returned. Built
+// as a symbolic pointer-sized word, compared by identity. Proves equivalent
+// when both versions carry it unchanged; catches a rewrite that returns a
+// different value. (Wall 2 opaque-handle.)
+const VP_DEFS: &[&str] =
+    &["#[repr(C)] pub struct S { pub data: *mut ::core::ffi::c_void, pub n: i64 }"];
+
+const VP_OLD: &str = r#"
+pub unsafe fn get(s: *mut S) -> *mut ::core::ffi::c_void {
+    if s.is_null() { return core::ptr::null_mut(); }
+    (*s).data
+}
+"#;
+
+const VP_OK: &str = r#"
+pub unsafe fn get(s: *mut S) -> *mut ::core::ffi::c_void {
+    if s.is_null() { return core::ptr::null_mut(); }
+    let d = (*s).data;
+    d
+}
+"#;
+
+// Wrong: returns a handle derived from `n` instead of the carried one.
+const VP_BAD: &str = r#"
+pub unsafe fn get(s: *mut S) -> *mut ::core::ffi::c_void {
+    if s.is_null() { return core::ptr::null_mut(); }
+    (*s).n as *mut ::core::ffi::c_void
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn void_ptr_handle_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(VP_OLD, VP_DEFS).unwrap();
+    let new = FnUnit::parse(VP_OK, VP_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn void_ptr_handle_catches_different_result() {
+    let old = FnUnit::parse(VP_OLD, VP_DEFS).unwrap();
+    let new = FnUnit::parse(VP_BAD, VP_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a different returned handle was proved equivalent: {:?}",
+        outcome.status
+    );
+}
