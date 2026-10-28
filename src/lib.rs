@@ -15,6 +15,7 @@ pub mod crate_index;
 pub mod extract;
 pub mod heapgen;
 pub mod kani;
+pub mod peg;
 mod process;
 pub mod report;
 mod scalar;

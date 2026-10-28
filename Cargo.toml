@@ -8,6 +8,7 @@ rust-version = "1.74"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+egg = "0.11.0"
 prettyplease = "0.2"
 proc-macro2 = "1"
 quote = "1"
