@@ -270,6 +270,13 @@ fn heap_lib_source(
                 old_args.push(format!("a{i}"));
                 new_args.push(format!("a{i}"));
             }
+            // A C-enum newtype: build old's value with a symbolic inner scalar,
+            // give new the same inner wrapped in its own (distinct) type.
+            Shape::ScalarNewtype(name) => {
+                build += &format!("        let a{i} = old::{name}(kani::any());\n");
+                old_args.push(format!("a{i}"));
+                new_args.push(format!("new::{name}(a{i}.0)"));
+            }
         }
     }
     let old_call = format!("old::{old_name}({})", old_args.join(", "));
@@ -294,6 +301,10 @@ fn heap_lib_source(
         Shape::OpaqueArg(_) => "        assert!(unsafe { core::mem::transmute::<_, usize>(o) } \
              == unsafe { core::mem::transmute::<_, usize>(n) }, \"results differ\");\n"
             .to_owned(),
+        // A returned C-enum newtype: compare the inner scalar (distinct types).
+        Shape::ScalarNewtype(_) => {
+            "        assert!(o.0 == n.0, \"results differ\");\n".to_owned()
+        }
     };
     let mut arg_cmp = String::new();
     for (i, name) in &heap_args {

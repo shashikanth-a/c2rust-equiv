@@ -61,6 +61,14 @@ enum Field {
     /// body scope check (a symbolic function address can't be called); the field
     /// is therefore carried data, never invoked. The string is the field type.
     OpaqueWord(String),
+    /// A C enum / flag newtype: a single-field tuple struct over a scalar
+    /// (`struct xmlElementType(c_uint)`, as c2rust emits). Built with a symbolic
+    /// inner value `Name(kani::any())` -- over-approximating to every bit
+    /// pattern, which is sound (a proof holds for all, including the valid
+    /// enum values) -- and compared by that inner value. The string is the
+    /// type name. Needs the version module prefix to construct, hence the
+    /// `old`/`new` arguments threaded into build/clone below.
+    ScalarNewtype(String),
 }
 
 /// The generated builder, cloner and comparer for one struct, plus the structs
@@ -283,6 +291,19 @@ fn classify(
     // rejected by the body scope check). Built symbolically over all values.
     if is_option_fn(ty, aliases) {
         return Ok(Field::OpaqueWord(opaque_word_type(ty, aliases)));
+    }
+    // A C enum / flag newtype: a single-field tuple struct wrapping a scalar
+    // (`struct xmlElementType(c_uint)`). It is a scalar by value -- build a
+    // symbolic inner value and compare by it.
+    if let Some(name) = last_segment(ty) {
+        if let Some(def) = table.get(&name) {
+            if !def.is_union && def.fields.len() == 1 && def.fields[0].0 == "0" {
+                let inner = last_segment(&resolve_alias(&def.fields[0].1, aliases));
+                if inner.as_deref().is_some_and(is_scalar_name) {
+                    return Ok(Field::ScalarNewtype(name));
+                }
+            }
+        }
     }
     Err(format!(
         "type `{}` is not a scalar or a pointer to a struct",
@@ -596,6 +617,10 @@ pub enum Shape {
     /// because a call *through* it is modelled as an observable trace call (see
     /// `crate::indirectmodel`). The string is the ABI-stripped field type.
     OpaqueArg(String),
+    /// A C-enum newtype argument/return (`struct X(c_uint)`): built per version
+    /// as `old::X(kani::any())` / `new::X(same inner)`, compared by inner value.
+    /// The string is the type name.
+    ScalarNewtype(String),
 }
 
 /// The shapes of a function's arguments and return value for the heap path.
@@ -652,6 +677,7 @@ pub fn signature_shapes(
             // modelled (`crate::indirectmodel`). The type is ABI-stripped and
             // alias-resolved so it names what the scratch crate emits.
             Field::OpaqueWord(ty) => Ok(Shape::OpaqueArg(ty)),
+            Field::ScalarNewtype(name) => Ok(Shape::ScalarNewtype(name)),
         }
     };
 
@@ -713,8 +739,15 @@ impl TaggedUnion {
     }
 }
 
-/// The expression that builds a symbolic value for one field.
-fn build_value(field: &Field) -> String {
+/// Whether a type's last-segment name is a scalar the generator treats by value.
+fn is_scalar_name(name: &str) -> bool {
+    scalar::primitive(name).is_some()
+        || scalar::c_type(name).is_some()
+        || scalar::libc_typedef(name).is_some()
+}
+
+/// The expression that builds a symbolic value for one field, in version `m`.
+fn build_value(field: &Field, m: &str) -> String {
     match field {
         Field::Scalar(_) => "kani::any()".to_owned(),
         Field::ScalarArray => "core::array::from_fn(|_| kani::any())".to_owned(),
@@ -728,17 +761,23 @@ fn build_value(field: &Field) -> String {
         Field::OpaqueWord(ty) => {
             format!("core::mem::transmute::<usize, {ty}>(kani::any::<usize>())")
         }
+        // A C-enum newtype: wrap a symbolic inner scalar in the version's type.
+        Field::ScalarNewtype(name) => format!("{m}::{name}(kani::any())"),
     }
 }
 
-/// The expression that clones one field from source access `src` into `new`.
-fn clone_value(field: &Field, src: &str) -> String {
+/// The expression that clones one field from source access `src` into version
+/// `m` (the destination module).
+fn clone_value(field: &Field, src: &str, m: &str) -> String {
     match field {
         // `Copy` values (scalars, arrays, and the opaque fn-ptr word) copy over.
         Field::Scalar(_) | Field::ScalarArray | Field::OpaqueWord(_) => src.to_owned(),
         Field::CStr => format!("clone_cstr({src} as *const core::ffi::c_char) as _"),
         Field::ScalarCell => format!("clone_cell({src})"),
         Field::Pointer(target) => format!("clone_{target}({src}, map)"),
+        // Rewrap the inner value in the destination version's newtype (old::X
+        // and new::X are distinct types with the same single scalar field).
+        Field::ScalarNewtype(name) => format!("{m}::{name}({src}.0)"),
     }
 }
 
@@ -750,6 +789,9 @@ fn compare_stmt(field: &Field, a: &str, b: &str) -> String {
         Field::Scalar(_) | Field::ScalarArray | Field::OpaqueWord(_) => {
             format!("    if {a} != {b} {{ return false; }}\n")
         }
+        // A newtype enum: compare the inner scalar (old::X and new::X differ as
+        // types, so `!=` on them wouldn't typecheck; their `.0` are the same).
+        Field::ScalarNewtype(_) => format!("    if {a}.0 != {b}.0 {{ return false; }}\n"),
         Field::CStr => format!(
             "    if !same_cstr({a} as *const core::ffi::c_char, {b} as *const core::ffi::c_char) {{ return false; }}\n"
         ),
@@ -767,7 +809,7 @@ fn compare_stmt(field: &Field, a: &str, b: &str) -> String {
 fn builder(struct_name: &str, old: &str, fields: &[(String, Field)], tu: Option<&TaggedUnion>) -> String {
     let mut inits = String::new();
     for (name, field) in fields {
-        inits += &format!("            {name}: {},\n", build_value(field));
+        inits += &format!("            {name}: {},\n", build_value(field, old));
     }
     let mut pre = String::new();
     if let Some(tu) = tu {
@@ -779,7 +821,7 @@ fn builder(struct_name: &str, old: &str, fields: &[(String, Field)], tu: Option<
             arms += &format!(
                 "        {i}usize => ({old}::{disc}, {old}::{} {{ {sub}: {} }}),\n",
                 tu.union_type,
-                build_value(field),
+                build_value(field, old),
             );
         }
         // `__k` is bounded, so the fallback arm is unreachable; it reuses
@@ -789,7 +831,7 @@ fn builder(struct_name: &str, old: &str, fields: &[(String, Field)], tu: Option<
             "        _ => ({old}::{}, {old}::{} {{ {fd}: {} }}),\n",
             tu.variants[0].0,
             tu.union_type,
-            build_value(ff),
+            build_value(ff, old),
         );
         pre = format!(
             "    let __k: usize = kani::any();\n\
@@ -832,11 +874,18 @@ fn cloner(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)], t
             }
             // A C string is copied whole; it can't form cycles, so no linking.
             Field::CStr => {
-                inits += &format!("        {name}: {},\n", clone_value(field, &format!("(*src).{name}")));
+                inits += &format!("        {name}: {},\n", clone_value(field, &format!("(*src).{name}"), new));
             }
             // A scalar cell: copy the pointed-to value; no cycles.
             Field::ScalarCell => {
                 inits += &format!("        {name}: clone_cell((*src).{name}),\n");
+            }
+            // A C-enum newtype: rewrap the inner scalar in new's type.
+            Field::ScalarNewtype(_) => {
+                inits += &format!(
+                    "        {name}: {},\n",
+                    clone_value(field, &format!("(*src).{name}"), new)
+                );
             }
             Field::Pointer(target) => {
                 inits += &format!("        {name}: core::ptr::null_mut(),\n");
@@ -859,7 +908,7 @@ fn cloner(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)], t
                 uni_arms += &format!(
                     "        {old}::{disc} => {new}::{} {{ {sub}: {} }},\n",
                     tu.union_type,
-                    clone_value(field, &src),
+                    clone_value(field, &src, new),
                 );
             }
         }
@@ -868,7 +917,7 @@ fn cloner(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)], t
         let fallback = format!(
             "{new}::{} {{ {fsub}: {} }}",
             tu.union_type,
-            clone_value(ffield, &fsrc),
+            clone_value(ffield, &fsrc, new),
         );
         inits += &format!(
             "        {tf}: match (*src).{tf} {{\n{tag_arms}            _ => {new}::{},\n        }},\n",

@@ -1178,3 +1178,72 @@ fn void_ptr_handle_catches_different_result() {
         outcome.status
     );
 }
+
+// A C-enum newtype (`struct Kind(c_uint)`, as c2rust emits): built with a
+// symbolic inner value, compared by it. As a struct field (NT_*) and as an
+// argument (NA_*). (Wall: crate enum as scalar.)
+const NT_DEFS: &[&str] = &[
+    "#[derive(Copy, Clone)] #[repr(C)] pub struct Kind(pub ::core::ffi::c_uint);",
+    "#[repr(C)] pub struct S { pub kind: Kind, pub n: i64 }",
+];
+
+const NT_OLD: &str = r#"
+pub unsafe fn get(s: *mut S) -> i64 {
+    if s.is_null() { return 0; }
+    (*s).kind.0 as i64
+}
+"#;
+
+const NT_OK: &str = r#"
+pub unsafe fn get(s: *mut S) -> i64 {
+    if s.is_null() { return 0; }
+    let k = (*s).kind;
+    k.0 as i64
+}
+"#;
+
+const NT_BAD: &str = r#"
+pub unsafe fn get(s: *mut S) -> i64 {
+    if s.is_null() { return 0; }
+    (*s).kind.0 as i64 + 1
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn newtype_enum_field_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(NT_OLD, NT_DEFS).unwrap();
+    let new = FnUnit::parse(NT_OK, NT_DEFS).unwrap();
+    assert!(
+        matches!(check(&old, &new, &opts()).status, Status::Proved { .. }),
+        "expected Proved"
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn newtype_enum_field_catches_divergence() {
+    let old = FnUnit::parse(NT_OLD, NT_DEFS).unwrap();
+    let new = FnUnit::parse(NT_BAD, NT_DEFS).unwrap();
+    assert!(
+        !matches!(check(&old, &new, &opts()).status, Status::Proved { .. }),
+        "a +1 rewrite was proved equivalent"
+    );
+}
+
+// A C-enum newtype as a by-value argument and return.
+const NA_DEFS: &[&str] =
+    &["#[derive(Copy, Clone)] #[repr(C)] pub struct Kind(pub ::core::ffi::c_uint);"];
+const NA_OLD: &str = "pub unsafe fn id(k: Kind) -> Kind { k }";
+const NA_OK: &str = "pub unsafe fn id(k: Kind) -> Kind { let v = k; v }";
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn newtype_enum_arg_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(NA_OLD, NA_DEFS).unwrap();
+    let new = FnUnit::parse(NA_OK, NA_DEFS).unwrap();
+    assert!(
+        matches!(check(&old, &new, &opts()).status, Status::Proved { .. }),
+        "expected Proved"
+    );
+}
