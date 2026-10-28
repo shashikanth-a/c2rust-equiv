@@ -15,19 +15,34 @@
 //! The tool's semantics counts arithmetic **overflow as a panic** (as in a
 //! build with overflow checks -- Kani always checks), so two functions are
 //! equivalent only if they also panic on exactly the same inputs. That rules
-//! out any rewrite that moves where an overflow can occur: associativity,
-//! distributivity, `a-b = a+(-b)` and `-(-a) = a` are therefore **excluded**
-//! (e.g. `(a+b)+c` can overflow where `a+(b+c)` does not). The rules kept are
-//! only those that preserve both value and overflow behaviour on every input:
-//! commutativity of `+`/`*`, `x+0 = x`, `x*1 = x`, `x*0 = 0`, `x-x = 0`, and
-//! `x*2 = x+x` (which overflows exactly when `x+x` does). General constant
-//! folding is omitted too (folding an overflowing constant is width-dependent).
+//! out, for the *checked* operators, any rewrite that moves where an overflow
+//! can occur: associativity, distributivity, `a-b = a+(-b)` and `-(-a) = a` are
+//! therefore **excluded** for them (e.g. `(a+b)+c` can overflow where
+//! `a+(b+c)` does not). The checked rules kept are only those that preserve
+//! both value and overflow behaviour on every input: commutativity of `+`/`*`,
+//! `x+0 = x`, `x*1 = x`, `x*0 = 0`, `x-x = 0`, and `x*2 = x+x` (which overflows
+//! exactly when `x+x` does). General constant folding is omitted too (folding
+//! an overflowing constant is width-dependent).
+//!
+//! **Wrapping operators** are different. c2rust-transpiled C emits
+//! `a.wrapping_add(b)`, `wrapping_sub`, `wrapping_mul` and `wrapping_neg` for C
+//! integer arithmetic, which never panics: it is two's-complement arithmetic
+//! modulo `2^n`. That is a commutative ring, so the **full ring axioms hold
+//! soundly** for these operators -- commutativity *and* associativity of `+`
+//! and `*`, distributivity of `*` over `+`, `a-b = a+(-b)` and `-(-a) = a` --
+//! because none of them can change an (impossible) panic. They are modelled as
+//! their own node kind (`w+`, `w-`, `w*`, `wneg`) so these stronger rules match
+//! only wrapping subtrees and never a checked operator, keeping the checked
+//! fragment sound. A checked `+` and a wrapping `w+` are distinct nodes and are
+//! never equated, which is correct: they differ precisely on the inputs where
+//! one panics.
 //!
 //! Current fragment: straight-line integer functions -- `let` bindings and a
-//! final (or `return`) expression over `+`, `-`, `*`, unary `-`, integer
-//! literals and parameters. Loops, pointers, calls and control flow are future
-//! work (they need PEG theta/eval/pass nodes); anything unsupported makes
-//! [`equivalent`] return `None` rather than guess.
+//! final (or `return`) expression over checked `+`, `-`, `*`, unary `-`, the
+//! wrapping method calls above, integer literals and parameters. Loops,
+//! pointers, calls and control flow are future work (they need PEG
+//! theta/eval/pass nodes); anything unsupported makes [`equivalent`] return
+//! `None` rather than guess.
 
 use std::collections::HashMap;
 
@@ -37,10 +52,18 @@ define_language! {
     /// A program expression graph node. Leaves are integer literals and opaque
     /// symbols (parameters, by position); the rest are integer operators.
     pub enum Peg {
+        // Checked (overflow-as-panic) operators.
         "+" = Add([Id; 2]),
         "-" = Sub([Id; 2]),
         "*" = Mul([Id; 2]),
         "neg" = Neg([Id; 1]),
+        // Wrapping (two's-complement modular) operators -- a commutative ring,
+        // so the full ring axioms apply soundly (see module docs). Kept as
+        // distinct node kinds so their rules never touch a checked operator.
+        "w+" = WAdd([Id; 2]),
+        "w-" = WSub([Id; 2]),
+        "w*" = WMul([Id; 2]),
+        "wneg" = WNeg([Id; 1]),
         Num(i64),
         Sym(Symbol),
     }
@@ -64,6 +87,28 @@ fn rules() -> Vec<Rewrite<Peg, ()>> {
         // `a * 2` and `a + a` are the same value and overflow on the same inputs.
         rw!("double";  "(* ?a 2)" => "(+ ?a ?a)"),
         rw!("double2"; "(+ ?a ?a)" => "(* ?a 2)"),
+        // --- Wrapping operators: a commutative ring mod 2^n, so the FULL ring
+        // axioms are sound (no operation can panic). These patterns only match
+        // the wrapping node kinds, so they never rewrite a checked operator.
+        rw!("w-comm-add"; "(w+ ?a ?b)" => "(w+ ?b ?a)"),
+        rw!("w-comm-mul"; "(w* ?a ?b)" => "(w* ?b ?a)"),
+        rw!("w-assoc-add"; "(w+ (w+ ?a ?b) ?c)" => "(w+ ?a (w+ ?b ?c))"),
+        rw!("w-assoc-add2"; "(w+ ?a (w+ ?b ?c))" => "(w+ (w+ ?a ?b) ?c)"),
+        rw!("w-assoc-mul"; "(w* (w* ?a ?b) ?c)" => "(w* ?a (w* ?b ?c))"),
+        rw!("w-assoc-mul2"; "(w* ?a (w* ?b ?c))" => "(w* (w* ?a ?b) ?c)"),
+        rw!("w-distrib"; "(w* ?a (w+ ?b ?c))" => "(w+ (w* ?a ?b) (w* ?a ?c))"),
+        rw!("w-distrib2"; "(w+ (w* ?a ?b) (w* ?a ?c))" => "(w* ?a (w+ ?b ?c))"),
+        rw!("w-add-0"; "(w+ ?a 0)" => "?a"),
+        rw!("w-mul-1"; "(w* ?a 1)" => "?a"),
+        rw!("w-mul-0"; "(w* ?a 0)" => "0"),
+        rw!("w-sub-self"; "(w- ?a ?a)" => "0"),
+        // In a ring, subtraction is addition of the negation, and negation is
+        // an involution -- both sound because wrapping never panics.
+        rw!("w-sub-neg"; "(w- ?a ?b)" => "(w+ ?a (wneg ?b))"),
+        rw!("w-sub-neg2"; "(w+ ?a (wneg ?b))" => "(w- ?a ?b)"),
+        rw!("w-neg-neg"; "(wneg (wneg ?a))" => "?a"),
+        rw!("w-double";  "(w* ?a 2)" => "(w+ ?a ?a)"),
+        rw!("w-double2"; "(w+ ?a ?a)" => "(w* ?a 2)"),
     ]
 }
 
@@ -170,6 +215,29 @@ fn translate_expr(
                 _ => None,
             }
         }
+        // c2rust emits C integer arithmetic as wrapping method calls. These are
+        // modular (never panic), so they become the wrapping node kinds.
+        syn::Expr::MethodCall(mc) if mc.turbofish.is_none() => {
+            let recv = translate_expr(g, &mc.receiver, env)?;
+            let method = mc.method.to_string();
+            let mut args = mc.args.iter();
+            match (method.as_str(), mc.args.len()) {
+                ("wrapping_neg", 0) => Some(g.add(Peg::WNeg([recv]))),
+                ("wrapping_add", 1) => {
+                    let b = translate_expr(g, args.next()?, env)?;
+                    Some(g.add(Peg::WAdd([recv, b])))
+                }
+                ("wrapping_sub", 1) => {
+                    let b = translate_expr(g, args.next()?, env)?;
+                    Some(g.add(Peg::WSub([recv, b])))
+                }
+                ("wrapping_mul", 1) => {
+                    let b = translate_expr(g, args.next()?, env)?;
+                    Some(g.add(Peg::WMul([recv, b])))
+                }
+                _ => None,
+            }
+        }
         syn::Expr::Return(r) => translate_expr(g, r.expr.as_ref()?, env),
         _ => None,
     }
@@ -228,6 +296,54 @@ mod tests {
         // a + b and a - b are not equal; the backend must not prove them equal.
         let a = f("fn g(x: i64, y: i64) -> i64 { x + y }");
         let b = f("fn g(x: i64, y: i64) -> i64 { x - y }");
+        assert_eq!(equivalent(&a, &b), Some(false));
+    }
+
+    #[test]
+    fn wrapping_associativity_is_proved() {
+        // Wrapping add is associative mod 2^n (never panics), so the two
+        // groupings ARE provably equivalent -- unlike checked `+`.
+        let a = f("fn g(a: i64, b: i64, c: i64) -> i64 \
+                   { a.wrapping_add(b).wrapping_add(c) }");
+        let b = f("fn g(a: i64, b: i64, c: i64) -> i64 \
+                   { a.wrapping_add(b.wrapping_add(c)) }");
+        assert_eq!(equivalent(&a, &b), Some(true));
+    }
+
+    #[test]
+    fn wrapping_distributivity_is_proved() {
+        // x*(y+z) == x*y + x*z in the ring Z/2^n -- all wrapping ops.
+        let a = f("fn g(x: i64, y: i64, z: i64) -> i64 \
+                   { x.wrapping_mul(y.wrapping_add(z)) }");
+        let b = f("fn g(x: i64, y: i64, z: i64) -> i64 \
+                   { let p = x.wrapping_mul(y); let q = x.wrapping_mul(z); p.wrapping_add(q) }");
+        assert_eq!(equivalent(&a, &b), Some(true));
+    }
+
+    #[test]
+    fn wrapping_sub_is_add_of_negation() {
+        // a - b == a + (-b) in the ring; both are wrapping.
+        let a = f("fn g(a: i64, b: i64) -> i64 { a.wrapping_sub(b) }");
+        let b = f("fn g(a: i64, b: i64) -> i64 { a.wrapping_add(b.wrapping_neg()) }");
+        assert_eq!(equivalent(&a, &b), Some(true));
+    }
+
+    #[test]
+    fn checked_and_wrapping_are_not_cross_equated() {
+        // SOUNDNESS: checked `a + b` panics on overflow where wrapping
+        // `a.wrapping_add(b)` does not, so they differ on exactly those inputs.
+        // The backend must NOT prove them equivalent.
+        let a = f("fn g(a: i64, b: i64) -> i64 { a + b }");
+        let b = f("fn g(a: i64, b: i64) -> i64 { a.wrapping_add(b) }");
+        assert_eq!(equivalent(&a, &b), Some(false));
+    }
+
+    #[test]
+    fn checked_associativity_still_withheld_with_wrapping_rules_present() {
+        // Adding the wrapping ring rules must not leak into the checked
+        // operators: checked associativity stays unproven (would be unsound).
+        let a = f("fn g(a: i64, b: i64, c: i64) -> i64 { (a + b) + c }");
+        let b = f("fn g(a: i64, b: i64, c: i64) -> i64 { a + (b + c) }");
         assert_eq!(equivalent(&a, &b), Some(false));
     }
 
