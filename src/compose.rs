@@ -33,6 +33,20 @@ fn canonical(item: &syn::Item) -> Option<String> {
 /// the two crates and summarisable. Keyed by function name; the shim replaces
 /// the callee at its call sites in both versions.
 pub fn summary_catalog(old: &CrateIndex, new: &CrateIndex) -> BTreeMap<String, syn::ItemFn> {
+    summary_catalog_with(old, new, &std::collections::BTreeSet::new())
+}
+
+/// Like [`summary_catalog`], but a callee also qualifies when its name is in
+/// `proven` -- a set of callees already shown equivalent bottom-up (RVT, phase
+/// A4), cached by the check driver. Such a callee may have *changed* between
+/// the versions; having been proven equivalent, replacing it by a shared
+/// summary on both sides stays sound (the summary over-approximates its one
+/// agreed behaviour). A still-unproven changed callee is left to be inlined.
+pub fn summary_catalog_with(
+    old: &CrateIndex,
+    new: &CrateIndex,
+    proven: &std::collections::BTreeSet<String>,
+) -> BTreeMap<String, syn::ItemFn> {
     // Index new's functions by name for matching.
     let mut new_by_name: BTreeMap<String, &syn::Item> = BTreeMap::new();
     for e in new.functions() {
@@ -53,8 +67,11 @@ pub fn summary_catalog(old: &CrateIndex, new: &CrateIndex) -> BTreeMap<String, s
         let Some(new_item) = new_by_name.get(&name) else {
             continue;
         };
-        // Only unchanged callees are summarised here (sound without a proof).
-        if canonical(item) != canonical(new_item) {
+        // A callee may be summarised when it is either unchanged (token-
+        // identical -- equivalent without a proof) or already proven equivalent
+        // bottom-up. Otherwise it must be inlined.
+        let unchanged = canonical(item) == canonical(new_item);
+        if !unchanged && !proven.contains(&name) {
             continue;
         }
         if let Some(shim) = summarize(&name, &f.sig, &write_set(f)) {
@@ -62,6 +79,21 @@ pub fn summary_catalog(old: &CrateIndex, new: &CrateIndex) -> BTreeMap<String, s
         }
     }
     catalog
+}
+
+/// The summary shim for one callee `name` defined in `old`, if it is
+/// summarisable. Used by the check driver (phase A4) to add a callee that has
+/// just been proven equivalent to the summary catalog, so its callers can
+/// replace it with the shim instead of inlining it.
+pub fn proven_shim(old: &CrateIndex, name: &str) -> Option<syn::ItemFn> {
+    for e in old.functions() {
+        if let Some(syn::Item::Fn(f)) = &old.entries[e].item {
+            if f.sig.ident == name {
+                return summarize(name, &f.sig, &write_set(f));
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -87,6 +119,26 @@ mod tests {
         let old = index("pub unsafe fn helper(p: *mut i32, v: i32) { *p = v; }");
         let new = index("pub unsafe fn helper(p: *mut i32, v: i32) { *p = v + 1; }");
         assert!(!summary_catalog(&old, &new).contains_key("helper"));
+    }
+
+    #[test]
+    fn changed_callee_is_catalogued_once_proven() {
+        // A4: a callee that changed between versions is not in the base catalog,
+        // but is summarised once the driver has proven it equivalent bottom-up.
+        let old = index("pub unsafe fn helper(p: *mut i32, v: i32) { *p = v; }");
+        let new = index("pub unsafe fn helper(p: *mut i32, v: i32) { *p = v + 1 - 1; }");
+        assert!(!summary_catalog(&old, &new).contains_key("helper"));
+        let proven = ["helper".to_owned()].into_iter().collect();
+        assert!(summary_catalog_with(&old, &new, &proven).contains_key("helper"));
+    }
+
+    #[test]
+    fn proven_shim_is_produced_for_a_summarisable_callee() {
+        let old = index("pub unsafe fn helper(p: *mut i32, v: i32) { *p = v; }");
+        assert!(proven_shim(&old, "helper").is_some());
+        // A non-summarisable callee (writes a struct pointee) yields no shim.
+        let o2 = index("pub unsafe fn helper(p: *mut Node) { (*p).next = p; }");
+        assert!(proven_shim(&o2, "helper").is_none());
     }
 
     #[test]

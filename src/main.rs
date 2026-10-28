@@ -175,31 +175,61 @@ fn run(cli: &Cli) -> Result<u8, Box<dyn std::error::Error>> {
         fs::write(path, eligibility)?;
     }
 
-    // For the real checks, only callees that are unchanged *between* old and
-    // new may be summarised, so the catalog is built old-vs-new.
-    let summaries = c2rust_equiv::compose::summary_catalog(&old, &new);
+    // For the real checks, a callee may be summarised when it is unchanged
+    // between old and new (token-identical, in the base catalog) or has itself
+    // been proven equivalent. Subsystem A phase A4 realises the latter with a
+    // bottom-up fixpoint: after each pass, every function newly proved
+    // equivalent is added to the catalog as a summary shim, so a caller blocked
+    // only by that (changed) callee can be re-checked with it summarised
+    // instead of inlined. Soundness holds for any order -- `proven` only ever
+    // grows with functions actually proved; the passes add completeness.
     let selected = select(&old, &new, &queries);
-    let mut results = Vec::new();
-    for (i, id) in selected.iter().enumerate() {
-        let (outcome, cached) = check_one(&old, &new, id, &opts, &summaries, cache.as_mut());
-        eprintln!(
-            "[{}/{}] {id}: {}{}",
-            i + 1,
-            selected.len(),
-            outcome.status.label(),
-            if cached {
-                " (cached)".to_owned()
-            } else {
-                format!(" ({} ms)", outcome.total_ms)
+    let mut catalog = c2rust_equiv::compose::summary_catalog(&old, &new);
+    let mut proven: std::collections::BTreeSet<String> = catalog.keys().cloned().collect();
+    let mut results_map: std::collections::BTreeMap<String, (c2rust_equiv::Outcome, bool)> =
+        std::collections::BTreeMap::new();
+    const MAX_PASSES: usize = 3;
+    for pass in 0..MAX_PASSES {
+        let mut added = false;
+        for (i, id) in selected.iter().enumerate() {
+            // Keep a function once it has been proved; only retry the rest with
+            // the (possibly grown) catalog.
+            if matches!(results_map.get(id), Some((o, _)) if matches!(o.status, c2rust_equiv::Status::Proved { .. })) {
+                continue;
             }
-        );
-        results.push(FunctionReport {
-            id: id.clone(),
-            label: outcome.status.label(),
-            cached,
-            outcome,
-        });
+            let (outcome, cached) = check_one(&old, &new, id, &opts, &catalog, cache.as_mut());
+            let is_proved = matches!(outcome.status, c2rust_equiv::Status::Proved { .. });
+            eprintln!(
+                "[pass {}][{}/{}] {id}: {}{}",
+                pass + 1,
+                i + 1,
+                selected.len(),
+                outcome.status.label(),
+                if cached { " (cached)".to_owned() } else { format!(" ({} ms)", outcome.total_ms) }
+            );
+            results_map.insert(id.clone(), (outcome, cached));
+            if is_proved {
+                let short = id.rsplit("::").next().unwrap_or(id).to_owned();
+                if proven.insert(short.clone()) {
+                    if let Some(shim) = c2rust_equiv::compose::proven_shim(&old, &short) {
+                        catalog.insert(short, shim);
+                        added = true;
+                    }
+                }
+            }
+        }
+        // A fixpoint: stop once a pass proves nothing new to summarise.
+        if !added {
+            break;
+        }
     }
+    let results: Vec<FunctionReport> = selected
+        .iter()
+        .map(|id| {
+            let (outcome, cached) = results_map.remove(id).expect("every selected id was checked");
+            FunctionReport { id: id.clone(), label: outcome.status.label(), cached, outcome }
+        })
+        .collect();
     if let Some(cache) = &cache {
         cache.save()?;
     }
