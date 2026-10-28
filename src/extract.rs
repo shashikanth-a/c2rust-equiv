@@ -265,8 +265,29 @@ fn extract_in(
         }
     }
 
-    let unit = FnUnit { function, callees };
+    // A union's discriminant may be proven by an accessor outside this unit's
+    // closure, so mine the discriminant catalog from the full crate index --
+    // but only when the unit actually carries a multi-field union (otherwise it
+    // is never consulted), to avoid scanning the whole crate for every function.
+    let union_tags = if heap && has_multi_field_union(&callees) {
+        crate::heapgen::union_tag_catalog(index)
+    } else {
+        Default::default()
+    };
+    let unit = FnUnit {
+        function,
+        callees,
+        union_tags,
+    };
     Ok(unit)
+}
+
+/// Whether any item is a union with more than one field -- the only case where
+/// the discriminant catalog is needed.
+fn has_multi_field_union(items: &[syn::Item]) -> bool {
+    items.iter().any(|it| {
+        matches!(it, syn::Item::Union(u) if u.fields.named.len() > 1)
+    })
 }
 
 /// Resolve a function into a self-contained unit and check it is in scope for

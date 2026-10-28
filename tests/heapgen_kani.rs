@@ -72,7 +72,7 @@ mod proofs {
 fn generated_proof_verifies() {
     let mut index = CrateIndex::default();
     index.add_source("lib.rs", DEF).unwrap();
-    let g = heapgen::generate(&index, "Node", "old", "new").unwrap();
+    let g = heapgen::generate(&index, "Node", &Default::default(), "old", "new").unwrap();
 
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();

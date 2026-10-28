@@ -339,6 +339,7 @@ fn is_option_fn(ty: &syn::Type, aliases: &BTreeMap<String, syn::Type>) -> bool {
 pub fn generate(
     index: &CrateIndex,
     struct_name: &str,
+    catalog: &BTreeMap<String, crate::taggedunion::TagMap>,
     old: &str,
     new: &str,
 ) -> Result<Generated, Unsupported> {
@@ -363,7 +364,7 @@ pub fn generate(
     // A by-value multi-field union field, if any, is handled as a tagged union
     // (its discriminant inferred); its tag and union fields are then built
     // together rather than as independent fields.
-    let tagged = tagged_union(index, def, &table, &aliases, &mut referenced)?;
+    let tagged = tagged_union(index, def, &table, &aliases, catalog, &mut referenced)?;
     let skip: BTreeSet<&str> = match &tagged {
         Some(tu) => [tu.tag_field.as_str(), tu.union_field.as_str()]
             .into_iter()
@@ -411,6 +412,7 @@ fn tagged_union(
     def: &StructDef,
     table: &BTreeMap<String, StructDef>,
     aliases: &BTreeMap<String, syn::Type>,
+    catalog: &BTreeMap<String, crate::taggedunion::TagMap>,
     referenced: &mut BTreeSet<String>,
 ) -> Result<Option<TaggedUnion>, Unsupported> {
     let unsupported = |field: &str, detail: String| Unsupported {
@@ -437,8 +439,16 @@ fn tagged_union(
     };
 
     let subnames: Vec<String> = udef.fields.iter().map(|(n, _)| n.clone()).collect();
-    let map = crate::taggedunion::mine_accessors(index, union_field, &subnames)
-        .ok_or_else(|| unsupported(union_field, "could not infer the union's discriminant".to_owned()))?;
+    // Prefer the crate-wide catalog (mined over the full crate at extraction);
+    // fall back to mining this unit's own index, so a self-contained unit that
+    // includes its accessor (and the heapgen tests) still works.
+    let map = catalog
+        .get(union_field)
+        .cloned()
+        .or_else(|| crate::taggedunion::mine_accessors(index, union_field, &subnames))
+        .ok_or_else(|| {
+            unsupported(union_field, "could not infer the union's discriminant".to_owned())
+        })?;
     if !def.fields.iter().any(|(n, _)| n == &map.tag_field) {
         return Err(unsupported(
             union_field,
@@ -478,9 +488,56 @@ fn tagged_union(
 /// Generate the builder, cloner and comparer for every struct reachable from
 /// `roots` (following pointer fields), concatenated as one block of source.
 /// Fails if any reachable struct has a field the generator can't handle.
+/// A crate-wide catalog of union discriminant maps, keyed by union-field name,
+/// mined over *all* the crate's functions. A self-contained unit's own index
+/// holds only its closure, so an accessor that proves the discriminant may live
+/// outside it; this catalog, built from the full crate index at extraction
+/// time and carried on the [`crate::FnUnit`], supplies the map regardless.
+pub(crate) fn union_tag_catalog(
+    index: &CrateIndex,
+) -> BTreeMap<String, crate::taggedunion::TagMap> {
+    let aliases = alias_table(index);
+    // Scan all struct/union defs tolerating c2rust's identical per-file
+    // duplicates -- unlike `struct_table`, which drops any name defined twice
+    // as ambiguous (a shared struct like `json_object` appears in every file
+    // that uses it, so it would vanish and no union field would be found).
+    let mut structs: Vec<StructDef> = Vec::new();
+    let mut unions: BTreeMap<String, StructDef> = BTreeMap::new();
+    for entry in &index.entries {
+        if entry.kind != Kind::Type {
+            continue;
+        }
+        if let Some(def) = entry.item.as_ref().and_then(struct_def) {
+            if def.is_union {
+                unions.entry(def.name.clone()).or_insert(def);
+            } else {
+                structs.push(def);
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    for def in &structs {
+        for (field, ty) in &def.fields {
+            let Some(u) = last_segment(&resolve_alias(ty, &aliases)).and_then(|n| unions.get(&n))
+            else {
+                continue;
+            };
+            if u.fields.len() <= 1 || out.contains_key(field) {
+                continue;
+            }
+            let subnames: Vec<String> = u.fields.iter().map(|(n, _)| n.clone()).collect();
+            if let Some(map) = crate::taggedunion::mine_accessors(index, field, &subnames) {
+                out.insert(field.clone(), map);
+            }
+        }
+    }
+    out
+}
+
 pub fn generate_all(
     index: &CrateIndex,
     roots: &BTreeSet<String>,
+    catalog: &BTreeMap<String, crate::taggedunion::TagMap>,
     old: &str,
     new: &str,
 ) -> Result<String, Unsupported> {
@@ -491,7 +548,7 @@ pub fn generate_all(
         if !done.insert(name.clone()) {
             continue;
         }
-        let g = generate(index, &name, old, new)?;
+        let g = generate(index, &name, catalog, old, new)?;
         out.push_str(&g.builder);
         out.push('\n');
         out.push_str(&g.cloner);
@@ -897,6 +954,7 @@ mod tests {
         let g = generate(
             &index("pub struct P { pub x: i32, pub y: u8 }"),
             "P",
+            &Default::default(),
             "old",
             "new",
         )
@@ -917,7 +975,7 @@ mod tests {
     #[test]
     fn pointer_field_recurses_and_is_referenced() {
         let src = "pub struct N { pub v: i32, pub next: *mut N }";
-        let g = generate(&index(src), "N", "old", "new").unwrap();
+        let g = generate(&index(src), "N", &Default::default(), "old", "new").unwrap();
         assert_eq!(g.referenced, ["N".to_owned()].into_iter().collect());
         assert!(g.builder.contains("next: gen_N(depth - 1),"));
         assert!(g
@@ -928,7 +986,7 @@ mod tests {
     #[test]
     fn cloner_registers_before_recursing_and_nulls_pointers() {
         let src = "pub struct N { pub v: i32, pub next: *mut N }";
-        let g = generate(&index(src), "N", "old", "new").unwrap();
+        let g = generate(&index(src), "N", &Default::default(), "old", "new").unwrap();
         // The pointer field is null in the initializer...
         assert!(g.cloner.contains("next: core::ptr::null_mut(),"));
         // ...the object is registered in the map...
@@ -944,7 +1002,7 @@ mod tests {
     #[test]
     fn scalar_array_field_builds_clones_and_compares_elementwise() {
         let src = "pub struct S { pub buf: [c_char; 32], pub n: i32 }";
-        let g = generate(&index(src), "S", "old", "new").unwrap();
+        let g = generate(&index(src), "S", &Default::default(), "old", "new").unwrap();
         assert!(g.referenced.is_empty());
         // Built per element, so elements are independently symbolic.
         assert!(g
@@ -961,7 +1019,7 @@ mod tests {
     #[test]
     fn array_of_non_scalar_is_unsupported() {
         let src = "pub struct S { pub kids: [*mut S; 4] }";
-        let err = generate(&index(src), "S", "old", "new").unwrap_err();
+        let err = generate(&index(src), "S", &Default::default(), "old", "new").unwrap_err();
         assert_eq!(err.field, "kids");
         assert!(err.detail.contains("array"));
     }
@@ -973,7 +1031,7 @@ mod tests {
                    pub type NodePtr = *mut N;\n\
                    pub struct N { pub v: i32 }\n\
                    pub struct S { pub flag: json_bool, pub next: NodePtr }";
-        let g = generate(&index(src), "S", "old", "new").unwrap();
+        let g = generate(&index(src), "S", &Default::default(), "old", "new").unwrap();
         // The typedef'd scalar is built like any scalar.
         assert!(g.builder.contains("flag: kani::any(),"));
         // The typedef'd pointer reaches `N` and references it.
@@ -984,7 +1042,7 @@ mod tests {
     #[test]
     fn c_type_and_typedef_fields_are_scalars() {
         let src = "pub struct S { pub a: c_int, pub b: size_t, pub c: f64 }";
-        let g = generate(&index(src), "S", "old", "new").unwrap();
+        let g = generate(&index(src), "S", &Default::default(), "old", "new").unwrap();
         assert!(g.referenced.is_empty());
         // Three field initializers (the null-guard also calls `kani::any()`).
         assert_eq!(g.builder.matches("kani::any(),").count(), 3);
@@ -993,7 +1051,7 @@ mod tests {
     #[test]
     fn pointer_to_unknown_type_is_unsupported() {
         let src = "pub struct S { pub p: *mut FILE }";
-        let err = generate(&index(src), "S", "old", "new").unwrap_err();
+        let err = generate(&index(src), "S", &Default::default(), "old", "new").unwrap_err();
         assert_eq!(err.field, "p");
         assert!(err.detail.contains("FILE"));
     }
@@ -1003,7 +1061,7 @@ mod tests {
         // A bare (non-nullable) function pointer: not pointer-sized-nullable, so
         // not modellable as an opaque word -- still unsupported.
         let src = "pub struct S { pub f: unsafe extern \"C\" fn() }";
-        let err = generate(&index(src), "S", "old", "new").unwrap_err();
+        let err = generate(&index(src), "S", &Default::default(), "old", "new").unwrap_err();
         assert_eq!(err.field, "f");
     }
 
@@ -1013,7 +1071,7 @@ mod tests {
         // symbolic, pointer-sized word (transmuted `kani::any`), never a fixed
         // value, and copied/compared by identity.
         let src = "pub struct S { pub cb: Option<unsafe extern \"C\" fn(i32) -> i32>, pub n: i32 }";
-        let g = generate(&index(src), "S", "old", "new").unwrap();
+        let g = generate(&index(src), "S", &Default::default(), "old", "new").unwrap();
         assert!(g.builder.contains("transmute::<usize"), "symbolic word: {}", g.builder);
         assert!(!g.builder.contains("None"), "never a fixed default: {}", g.builder);
         assert!(g.comparer.contains("(*a).cb != (*b).cb"), "compared by identity: {}", g.comparer);
@@ -1053,7 +1111,7 @@ mod tests {
     fn generate_all_closes_over_referenced_structs() {
         let src = "pub struct A { pub b: *mut B, pub x: i32 }\npub struct B { pub y: i32 }";
         let roots = ["A".to_owned()].into_iter().collect();
-        let code = generate_all(&index(src), &roots, "old", "new").unwrap();
+        let code = generate_all(&index(src), &roots, &Default::default(), "old", "new").unwrap();
         // Reached A directly and B through A's pointer field.
         assert!(code.contains("gen_A(depth: usize) -> *mut old::A"));
         assert!(code.contains("gen_B(depth: usize) -> *mut old::B"));
@@ -1065,14 +1123,14 @@ mod tests {
     fn generate_all_fails_on_an_unsupported_reachable_struct() {
         let src = "pub struct A { pub b: *mut B }\npub struct B { pub f: *mut FILE }";
         let roots = ["A".to_owned()].into_iter().collect();
-        let err = generate_all(&index(src), &roots, "old", "new").unwrap_err();
+        let err = generate_all(&index(src), &roots, &Default::default(), "old", "new").unwrap_err();
         assert_eq!(err.struct_name, "B");
     }
 
     #[test]
     fn const_c_char_field_is_a_c_string() {
         let src = "pub struct S { pub name: *const c_char, pub n: i32 }";
-        let g = generate(&index(src), "S", "old", "new").unwrap();
+        let g = generate(&index(src), "S", &Default::default(), "old", "new").unwrap();
         assert!(g.referenced.is_empty());
         // Built/cloned/compared through `gen_cstr`/`clone_cstr`/`same_cstr`,
         // with casts to the field's own pointer type (c_char vs c_uchar).
@@ -1086,7 +1144,7 @@ mod tests {
         // A `*mut c_char` buffer is built like a C string; its post-state is
         // compared, so a divergent write is caught.
         let src = "pub struct S { pub buf: *mut c_char }";
-        let g = generate(&index(src), "S", "old", "new").unwrap();
+        let g = generate(&index(src), "S", &Default::default(), "old", "new").unwrap();
         assert!(g.builder.contains("buf: gen_cstr() as _,"));
     }
 
@@ -1115,7 +1173,7 @@ mod tests {
         let s = signature_shapes(&idx, &sig("fn f(out: *mut c_int, inp: *const i64)")).unwrap();
         assert_eq!(s.args, vec![Shape::ScalarCell, Shape::ScalarCell]);
         // A pointer-to-scalar field is a cell too.
-        let g = generate(&index("pub struct S { pub p: *mut i32 }"), "S", "old", "new").unwrap();
+        let g = generate(&index("pub struct S { pub p: *mut i32 }"), "S", &Default::default(), "old", "new").unwrap();
         assert!(g.builder.contains("p: gen_cell(),"));
         assert!(g.cloner.contains("p: clone_cell((*src).p),"));
         assert!(g.comparer.contains("if !same_cell((*a).p, (*b).p)"));
@@ -1143,9 +1201,9 @@ mod tests {
     fn single_field_union_pointer_is_built_like_a_struct() {
         // A one-field union is unambiguous: only that field can be active.
         let src = "pub struct S { pub u: *mut U }\npub union U { pub only: i32 }";
-        let g = generate(&index(src), "S", "old", "new").unwrap();
+        let g = generate(&index(src), "S", &Default::default(), "old", "new").unwrap();
         assert_eq!(g.referenced, ["U".to_owned()].into_iter().collect());
-        let gu = generate(&index(src), "U", "old", "new").unwrap();
+        let gu = generate(&index(src), "U", &Default::default(), "old", "new").unwrap();
         assert!(gu.builder.contains("gen_U(depth: usize) -> *mut old::U"));
         assert!(gu.builder.contains("only: kani::any(),"));
         assert!(gu.cloner.contains("only: (*src).only,"));
@@ -1169,7 +1227,7 @@ mod tests {
                 }
             }
         "#;
-        let g = generate(&index(src), "Obj", "old", "new").unwrap();
+        let g = generate(&index(src), "Obj", &Default::default(), "old", "new").unwrap();
         // The builder picks a symbolic discriminant and builds the matching
         // variant, keeping the tag and union consistent.
         assert!(g.builder.contains("kani::assume(__k <"));
@@ -1193,7 +1251,7 @@ mod tests {
     fn tagged_union_without_inferable_discriminant_is_unsupported() {
         // No accessor matches on the tag, so the discriminant can't be inferred.
         let src = "pub struct Obj { pub t: Tag, pub d: U }\npub union U { pub a: i32, pub b: f64 }";
-        let err = generate(&index(src), "Obj", "old", "new").unwrap_err();
+        let err = generate(&index(src), "Obj", &Default::default(), "old", "new").unwrap_err();
         assert_eq!(err.field, "d");
         assert!(err.detail.contains("infer"), "got: {}", err.detail);
     }
@@ -1202,7 +1260,7 @@ mod tests {
     fn multi_field_union_pointer_needs_a_discriminant() {
         let src =
             "pub struct S { pub u: *mut U }\npub union U { pub i: i32, pub p: *mut S }";
-        let err = generate(&index(src), "S", "old", "new").unwrap_err();
+        let err = generate(&index(src), "S", &Default::default(), "old", "new").unwrap_err();
         assert_eq!(err.field, "u");
         assert!(err.detail.contains("discriminant"), "got: {}", err.detail);
     }
@@ -1210,7 +1268,7 @@ mod tests {
     #[test]
     fn generating_a_multi_field_union_directly_is_unsupported() {
         let src = "pub union U { pub i: i32, pub f: f64 }";
-        let err = generate(&index(src), "U", "old", "new").unwrap_err();
+        let err = generate(&index(src), "U", &Default::default(), "old", "new").unwrap_err();
         assert_eq!(err.struct_name, "U");
         assert!(err.detail.contains("discriminant"));
     }

@@ -81,7 +81,7 @@ fn main() {
 fn generated_code_behaves_on_shared_and_cyclic_heaps() {
     let mut index = CrateIndex::default();
     index.add_source("lib.rs", DEF).unwrap();
-    let g = heapgen::generate(&index, "N", "old", "new").unwrap();
+    let g = heapgen::generate(&index, "N", &Default::default(), "old", "new").unwrap();
 
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();

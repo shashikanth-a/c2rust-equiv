@@ -20,6 +20,11 @@ pub const MAX_ARGS: usize = 8;
 pub struct FnUnit {
     pub function: syn::ItemFn,
     pub callees: Vec<syn::Item>,
+    /// Crate-wide union discriminant maps (keyed by union-field name), mined
+    /// from the full crate index at extraction time. A self-contained unit's
+    /// own index may lack the accessor that proves a discriminant, so the heap
+    /// generator consults this catalog; empty when built outside extraction.
+    pub union_tags: std::collections::BTreeMap<String, crate::taggedunion::TagMap>,
 }
 
 /// Why a function wasn't checked.
@@ -70,6 +75,7 @@ impl FnUnit {
                 .iter()
                 .map(|s| syn::parse_str(s))
                 .collect::<syn::Result<_>>()?,
+            union_tags: Default::default(),
         })
     }
 

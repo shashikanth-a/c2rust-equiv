@@ -43,7 +43,7 @@ fn generated_code_type_checks() {
     index
         .add_source("lib.rs", "pub struct N { pub v: i32, pub next: *mut N }")
         .unwrap();
-    let g = heapgen::generate(&index, "N", "old", "new").unwrap();
+    let g = heapgen::generate(&index, "N", &Default::default(), "old", "new").unwrap();
 
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();

@@ -299,7 +299,7 @@ pub fn heap_diagnose(unit: &FnUnit) -> Result<(), String> {
     }
     unit.heap_body_in_scope()
         .map_err(|s| format!("body: {} ({})", s.detail, s.category))?;
-    heapgen::generate_all(&index, &shapes.structs, "old", "new")
+    heapgen::generate_all(&index, &shapes.structs, &unit.union_tags, "old", "new")
         .map_err(|u| format!("generate: {} field `{}`: {}", u.struct_name, u.field, u.detail))?;
     Ok(())
 }
@@ -337,7 +337,7 @@ fn heap_plan(old: &FnUnit, new: &FnUnit) -> Option<(SigShapes, String)> {
     // put the function out of scope; the scalar path then reports the reason.
     old.heap_body_in_scope().ok()?;
     new.heap_body_in_scope().ok()?;
-    let code = heapgen::generate_all(&index, &shapes.structs, "old", "new").ok()?;
+    let code = heapgen::generate_all(&index, &shapes.structs, &old.union_tags, "old", "new").ok()?;
     Some((shapes, code))
 }
 

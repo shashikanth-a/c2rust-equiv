@@ -56,10 +56,42 @@ fn json_object_still_blocked_after_union_support() {
     }
     let mut index = CrateIndex::default();
     index.add_source(JSONC, &std::fs::read_to_string(JSONC).unwrap()).unwrap();
-    let err = c2rust_equiv::heapgen::generate(&index, "json_object", "old", "new")
+    let err = c2rust_equiv::heapgen::generate(&index, "json_object", &Default::default(), "old", "new")
         .expect_err("json_object should still be unsupported");
     eprintln!("json_object blocked by: field `{}`: {}", err.field, err.detail);
     // The tag map is inferred, so the failure is a non-buildable field, not the
     // discriminant.
     assert!(!err.detail.contains("infer"), "unexpected: {}", err.detail);
+}
+
+// The crate-wide catalog (wall 4): a function's own closure may not contain the
+// accessor that proves the union discriminant, so it is mined from the full
+// crate index at extraction time and carried on the FnUnit. Here the whole
+// json-c crate is indexed and a json_object-touching function extracted; its
+// union_tags must carry the `o` map with the real `o_type` discriminant.
+#[test]
+fn crate_wide_catalog_infers_json_object_discriminant() {
+    let root = Path::new("drafts/eval/examples/json-c");
+    if !root.exists() {
+        eprintln!("skipping: {} not present", root.display());
+        return;
+    }
+    let index = CrateIndex::load(root).unwrap();
+    let entry = index
+        .find_functions("get_string_component")
+        .into_iter()
+        .next()
+        .expect("get_string_component present");
+    let unit = c2rust_equiv::extract_heap_composed(&index, entry, &Default::default())
+        .expect("extracts on the heap path");
+    let map = unit
+        .union_tags
+        .get("o")
+        .expect("crate-wide catalog carries the `o` union map");
+    assert_eq!(map.tag_field, "o_type");
+    assert_eq!(
+        map.variants.get("json_type::json_type_boolean"),
+        Some(&Some("c_boolean".to_owned())),
+        "boolean variant selects c_boolean"
+    );
 }
