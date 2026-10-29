@@ -784,6 +784,13 @@ impl Analyzer<'_> {
 
 impl<'ast> Visit<'ast> for Analyzer<'_> {
     fn visit_expr_call(&mut self, c: &'ast syn::ExprCall) {
+        // A lock/unlock wrapper call is a sequential no-op (dropped at harness
+        // generation); admit it without resolving the wrapper's body or its
+        // global mutex argument (which would otherwise trip the foreign-call and
+        // global walls). See `crate::mutexmodel`.
+        if self.resolver.heap && crate::mutexmodel::is_mutex_call(c) {
+            return;
+        }
         // An indirect call -- through a function pointer held in a local (c2rust
         // emits `if let Some(cb) = (*x).field { cb(..) }`) or any non-path callee
         // -- targets a symbolic address on the heap path and can't be modelled

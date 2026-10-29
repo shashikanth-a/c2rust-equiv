@@ -450,6 +450,12 @@ impl<'ast> Visit<'ast> for BodyChecker {
     }
 
     fn visit_expr_call(&mut self, c: &'ast syn::ExprCall) {
+        // A lock/unlock wrapper call is a sequential no-op, dropped at harness
+        // generation (see `crate::mutexmodel`); admit it and don't descend into
+        // its global mutex argument.
+        if self.allow_pointers && crate::mutexmodel::is_mutex_call(c) {
+            return;
+        }
         // A direct call names a function by path (`foo(...)`). Any other callee
         // expression is an indirect call through a function pointer (e.g. a
         // struct field `((*x).cb)(...)`), whose target is a symbolic address we

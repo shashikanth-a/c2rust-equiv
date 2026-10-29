@@ -670,6 +670,82 @@ fn data_global_struct_of_scalars_catches_divergence() {
     );
 }
 
+// Lock/unlock wrapper calls around real work: without the mutex model the call
+// to `xmlMutexLock` (and its global argument) would put the function out of
+// scope; with it, the calls are dropped as sequential no-ops and the actual
+// work is proven. `GMUTEX` is a stand-in for the global mutex pointer.
+const GMUTEX_DEF: &str = "static mut GMUTEX: *mut i32 = core::ptr::null_mut();";
+
+const MUTEX_OLD: &str = r#"
+pub unsafe fn locked_inc(p: *const i32) -> i32 {
+    if p.is_null() { return 0; }
+    xmlMutexLock(GMUTEX);
+    let r = (*p).wrapping_add(1);
+    xmlMutexUnlock(GMUTEX);
+    r
+}
+"#;
+
+const MUTEX_OK: &str = r#"
+pub unsafe fn locked_inc(p: *const i32) -> i32 {
+    if p.is_null() { return 0; }
+    xmlRMutexLock(GMUTEX);
+    let mut r = *p;
+    r = r.wrapping_add(1);
+    xmlRMutexUnlock(GMUTEX);
+    r
+}
+"#;
+
+// Same no-op locking, but a divergent result -- caught despite the dropped locks.
+const MUTEX_BAD: &str = r#"
+pub unsafe fn locked_inc(p: *const i32) -> i32 {
+    if p.is_null() { return 0; }
+    xmlMutexLock(GMUTEX);
+    let r = (*p).wrapping_add(2);
+    xmlMutexUnlock(GMUTEX);
+    r
+}
+"#;
+
+#[test]
+fn mutex_wrapper_calls_are_in_heap_scope() {
+    // No Kani: the lock/unlock calls and their global argument are admitted
+    // rather than rejected as a foreign call / out-of-scope global.
+    let unit = FnUnit::parse(MUTEX_OLD, &[GMUTEX_DEF]).unwrap();
+    assert!(
+        unit.heap_body_in_scope().is_ok(),
+        "mutex wrapper call rejected: {:?}",
+        unit.heap_body_in_scope()
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn mutex_noop_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(MUTEX_OLD, &[GMUTEX_DEF]).unwrap();
+    let new = FnUnit::parse(MUTEX_OK, &[GMUTEX_DEF]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn mutex_noop_catches_divergence() {
+    let old = FnUnit::parse(MUTEX_OLD, &[GMUTEX_DEF]).unwrap();
+    let new = FnUnit::parse(MUTEX_BAD, &[GMUTEX_DEF]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent result under no-op locks was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 // A `*mut c_char` output buffer: uppercase the first byte in place. The heap
 // path compares the buffer's post-state, so a divergent write is caught.
 const OUTBUF_OLD: &str = r#"

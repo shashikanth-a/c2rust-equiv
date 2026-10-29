@@ -108,6 +108,7 @@ fn module_source(unit: &FnUnit, inject_str_models: bool) -> String {
         crate::allocmodel::inject(&mut items);
         crate::varmodel::rewrite(&mut items);
         crate::indirectmodel::rewrite(&mut items);
+        crate::mutexmodel::rewrite(&mut items);
     }
     let file = syn::File {
         shebang: None,
