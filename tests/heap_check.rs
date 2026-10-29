@@ -814,6 +814,70 @@ fn flexible_array_member_catches_divergence() {
     );
 }
 
+// A pointer-to-pointer field (`T**`, c2rust's growable arrays, e.g.
+// `xmlParserCtxt.inputTab`). It is carried as an opaque word (never
+// dereferenced); the struct still builds, so a function reading its other
+// fields is in scope. A divergent result is still caught.
+const PP_STRUCT: &str = "#[repr(C)] pub struct Ctx { pub n: i32, pub tab: *mut *mut i32 }";
+
+const PP_OLD: &str = r#"
+pub unsafe fn ctx_n(c: *mut Ctx) -> i32 {
+    if c.is_null() { return -1; }
+    (*c).n
+}
+"#;
+
+const PP_OK: &str = r#"
+pub unsafe fn ctx_n(c: *mut Ctx) -> i32 {
+    if c.is_null() { return -1; }
+    let v = (*c).n;
+    v
+}
+"#;
+
+const PP_BAD: &str = r#"
+pub unsafe fn ctx_n(c: *mut Ctx) -> i32 {
+    if c.is_null() { return -1; }
+    (*c).n ^ 1
+}
+"#;
+
+#[test]
+fn pointer_to_pointer_field_is_in_heap_scope() {
+    let unit = FnUnit::parse(PP_OLD, &[PP_STRUCT]).unwrap();
+    assert!(
+        c2rust_equiv::heap_diagnose(&unit).is_ok(),
+        "pointer-to-pointer field rejected: {:?}",
+        c2rust_equiv::heap_diagnose(&unit)
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn pointer_to_pointer_field_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(PP_OLD, &[PP_STRUCT]).unwrap();
+    let new = FnUnit::parse(PP_OK, &[PP_STRUCT]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn pointer_to_pointer_field_catches_divergence() {
+    let old = FnUnit::parse(PP_OLD, &[PP_STRUCT]).unwrap();
+    let new = FnUnit::parse(PP_BAD, &[PP_STRUCT]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent result was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 // A `*mut c_char` output buffer: uppercase the first byte in place. The heap
 // path compares the buffer's post-state, so a divergent write is caught.
 const OUTBUF_OLD: &str = r#"

@@ -311,6 +311,16 @@ fn classify(
                 None => return Err(format!("pointer to `{name}`, which is not a plain aggregate")),
             }
         }
+        // A pointer to a pointer (`T**`), c2rust's growable arrays -- e.g.
+        // `xmlParserCtxt.inputTab: *mut xmlParserInputPtr`, or `*mut *const
+        // xmlChar`. Carry the outer pointer as an opaque word, compared by
+        // identity and never dereferenced: reading `tab[i]` would read an
+        // arbitrary address, which Kani flags as an invalid access ("not
+        // proved"), never a false proof. The same model as `void*` and fn-ptr
+        // fields; soundness is identical (carried data, never built).
+        if matches!(elem, syn::Type::Ptr(_)) {
+            return Ok(Field::OpaqueWord(opaque_word_type(ty, aliases)));
+        }
         return Err("pointer to a non-struct type".to_owned());
     }
     // A fixed-size array of a scalar. The element is resolved through aliases
