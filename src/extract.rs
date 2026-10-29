@@ -484,6 +484,11 @@ impl Resolver<'_> {
 
     /// Whether a static item is a modellable data global, seeing through crate
     /// type aliases (so `static X: SomePtrTypedef` is recognised as a pointer).
+    fn is_modelled_struct_mut_static_item(&self, item: &Option<syn::Item>) -> bool {
+        matches!(item, Some(syn::Item::Static(s))
+            if crate::unit::modelled_struct_mut_static(s, self.structs, self.aliases).is_some())
+    }
+
     fn is_data_static_item(&self, item: &Option<syn::Item>) -> bool {
         let Some(syn::Item::Static(s)) = item else {
             return false;
@@ -533,6 +538,11 @@ impl Resolver<'_> {
             // pulled in too; the final write-guard in `extract_in` rejects the
             // unit if any function actually writes it (then it isn't read-only).
             Kind::Static if self.heap && self.is_data_static_item(&entry.item) => Res::Item(e),
+            // A modelled struct `static mut` (e.g. `xmlLastError`): pulled in and
+            // compared by final state field-by-field, so writing it is in scope.
+            Kind::Static if self.heap && self.is_modelled_struct_mut_static_item(&entry.item) => {
+                Res::Item(e)
+            }
             // A reference through an `extern` declaration (c2rust emits one per
             // file) resolves to the crate definition of the same name when that
             // definition is a modellable global, so the data-global and

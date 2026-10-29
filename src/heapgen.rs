@@ -150,14 +150,27 @@ fn struct_def(item: &syn::Item) -> Option<StructDef> {
 /// since the generator can't tell which layout a pointer refers to.
 fn struct_table(index: &CrateIndex) -> BTreeMap<String, StructDef> {
     let mut table: BTreeMap<String, StructDef> = BTreeMap::new();
+    let mut src: BTreeMap<String, String> = BTreeMap::new();
     let mut ambiguous: BTreeSet<String> = BTreeSet::new();
     for entry in &index.entries {
         if entry.kind != Kind::Type {
             continue;
         }
-        if let Some(def) = entry.item.as_ref().and_then(struct_def) {
-            if table.contains_key(&def.name) {
-                ambiguous.insert(def.name.clone());
+        let Some(item) = entry.item.as_ref() else {
+            continue;
+        };
+        if let Some(def) = struct_def(item) {
+            // c2rust emits an identical struct definition in every file that
+            // uses it; those duplicates are interchangeable. Only a name defined
+            // as two *different* structs is genuinely ambiguous and dropped
+            // (matching `alias_table`'s treatment of duplicate type aliases).
+            let text = item.to_token_stream().to_string();
+            if let Some(prev) = src.get(&def.name) {
+                if *prev != text {
+                    ambiguous.insert(def.name.clone());
+                }
+            } else {
+                src.insert(def.name.clone(), text);
             }
             table.insert(def.name.clone(), def);
         }
