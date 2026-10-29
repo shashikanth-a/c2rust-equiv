@@ -561,6 +561,115 @@ fn scalar_global_side_effect_catches_divergence() {
     );
 }
 
+// A read-only struct-of-scalars data global, libxml2's `xmlChRangeGroup` shape:
+// a `Group` of scalars plus a raw pointer to a `[Range; N]` table (a second
+// static the group's initializer references by name -- so accepting the group
+// requires pulling the table in too). Both versions get an identical const
+// copy, so a divergent *use* of the table is caught while the data itself never
+// differs. Exercises the struct-of-scalars `is_data_type` extension end to end.
+const RANGE_DEF: &str = "#[repr(C)] #[derive(Copy, Clone)] pub struct Range { pub low: u32, pub high: u32 }";
+const GROUP_DEF: &str = "#[repr(C)] #[derive(Copy, Clone)] pub struct Group { pub n: i32, pub ranges: *const Range }";
+// `static mut` as c2rust emits these (a plain `static` with a raw-pointer field
+// isn't `Sync`); the heap path treats a non-scalar `static mut` as a read-only
+// data global regardless, since it emits no final-value comparison for it.
+const TBL_DEF: &str =
+    "static mut RANGES: [Range; 2] = [Range { low: 10, high: 20 }, Range { low: 30, high: 40 }];";
+const GRP_DEF: &str =
+    "static mut GRP: Group = Group { n: 2, ranges: &raw const RANGES as *const Range };";
+
+// Classify the pointed-to value against the global range table.
+const DATAG_OLD: &str = r#"
+pub unsafe fn in_range(x: *const u32) -> i32 {
+    if x.is_null() { return -1; }
+    let v = *x;
+    let n = (*(&raw const GRP)).n;
+    let ranges = (*(&raw const GRP)).ranges;
+    let mut i = 0i32;
+    while i < n {
+        let r = *ranges.offset(i as isize);
+        if v >= r.low && v <= r.high { return 1; }
+        i += 1;
+    }
+    0
+}
+"#;
+
+const DATAG_OK: &str = r#"
+pub unsafe fn in_range(x: *const u32) -> i32 {
+    if x.is_null() { return -1; }
+    let v = *x;
+    let n = (*(&raw const GRP)).n;
+    let ranges = (*(&raw const GRP)).ranges;
+    let mut i = 0i32;
+    while i < n {
+        let r = *ranges.offset(i as isize);
+        if r.low <= v && v <= r.high { return 1; }
+        i += 1;
+    }
+    0
+}
+"#;
+
+// Divergent use: a strict upper bound, so a value equal to `high` classifies
+// differently -- same global data, different behaviour.
+const DATAG_BAD: &str = r#"
+pub unsafe fn in_range(x: *const u32) -> i32 {
+    if x.is_null() { return -1; }
+    let v = *x;
+    let n = (*(&raw const GRP)).n;
+    let ranges = (*(&raw const GRP)).ranges;
+    let mut i = 0i32;
+    while i < n {
+        let r = *ranges.offset(i as isize);
+        if v >= r.low && v < r.high { return 1; }
+        i += 1;
+    }
+    0
+}
+"#;
+
+#[test]
+fn data_global_struct_of_scalars_is_in_heap_scope() {
+    // No Kani: just that the struct-of-scalars read-only global (and the table
+    // its initializer references) are accepted in heap scope rather than
+    // rejected as an out-of-scope global.
+    let items = [RANGE_DEF, GROUP_DEF, TBL_DEF, GRP_DEF];
+    let unit = FnUnit::parse(DATAG_OLD, &items).unwrap();
+    assert!(
+        unit.heap_body_in_scope().is_ok(),
+        "struct-of-scalars data global rejected: {:?}",
+        unit.heap_body_in_scope()
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn data_global_struct_of_scalars_proves_equivalent_rewrite() {
+    let items = [RANGE_DEF, GROUP_DEF, TBL_DEF, GRP_DEF];
+    let old = FnUnit::parse(DATAG_OLD, &items).unwrap();
+    let new = FnUnit::parse(DATAG_OK, &items).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(4));
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn data_global_struct_of_scalars_catches_divergence() {
+    let items = [RANGE_DEF, GROUP_DEF, TBL_DEF, GRP_DEF];
+    let old = FnUnit::parse(DATAG_OLD, &items).unwrap();
+    let new = FnUnit::parse(DATAG_BAD, &items).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(4));
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent use of the global table was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 // A `*mut c_char` output buffer: uppercase the first byte in place. The heap
 // path compares the buffer's post-state, so a divergent write is caught.
 const OUTBUF_OLD: &str = r#"

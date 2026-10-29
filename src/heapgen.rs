@@ -152,6 +152,32 @@ fn struct_table(index: &CrateIndex) -> BTreeMap<String, StructDef> {
     table
 }
 
+/// The named-struct field types of a crate, by struct name (unions excluded:
+/// their bytes are ambiguous without a discriminant). Used to decide whether a
+/// `static X: SomeStruct` is a read-only data global the heap path can carry --
+/// a struct every one of whose fields is itself data (a scalar, a raw pointer,
+/// an array, or a nested data struct). Dedup-tolerant like [`struct_table`].
+pub(crate) fn data_struct_fields(index: &CrateIndex) -> BTreeMap<String, Vec<syn::Type>> {
+    struct_table(index)
+        .into_iter()
+        .filter(|(_, d)| !d.is_union)
+        .map(|(n, d)| (n, d.fields.into_iter().map(|(_, t)| t).collect()))
+        .collect()
+}
+
+/// Like [`data_struct_fields`], but over an assembled unit's items (used by the
+/// body scope check, which sees the unit rather than the whole crate index).
+pub(crate) fn data_struct_fields_from_items(
+    items: &[syn::Item],
+) -> BTreeMap<String, Vec<syn::Type>> {
+    items
+        .iter()
+        .filter_map(struct_def)
+        .filter(|d| !d.is_union)
+        .map(|d| (d.name, d.fields.into_iter().map(|(_, t)| t).collect()))
+        .collect()
+}
+
 /// Crate-local type aliases (`type json_bool = c_int;`), by name. A name
 /// defined twice is dropped, like structs, since the target is then ambiguous.
 pub(crate) fn alias_table(index: &CrateIndex) -> BTreeMap<String, syn::Type> {
@@ -176,6 +202,19 @@ pub(crate) fn alias_table(index: &CrateIndex) -> BTreeMap<String, syn::Type> {
         table.remove(&name);
     }
     table
+}
+
+/// Like [`alias_table`], but over an assembled unit's items (used by the body
+/// scope check). The unit already inlines *pointer* aliases, so this is mainly
+/// for struct/scalar aliases that remain (`type xmlChRangeGroup = _xmlChRangeGroup`).
+pub(crate) fn alias_table_from_items(items: &[syn::Item]) -> BTreeMap<String, syn::Type> {
+    items
+        .iter()
+        .filter_map(|it| match it {
+            syn::Item::Type(t) => Some((t.ident.to_string(), (*t.ty).clone())),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Follow crate-local type aliases to the underlying type, so a typedef'd

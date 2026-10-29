@@ -1,5 +1,6 @@
 //! A function together with the items it needs, independent of any crate.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use quote::ToTokens;
@@ -121,6 +122,11 @@ impl FnUnit {
             // Field types come from every struct in the unit; variable types are
             // filled in per function as the checker descends (see visit_item_fn).
             type_env: crate::indirectmodel::TypeEnv::from_items(&items),
+            // Struct layouts and type aliases, so a read-only data global of a
+            // struct-of-scalars type (`static G: xmlChRangeGroup`) is recognised
+            // as in scope -- the same gate the extractor used to pull it in.
+            structs: crate::heapgen::data_struct_fields_from_items(&items),
+            aliases: crate::heapgen::alias_table_from_items(&items),
         };
         for item in &items {
             // A generated summary shim is trusted code that only runs in the
@@ -337,19 +343,60 @@ pub(crate) fn is_scalar_mut_static(s: &syn::ItemStatic) -> bool {
 /// scalar `static mut` -- modelled with a final-value comparison -- these carry
 /// no comparison, so they are sound only when the unit never writes them, which
 /// the extractor checks before keeping them.
-pub(crate) fn is_data_static(s: &syn::ItemStatic) -> bool {
-    !is_scalar_mut_static(s) && is_data_type(&s.ty)
+pub(crate) fn is_data_static(
+    s: &syn::ItemStatic,
+    structs: &BTreeMap<String, Vec<syn::Type>>,
+    aliases: &BTreeMap<String, syn::Type>,
+) -> bool {
+    !is_scalar_mut_static(s) && is_data_type(&s.ty, structs, aliases)
 }
 
-pub(crate) fn is_data_type(ty: &syn::Type) -> bool {
-    match ty {
-        syn::Type::Array(a) => is_data_type(&a.elem),
+/// Whether `ty` is a read-only "data" type the heap path can carry as an
+/// identical per-version copy: a scalar, a raw pointer (carried by its bits, not
+/// dereferenced here), an array of such, or a struct every one of whose fields
+/// is itself a data type (e.g. libxml2's `xmlChRangeGroup` Unicode-range tables:
+/// `{ nbShortRange: c_int, shortRange: *const xmlChSRange, .. }`). Type aliases
+/// are followed. A struct field that is a pointer short-circuits to `true`
+/// without recursing into the pointee, so the recursion (bounded anyway)
+/// terminates; unions are excluded (absent from `structs`), since their bytes
+/// are ambiguous. Carrying such a global is sound only because the extractor's
+/// write-guard rejects the unit if any function writes it -- both versions then
+/// read the identical const bytes, so any observable difference is real.
+pub(crate) fn is_data_type(
+    ty: &syn::Type,
+    structs: &BTreeMap<String, Vec<syn::Type>>,
+    aliases: &BTreeMap<String, syn::Type>,
+) -> bool {
+    is_data_type_rec(ty, structs, aliases, 0)
+}
+
+fn is_data_type_rec(
+    ty: &syn::Type,
+    structs: &BTreeMap<String, Vec<syn::Type>>,
+    aliases: &BTreeMap<String, syn::Type>,
+    depth: usize,
+) -> bool {
+    if depth > 16 {
+        return false;
+    }
+    let resolved = crate::heapgen::resolve_alias(ty, aliases);
+    match &resolved {
+        syn::Type::Array(a) => is_data_type_rec(&a.elem, structs, aliases, depth + 1),
         syn::Type::Ptr(_) => true,
         syn::Type::Path(p) => p.path.segments.last().is_some_and(|seg| {
             let n = seg.ident.to_string();
-            crate::scalar::primitive(&n).is_some()
+            if crate::scalar::primitive(&n).is_some()
                 || crate::scalar::c_type(&n).is_some()
                 || crate::scalar::libc_typedef(&n).is_some()
+            {
+                return true;
+            }
+            // A struct of data fields: check every field recursively.
+            structs.get(&n).is_some_and(|fields| {
+                fields
+                    .iter()
+                    .all(|f| is_data_type_rec(f, structs, aliases, depth + 1))
+            })
         }),
         _ => false,
     }
@@ -382,6 +429,10 @@ struct BodyChecker {
     /// Struct-field and current-function variable types, so a modellable
     /// indirect call (`field.expect("..")(args)`) can be recognised.
     type_env: crate::indirectmodel::TypeEnv,
+    /// Struct layouts (by name) and type aliases, for classifying a read-only
+    /// data global of a struct-of-scalars type (see [`is_data_type`]).
+    structs: BTreeMap<String, Vec<syn::Type>>,
+    aliases: BTreeMap<String, syn::Type>,
 }
 
 impl BodyChecker {
@@ -431,7 +482,9 @@ impl<'ast> Visit<'ast> for BodyChecker {
         // A read-only data global (lookup table / string constant) is also
         // kept: the extractor only pulls one in after checking the unit never
         // writes it, so each version's identical copy is read identically.
-        if self.allow_pointers && (is_scalar_mut_static(s) || is_data_static(s)) {
+        if self.allow_pointers
+            && (is_scalar_mut_static(s) || is_data_static(s, &self.structs, &self.aliases))
+        {
             return;
         }
         self.set(Skip::new(

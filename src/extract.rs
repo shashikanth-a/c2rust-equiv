@@ -123,11 +123,17 @@ fn extract_in(
     } else {
         BTreeMap::new()
     };
+    let structs = if heap {
+        crate::heapgen::data_struct_fields(index)
+    } else {
+        BTreeMap::new()
+    };
     let resolver = Resolver {
         index,
         heap,
         summaries: &summary_names,
         aliases: &aliases,
+        structs: &structs,
     };
     let mut closure = BTreeSet::new();
     let mut queue = VecDeque::from([entry]);
@@ -224,7 +230,9 @@ fn extract_in(
     let data_statics: BTreeSet<String> = callees
         .iter()
         .filter_map(|c| match c {
-            syn::Item::Static(s) if crate::unit::is_data_static(s) => Some(s.ident.to_string()),
+            syn::Item::Static(s) if crate::unit::is_data_static(s, &structs, &aliases) => {
+                Some(s.ident.to_string())
+            }
             _ => None,
         })
         .collect();
@@ -312,6 +320,9 @@ struct Resolver<'a> {
     /// Crate type aliases, for seeing through a typedef to a pointer/scalar
     /// when classifying a foreign-call signature or a static's type.
     aliases: &'a BTreeMap<String, syn::Type>,
+    /// Crate struct layouts (by name), for recognising a read-only data global
+    /// of a struct-of-scalars type (`static G: xmlChRangeGroup`).
+    structs: &'a BTreeMap<String, Vec<syn::Type>>,
 }
 
 impl Resolver<'_> {
@@ -474,7 +485,11 @@ impl Resolver<'_> {
         if crate::unit::is_scalar_mut_static(s) {
             return false;
         }
-        crate::unit::is_data_type(&inline_ptr_aliases(&s.ty, self.aliases))
+        crate::unit::is_data_type(
+            &inline_ptr_aliases(&s.ty, self.aliases),
+            self.structs,
+            self.aliases,
+        )
     }
 
     /// Whether a foreign function can be modelled as an observable trace call,
