@@ -943,6 +943,100 @@ fn by_value_struct_field_catches_divergence() {
     );
 }
 
+// A by-value union of unknown discriminant (`v: U`), libxml2's
+// `xmlSchemaVal.value` shape. Built as symbolic raw bytes, byte-identical
+// across versions. A function reading a *scalar* variant consistently proves;
+// a divergent read is caught; and -- crucially for soundness -- reading a
+// pointer variant and dereferencing it is NOT falsely proved (it reads an
+// arbitrary address). `tag` is an ordinary scalar; no discriminant is inferred.
+const OU_UNION: &str = "#[repr(C)] #[derive(Copy, Clone)] pub union U { pub n: i32, pub p: *mut i32 }";
+const OU_STRUCT: &str = "#[repr(C)] pub struct Val { pub tag: i32, pub v: U }";
+
+// Reads the scalar variant `v.n` -- same bytes both sides, so equivalent.
+const OU_OLD: &str = r#"
+pub unsafe fn val_n(x: *mut Val) -> i32 {
+    if x.is_null() { return -1; }
+    (*x).v.n
+}
+"#;
+
+const OU_OK: &str = r#"
+pub unsafe fn val_n(x: *mut Val) -> i32 {
+    if x.is_null() { return -1; }
+    let u = (*x).v;
+    u.n
+}
+"#;
+
+// Divergent read of the same bytes -- caught despite no discriminant.
+const OU_BAD: &str = r#"
+pub unsafe fn val_n(x: *mut Val) -> i32 {
+    if x.is_null() { return -1; }
+    (*x).v.n ^ 1
+}
+"#;
+
+// Dereferences the pointer variant of the symbolic-byte union: an arbitrary
+// address, which must NOT prove equivalent (Kani flags the invalid access).
+const OU_DEREF: &str = r#"
+pub unsafe fn val_n(x: *mut Val) -> i32 {
+    if x.is_null() { return -1; }
+    *(*x).v.p
+}
+"#;
+
+#[test]
+fn opaque_union_is_in_heap_scope() {
+    let unit = FnUnit::parse(OU_OLD, &[OU_UNION, OU_STRUCT]).unwrap();
+    assert!(
+        c2rust_equiv::heap_diagnose(&unit).is_ok(),
+        "opaque union rejected: {:?}",
+        c2rust_equiv::heap_diagnose(&unit)
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn opaque_union_scalar_variant_proves_equivalent() {
+    let old = FnUnit::parse(OU_OLD, &[OU_UNION, OU_STRUCT]).unwrap();
+    let new = FnUnit::parse(OU_OK, &[OU_UNION, OU_STRUCT]).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(16));
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn opaque_union_catches_divergence() {
+    let old = FnUnit::parse(OU_OLD, &[OU_UNION, OU_STRUCT]).unwrap();
+    let new = FnUnit::parse(OU_BAD, &[OU_UNION, OU_STRUCT]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent union read was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn opaque_union_pointer_variant_deref_is_not_falsely_proved() {
+    // Both versions are identical but dereference a pointer read from the
+    // symbolic-byte union -- an arbitrary address. This must NOT prove
+    // (soundness: byte-wise unions never fabricate valid pointer provenance).
+    let old = FnUnit::parse(OU_DEREF, &[OU_UNION, OU_STRUCT]).unwrap();
+    let new = FnUnit::parse(OU_DEREF, &[OU_UNION, OU_STRUCT]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "dereferencing an arbitrary union pointer was proved: {:?}",
+        outcome.status
+    );
+}
+
 // A `*mut c_char` output buffer: uppercase the first byte in place. The heap
 // path compares the buffer's post-state, so a divergent write is caught.
 const OUTBUF_OLD: &str = r#"

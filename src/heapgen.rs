@@ -77,6 +77,14 @@ enum Field {
     /// ambiguous); the inner struct's own fields are built recursively, so it is
     /// sound exactly as the pointer case is. The string is the type name.
     StructValue(String),
+    /// A union held by value as a field, whose discriminant can't be inferred.
+    /// Built as symbolic raw bytes (`gen_union`), copied byte-identically into
+    /// both versions (`clone_union`) and compared byte-wise (`same_union`) -- an
+    /// over-approximation of all variants that needs no discriminant and is
+    /// sound for differential equivalence (both versions see the same bytes; a
+    /// dereferenced pointer variant reads an arbitrary address and is "not
+    /// proved", never falsely equal). The string is the union type name.
+    OpaqueUnion(String),
 }
 
 /// The generated builder, cloner and comparer for one struct, plus the structs
@@ -364,10 +372,17 @@ fn classify(
                 }
             }
             // A multi-field struct held by value (not a single-scalar newtype,
-            // not a union): build it inline. A union by value would be
-            // ambiguous (no discriminant), so it is left unsupported.
+            // not a union): build it inline.
             if !def.is_union && !def.fields.is_empty() {
                 return Ok(Field::StructValue(name));
+            }
+            // A union held by value whose discriminant the tagged-union path
+            // couldn't infer: fall back to a byte-wise opaque union (sound, no
+            // discriminant needed). When the discriminant *is* inferable the
+            // field is handled precisely as a tagged union and never reaches
+            // here (it is excluded from the field loop).
+            if def.is_union && !def.fields.is_empty() {
+                return Ok(Field::OpaqueUnion(name));
             }
         }
     }
@@ -462,7 +477,18 @@ pub fn generate(
     // A by-value multi-field union field, if any, is handled as a tagged union
     // (its discriminant inferred); its tag and union fields are then built
     // together rather than as independent fields.
-    let tagged = tagged_union(index, def, &table, &aliases, catalog, &mut referenced)?;
+    // Try to describe a by-value multi-field union precisely as a tagged union
+    // (inferring its discriminant). If that fails, fall back to building each
+    // such union byte-wise (classify -> `OpaqueUnion` in the field loop below),
+    // which is sound without a discriminant. `referenced` is only extended on
+    // the precise path, so a failed inference leaves it untouched.
+    let mut tu_ref = BTreeSet::new();
+    let tagged = tagged_union(index, def, &table, &aliases, catalog, &mut tu_ref)
+        .ok()
+        .flatten();
+    if tagged.is_some() {
+        referenced.extend(tu_ref);
+    }
     let skip: BTreeSet<&str> = match &tagged {
         Some(tu) => [tu.tag_field.as_str(), tu.union_field.as_str()]
             .into_iter()
@@ -755,6 +781,11 @@ pub fn signature_shapes(
             Field::StructValue(name) => {
                 Err(format!("`{name}` passed or returned by value"))
             }
+            // A union passed by value as a top-level argument/return: likewise a
+            // separate harness path; leave unsupported.
+            Field::OpaqueUnion(name) => {
+                Err(format!("union `{name}` passed or returned by value"))
+            }
         }
     };
 
@@ -845,6 +876,9 @@ fn build_value(field: &Field, m: &str) -> String {
         }
         // A C-enum newtype: wrap a symbolic inner scalar in the version's type.
         Field::ScalarNewtype(name) => format!("{m}::{name}(kani::any())"),
+        // A by-value union of unknown discriminant: symbolic raw bytes. The
+        // concrete union type is inferred from the field being initialised.
+        Field::OpaqueUnion(_) => "gen_union()".to_owned(),
     }
 }
 
@@ -862,6 +896,8 @@ fn clone_value(field: &Field, src: &str, m: &str) -> String {
         Field::ScalarNewtype(name) => format!("{m}::{name}({src}.0)"),
         // A by-value struct: deep-copy it by value from a reference to the source.
         Field::StructValue(target) => format!("cloneval_{target}(&{src}, map)"),
+        // A by-value union: byte-copy from old layout to new (inferred types).
+        Field::OpaqueUnion(_) => format!("clone_union(&{src})"),
     }
 }
 
@@ -886,6 +922,10 @@ fn compare_stmt(field: &Field, a: &str, b: &str) -> String {
         // A by-value struct: compare by value through references to each side.
         Field::StructValue(target) => {
             format!("    if !sameval_{target}(&{a}, &{b}, corr) {{ return false; }}\n")
+        }
+        // A by-value union: compare its bytes (post-state), types inferred.
+        Field::OpaqueUnion(_) => {
+            format!("    if !same_union(&{a}, &{b}) {{ return false; }}\n")
         }
     }
 }
@@ -998,6 +1038,13 @@ fn cloner(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)], t
             // pointed to), so no two-phase linking is needed; any cycle through
             // its pointer sub-fields is resolved by `map` inside `cloneval_`.
             Field::StructValue(_) => {
+                inits += &format!(
+                    "        {name}: {},\n",
+                    clone_value(field, &format!("(*src).{name}"), new)
+                );
+            }
+            // A by-value opaque union: byte-copy it in the initializer.
+            Field::OpaqueUnion(_) => {
                 inits += &format!(
                     "        {name}: {},\n",
                     clone_value(field, &format!("(*src).{name}"), new)
@@ -1471,12 +1518,16 @@ mod tests {
     }
 
     #[test]
-    fn tagged_union_without_inferable_discriminant_is_unsupported() {
-        // No accessor matches on the tag, so the discriminant can't be inferred.
-        let src = "pub struct Obj { pub t: Tag, pub d: U }\npub union U { pub a: i32, pub b: f64 }";
-        let err = generate(&index(src), "Obj", &Default::default(), "old", "new").unwrap_err();
-        assert_eq!(err.field, "d");
-        assert!(err.detail.contains("infer"), "got: {}", err.detail);
+    fn union_without_inferable_discriminant_falls_back_to_byte_wise() {
+        // No accessor matches on the tag, so the discriminant can't be inferred;
+        // the by-value union is then built byte-wise (symbolic raw bytes),
+        // which needs no discriminant and is sound. The ordinary field is still
+        // built normally.
+        let src = "pub struct Obj { pub t: c_int, pub d: U }\npub union U { pub a: i32, pub b: f64 }";
+        let g = generate(&index(src), "Obj", &Default::default(), "old", "new").unwrap();
+        assert!(g.builder.contains("d: gen_union()"), "got: {}", g.builder);
+        assert!(g.cloner.contains("d: clone_union(&(*src).d)"), "got: {}", g.cloner);
+        assert!(g.comparer.contains("same_union(&(*a).d, &(*b).d)"), "got: {}", g.comparer);
     }
 
     #[test]

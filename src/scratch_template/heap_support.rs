@@ -341,6 +341,50 @@ pub unsafe fn same_cell<T: Bits>(a: *const T, b: *const T) -> bool {
     Bits::bits(&*a) == Bits::bits(&*b)
 }
 
+/// A union built as symbolic raw bytes -- every bit pattern, over-approximating
+/// all variants at once, so no discriminant is needed. Sound for differential
+/// equivalence: both versions get byte-identical unions (see `clone_union`), so
+/// reading any scalar variant agrees across them; reading a *pointer* variant
+/// and dereferencing it hits an arbitrary address, which Kani reports as an
+/// invalid access ("not proved"), never a false proof.
+pub unsafe fn gen_union<T: Copy>() -> T {
+    let mut u: T = core::mem::zeroed();
+    let p = &mut u as *mut T as *mut u8;
+    for i in 0..core::mem::size_of::<T>() {
+        *p.add(i) = kani::any();
+    }
+    u
+}
+
+/// A byte copy of a union from the old layout `A` into the new layout `B`. Both
+/// are the same `#[repr(C)]` union from the two crates, so their size and layout
+/// match; copying the bytes gives the new version the identical union value.
+pub unsafe fn clone_union<A: Copy, B: Copy>(src: *const A) -> B {
+    let mut dst: B = core::mem::zeroed();
+    core::ptr::copy_nonoverlapping(
+        src as *const u8,
+        &mut dst as *mut B as *mut u8,
+        core::mem::size_of::<B>().min(core::mem::size_of::<A>()),
+    );
+    dst
+}
+
+/// Whether two unions hold identical bytes (same `#[repr(C)]` layout in both
+/// crates). Compares the post-state, catching a divergent write to the union.
+pub unsafe fn same_union<A: Copy, B: Copy>(a: *const A, b: *const B) -> bool {
+    if core::mem::size_of::<A>() != core::mem::size_of::<B>() {
+        return false;
+    }
+    let pa = a as *const u8;
+    let pb = b as *const u8;
+    for i in 0..core::mem::size_of::<A>() {
+        if *pa.add(i) != *pb.add(i) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Whether two `gen_cstr` buffers hold the same bytes up to and including the
 /// first NUL. Both must be null or `gen_cstr` buffers.
 pub unsafe fn same_cstr(a: *const core::ffi::c_char, b: *const core::ffi::c_char) -> bool {
