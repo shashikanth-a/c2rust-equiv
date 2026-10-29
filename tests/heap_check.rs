@@ -1786,3 +1786,92 @@ fn alloc_hook_catches_divergence() {
     );
 }
 
+
+// ---------------------------------------------------------------------------
+// A written struct `static mut` global modelled as observable output. libxml2's
+// error path writes `static mut xmlLastError: xmlError { code, line, message*,
+// .. }`; such a global is pulled into the unit (both versions keep their own
+// copy, started from the shared initializer) and the harness compares the final
+// state field-by-field with `sameval_`. Writing it is therefore in scope, and a
+// divergent write to the error state is caught. `ERRST` stands in for xmlError:
+// scalar fields plus a message pointer (left null here, so comparable).
+const ERRST_DEF: &str =
+    "pub struct ErrSt { pub code: i32, pub line: i32, pub msg: *mut i8 }";
+const LASTERR_DEF: &str =
+    "pub static mut LASTERR: ErrSt = ErrSt { code: 0, line: 0, msg: core::ptr::null_mut() };";
+
+// Record an error: write the scalar fields of the global error state. Takes a
+// pointer so the function is on the heap path.
+const ERRG_OLD: &str = r#"
+pub unsafe fn record(p: *const i32) -> i32 {
+    if p.is_null() { return -1; }
+    let v = *p;
+    (*(&raw mut LASTERR)).code = v;
+    (*(&raw mut LASTERR)).line = v.wrapping_add(1);
+    v
+}
+"#;
+
+// Equivalent rewrite: same final error state, written in a different order.
+const ERRG_OK: &str = r#"
+pub unsafe fn record(p: *const i32) -> i32 {
+    if p.is_null() { return -1; }
+    let v = *p;
+    (*(&raw mut LASTERR)).line = v.wrapping_add(1);
+    (*(&raw mut LASTERR)).code = v;
+    v
+}
+"#;
+
+// Divergent rewrite: records a different error code (v+1), so the observable
+// error state differs even though the return value is identical.
+const ERRG_BAD: &str = r#"
+pub unsafe fn record(p: *const i32) -> i32 {
+    if p.is_null() { return -1; }
+    let v = *p;
+    (*(&raw mut LASTERR)).code = v.wrapping_add(1);
+    (*(&raw mut LASTERR)).line = v.wrapping_add(1);
+    v
+}
+"#;
+
+#[test]
+fn written_struct_global_is_in_heap_scope() {
+    // No Kani: a function that writes the struct `static mut` global is in heap
+    // scope (the write-guard does not reject it; it is compared instead).
+    let items = [ERRST_DEF, LASTERR_DEF];
+    let unit = FnUnit::parse(ERRG_OLD, &items).unwrap();
+    assert!(
+        unit.heap_body_in_scope().is_ok(),
+        "writing a modelled struct global rejected: {:?}",
+        unit.heap_body_in_scope()
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn written_struct_global_proves_equivalent_rewrite() {
+    let items = [ERRST_DEF, LASTERR_DEF];
+    let old = FnUnit::parse(ERRG_OLD, &items).unwrap();
+    let new = FnUnit::parse(ERRG_OK, &items).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(4));
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn written_struct_global_catches_divergent_error_state() {
+    let items = [ERRST_DEF, LASTERR_DEF];
+    let old = FnUnit::parse(ERRG_OLD, &items).unwrap();
+    let new = FnUnit::parse(ERRG_BAD, &items).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(4));
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent write to the global error state was proved equivalent: {:?}",
+        outcome.status
+    );
+}

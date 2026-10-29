@@ -227,10 +227,16 @@ fn extract_in(
     // unit never writes it, so each version's identical copy is read
     // identically (no final comparison is emitted for it). If the unit does
     // write one, it isn't read-only -- reject rather than risk a silent miss.
+    // A modelled struct `static mut` (e.g. `xmlLastError`) is excluded: it is
+    // compared by final state, so writing it is in scope, not a violation.
     let data_statics: BTreeSet<String> = callees
         .iter()
         .filter_map(|c| match c {
-            syn::Item::Static(s) if crate::unit::is_data_static(s, &structs, &aliases) => {
+            syn::Item::Static(s)
+                if crate::unit::is_data_static(s, &structs, &aliases)
+                    && crate::unit::modelled_struct_mut_static(s, &structs, &aliases)
+                        .is_none() =>
+            {
                 Some(s.ident.to_string())
             }
             _ => None,

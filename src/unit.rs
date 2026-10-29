@@ -351,6 +351,39 @@ pub(crate) fn is_data_static(
     !is_scalar_mut_static(s) && is_data_type(&s.ty, structs, aliases)
 }
 
+/// If `s` is a `static mut` whose type names a crate struct the heap generator
+/// can build, return that struct's name. Such a global is modelled like a
+/// scalar `static mut` -- each version keeps its own copy, started from the
+/// shared initializer, and the harness compares the final state field-by-field
+/// with `sameval_<T>` -- only generalised from a scalar to a struct. A function
+/// that *writes* it is therefore in scope, and the written state is treated as
+/// observable output: libxml2's error path writes `static mut xmlLastError:
+/// xmlError`, and comparing its final value is exactly "error reporting is
+/// observable". Sound because both versions start from the identical
+/// initializer and the field-wise comparison follows pointers (a message
+/// pointer that genuinely differs fails to prove -- a false negative, never a
+/// false proof). Unions are absent from `structs`, so an undiscriminated union
+/// global is not modelled here (its bytes need the separate byte-wise path).
+pub(crate) fn modelled_struct_mut_static(
+    s: &syn::ItemStatic,
+    structs: &BTreeMap<String, Vec<syn::Type>>,
+    aliases: &BTreeMap<String, syn::Type>,
+) -> Option<String> {
+    if !matches!(s.mutability, syn::StaticMutability::Mut(_)) {
+        return None;
+    }
+    let resolved = crate::heapgen::resolve_alias(&s.ty, aliases);
+    if let syn::Type::Path(p) = &resolved {
+        if let Some(seg) = p.path.segments.last() {
+            let n = seg.ident.to_string();
+            if structs.contains_key(&n) {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
 /// Whether `ty` is a read-only "data" type the heap path can carry as an
 /// identical per-version copy: a scalar, a raw pointer (carried by its bits, not
 /// dereferenced here), an array of such, or a struct every one of whose fields

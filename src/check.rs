@@ -299,9 +299,26 @@ pub fn heap_diagnose(unit: &FnUnit) -> Result<(), String> {
     }
     unit.heap_body_in_scope()
         .map_err(|s| format!("body: {} ({})", s.detail, s.category))?;
-    heapgen::generate_all(&index, &shapes.structs, &unit.union_tags, "old", "new")
+    let mut roots = shapes.structs.clone();
+    roots.extend(struct_global_roots(unit));
+    heapgen::generate_all(&index, &roots, &unit.union_tags, "old", "new")
         .map_err(|u| format!("generate: {} field `{}`: {}", u.struct_name, u.field, u.detail))?;
     Ok(())
+}
+
+/// The struct types of a unit's modelled `static mut` globals, which must be
+/// built and compared (`sameval_<T>`) alongside the signature's structs.
+fn struct_global_roots(unit: &FnUnit) -> std::collections::BTreeSet<String> {
+    let items = unit.items();
+    let structs = heapgen::data_struct_fields_from_items(&items);
+    let aliases = heapgen::alias_table_from_items(&items);
+    items
+        .iter()
+        .filter_map(|it| match it {
+            syn::Item::Static(s) => crate::unit::modelled_struct_mut_static(s, &structs, &aliases),
+            _ => None,
+        })
+        .collect()
 }
 
 /// A crate index over a unit's own items, so the generator can see its structs.
@@ -337,7 +354,9 @@ fn heap_plan(old: &FnUnit, new: &FnUnit) -> Option<(SigShapes, String)> {
     // put the function out of scope; the scalar path then reports the reason.
     old.heap_body_in_scope().ok()?;
     new.heap_body_in_scope().ok()?;
-    let code = heapgen::generate_all(&index, &shapes.structs, &old.union_tags, "old", "new").ok()?;
+    let mut roots = shapes.structs.clone();
+    roots.extend(struct_global_roots(old));
+    let code = heapgen::generate_all(&index, &roots, &old.union_tags, "old", "new").ok()?;
     Some((shapes, code))
 }
 

@@ -332,9 +332,32 @@ fn heap_lib_source(
              assert!(Bits::bits(&og) == Bits::bits(&ng), \"global {g} differs\"); }}\n"
         );
     }
+    // Each modelled struct `static mut` global (e.g. `xmlLastError`): both
+    // versions start from the same initializer, so their final states must
+    // agree field-by-field. The write is observable output; the comparison
+    // follows pointers under `corr`, so a diverging error message is caught.
+    let gitems = old.items();
+    let gstructs = crate::heapgen::data_struct_fields_from_items(&gitems);
+    let galiases = crate::heapgen::alias_table_from_items(&gitems);
+    let struct_globals: Vec<(String, String)> = gitems
+        .iter()
+        .filter_map(|it| match it {
+            syn::Item::Static(s) => crate::unit::modelled_struct_mut_static(s, &gstructs, &galiases)
+                .map(|t| (s.ident.to_string(), t)),
+            _ => None,
+        })
+        .collect();
+    for (g, ty) in &struct_globals {
+        arg_cmp += &format!(
+            "        {{ let og = core::ptr::addr_of!(old::{g}); \
+             let ng = core::ptr::addr_of!(new::{g}); \
+             assert!(sameval_{ty}(og, ng, &mut corr), \"global {g} differs\"); }}\n"
+        );
+    }
     // `corr` is used only by struct-pointer comparisons; a C-string-only
     // signature has none, so declaring it unconditionally would warn.
-    let needs_corr = matches!(shapes.ret, Shape::Heap(_)) || !heap_args.is_empty();
+    let needs_corr =
+        matches!(shapes.ret, Shape::Heap(_)) || !heap_args.is_empty() || !struct_globals.is_empty();
     let corr_decl = if needs_corr {
         "        let mut corr = Corr::default();\n"
     } else {
