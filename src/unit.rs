@@ -502,7 +502,10 @@ impl<'ast> Visit<'ast> for BodyChecker {
         {
             self.set(Skip::new(
                 "indirect call",
-                "calls through a function pointer",
+                format!(
+                    "calls through a function pointer: {}",
+                    quote::ToTokens::to_token_stream(&*c.func).to_string()
+                ),
             ));
         }
         syn::visit::visit_expr_call(self, c);

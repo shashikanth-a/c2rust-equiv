@@ -469,8 +469,24 @@ pub fn generate(
     old: &str,
     new: &str,
 ) -> Result<Generated, Unsupported> {
+    // Public entry: build the crate-wide struct/alias tables, then delegate.
+    // Bulk callers (`generate_all`) build those tables once and call
+    // `generate_in` per struct, avoiding a full-index rescan on every struct.
     let table = struct_table(index);
     let aliases = alias_table(index);
+    generate_in(index, struct_name, &table, &aliases, catalog, old, new)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_in(
+    index: &CrateIndex,
+    struct_name: &str,
+    table: &BTreeMap<String, StructDef>,
+    aliases: &BTreeMap<String, syn::Type>,
+    catalog: &BTreeMap<String, crate::taggedunion::TagMap>,
+    old: &str,
+    new: &str,
+) -> Result<Generated, Unsupported> {
     let def = table.get(struct_name).ok_or_else(|| Unsupported {
         struct_name: struct_name.to_owned(),
         field: String::new(),
@@ -496,7 +512,7 @@ pub fn generate(
     // which is sound without a discriminant. `referenced` is only extended on
     // the precise path, so a failed inference leaves it untouched.
     let mut tu_ref = BTreeSet::new();
-    let tagged = tagged_union(index, def, &table, &aliases, catalog, &mut tu_ref)
+    let tagged = tagged_union(index, def, table, aliases, catalog, &mut tu_ref)
         .ok()
         .flatten();
     if tagged.is_some() {
@@ -514,7 +530,7 @@ pub fn generate(
         if skip.contains(name.as_str()) {
             continue;
         }
-        match classify(ty, &table, &aliases) {
+        match classify(ty, table, aliases) {
             Ok(Field::Pointer(target)) => {
                 referenced.insert(target.clone());
                 fields.push((name.clone(), Field::Pointer(target)));
@@ -683,6 +699,10 @@ pub fn generate_all(
     old: &str,
     new: &str,
 ) -> Result<String, Unsupported> {
+    // Build the crate-wide struct/alias tables once for the whole closure,
+    // rather than rescanning the index in every `generate` call.
+    let table = struct_table(index);
+    let aliases = alias_table(index);
     let mut done = BTreeSet::new();
     let mut queue: Vec<String> = roots.iter().cloned().collect();
     let mut out = String::new();
@@ -690,7 +710,7 @@ pub fn generate_all(
         if !done.insert(name.clone()) {
             continue;
         }
-        let g = generate(index, &name, catalog, old, new)?;
+        let g = generate_in(index, &name, &table, &aliases, catalog, old, new)?;
         out.push_str(&g.builder);
         out.push('\n');
         out.push_str(&g.cloner);

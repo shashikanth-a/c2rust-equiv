@@ -2200,3 +2200,73 @@ fn many_arg_indirect_call_catches_different_argument() {
         outcome.status
     );
 }
+
+// An indirect call reached through ALIASED pointer types and a nested struct,
+// as c2rust emits SAX dispatch: `(*(*ctxt).sax).cb.expect(..)(args)` where ctxt
+// is a `CtxPtr` typedef and sax an `InnerPtr` typedef. Exercises alias
+// resolution in the indirect-call type walk.
+const ACHAIN_DEFS: &[&str] = &[
+    "pub type CtxPtr = *mut Ctx;",
+    "pub type InnerPtr = *mut Inner;",
+    "pub type cb_t = unsafe extern \"C\" fn(i64) -> i64;",
+    "#[repr(C)] pub struct Inner { pub cb: Option<cb_t>, pub pad: i64 }",
+    "#[repr(C)] pub struct Ctx { pub inner: InnerPtr, pub x: i64 }",
+];
+
+const ACHAIN_OLD: &str = r#"
+pub unsafe fn run(c: CtxPtr) -> i64 {
+    if c.is_null() || (*c).inner.is_null() { return 0; }
+    (*(*c).inner).cb.expect("non-null function pointer")((*c).x)
+}
+"#;
+
+const ACHAIN_OK: &str = r#"
+pub unsafe fn run(c: CtxPtr) -> i64 {
+    if c.is_null() || (*c).inner.is_null() { return 0; }
+    let v = (*c).x;
+    (*(*c).inner).cb.expect("non-null function pointer")(v)
+}
+"#;
+
+const ACHAIN_BAD: &str = r#"
+pub unsafe fn run(c: CtxPtr) -> i64 {
+    if c.is_null() || (*c).inner.is_null() { return 0; }
+    (*(*c).inner).cb.expect("non-null function pointer")((*c).x.wrapping_add(1))
+}
+"#;
+
+#[test]
+fn aliased_chain_indirect_call_is_in_heap_scope() {
+    let old = FnUnit::parse(ACHAIN_OLD, ACHAIN_DEFS).unwrap();
+    assert!(
+        old.heap_body_in_scope().is_ok(),
+        "an aliased-chain indirect call rejected: {:?}",
+        old.heap_body_in_scope()
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn aliased_chain_indirect_call_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(ACHAIN_OLD, ACHAIN_DEFS).unwrap();
+    let new = FnUnit::parse(ACHAIN_OK, ACHAIN_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn aliased_chain_indirect_call_catches_different_argument() {
+    let old = FnUnit::parse(ACHAIN_OLD, ACHAIN_DEFS).unwrap();
+    let new = FnUnit::parse(ACHAIN_BAD, ACHAIN_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a changed callback argument was proved equivalent: {:?}",
+        outcome.status
+    );
+}

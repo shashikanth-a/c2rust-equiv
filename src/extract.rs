@@ -862,7 +862,10 @@ impl<'ast> Visit<'ast> for Analyzer<'_> {
             {
                 self.skip.get_or_insert(Skip::new(
                     "indirect call",
-                    "calls through a function pointer",
+                    format!(
+                        "calls through a function pointer: {}",
+                        quote::ToTokens::to_token_stream(&*c.func).to_string()
+                    ),
                 ));
             }
         }

@@ -141,15 +141,20 @@ impl TypeEnv {
                 self.vars.get(&name).cloned()
             }
             syn::Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => {
-                match self.type_of(&u.expr)? {
+                // Resolve type aliases first: c2rust types context pointers as
+                // `xmlParserCtxtPtr` etc., not a bare `*mut _`, so the pointer is
+                // only visible after following the alias.
+                let inner = crate::heapgen::resolve_alias(&self.type_of(&u.expr)?, &self.aliases);
+                match inner {
                     syn::Type::Ptr(ptr) => Some((*ptr.elem).clone()),
                     _ => None,
                 }
             }
             syn::Expr::Field(f) => {
-                // The base types to a struct (possibly behind a pointer the
-                // dereference above has already stripped); look up the member.
-                let base = self.type_of(&f.base)?;
+                // The base types to a struct (possibly an alias, and possibly
+                // behind a pointer the dereference above has already stripped);
+                // resolve aliases, then look up the member.
+                let base = crate::heapgen::resolve_alias(&self.type_of(&f.base)?, &self.aliases);
                 let sname = struct_name(&base)?;
                 let member = match &f.member {
                     syn::Member::Named(id) => id.to_string(),
