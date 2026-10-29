@@ -746,6 +746,74 @@ fn mutex_noop_catches_divergence() {
     );
 }
 
+// A flexible array member typed through an alias (`data: [Ch; 0]`, `Ch = u8`),
+// libxml2's `_xmlDictStrings.array: [xmlChar; 0]` shape. The element is resolved
+// through aliases before the scalar check, so the struct builds (an empty array
+// contributes nothing); without it the whole struct -- and every function that
+// takes one -- was out of scope.
+const FAM_ALIAS: &str = "pub type Ch = u8;";
+const FAM_STRUCT: &str = "#[repr(C)] pub struct Strs { pub len: i32, pub data: [Ch; 0] }";
+
+const FAM_OLD: &str = r#"
+pub unsafe fn strs_len(s: *mut Strs) -> i32 {
+    if s.is_null() { return -1; }
+    (*s).len
+}
+"#;
+
+const FAM_OK: &str = r#"
+pub unsafe fn strs_len(s: *mut Strs) -> i32 {
+    if s.is_null() { return -1; }
+    let n = (*s).len;
+    n
+}
+"#;
+
+const FAM_BAD: &str = r#"
+pub unsafe fn strs_len(s: *mut Strs) -> i32 {
+    if s.is_null() { return -1; }
+    (*s).len ^ 1
+}
+"#;
+
+#[test]
+fn flexible_array_member_is_in_heap_scope() {
+    // No Kani: the struct with a `[Ch; 0]` flexible array member builds rather
+    // than being rejected as an array of a non-scalar element.
+    let unit = FnUnit::parse(FAM_OLD, &[FAM_ALIAS, FAM_STRUCT]).unwrap();
+    assert!(
+        c2rust_equiv::heap_diagnose(&unit).is_ok(),
+        "flexible array member rejected: {:?}",
+        c2rust_equiv::heap_diagnose(&unit)
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn flexible_array_member_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(FAM_OLD, &[FAM_ALIAS, FAM_STRUCT]).unwrap();
+    let new = FnUnit::parse(FAM_OK, &[FAM_ALIAS, FAM_STRUCT]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn flexible_array_member_catches_divergence() {
+    let old = FnUnit::parse(FAM_OLD, &[FAM_ALIAS, FAM_STRUCT]).unwrap();
+    let new = FnUnit::parse(FAM_BAD, &[FAM_ALIAS, FAM_STRUCT]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent result was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 // A `*mut c_char` output buffer: uppercase the first byte in place. The heap
 // path compares the buffer's post-state, so a divergent write is caught.
 const OUTBUF_OLD: &str = r#"

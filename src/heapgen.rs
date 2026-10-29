@@ -313,9 +313,12 @@ fn classify(
         }
         return Err("pointer to a non-struct type".to_owned());
     }
-    // A fixed-size array of a scalar.
+    // A fixed-size array of a scalar. The element is resolved through aliases
+    // first, so c2rust's typedef'd scalars count -- e.g. a flexible array member
+    // `array: [xmlChar; 0]` (`xmlChar = c_uchar`), which otherwise reads as a
+    // non-scalar element and blocks every struct that ends in one.
     if let syn::Type::Array(arr) = ty {
-        if let Some(name) = last_segment(&arr.elem) {
+        if let Some(name) = last_segment(&resolve_alias(&arr.elem, aliases)) {
             if scalar::primitive(&name).is_some()
                 || scalar::c_type(&name).is_some()
                 || scalar::libc_typedef(&name).is_some()
