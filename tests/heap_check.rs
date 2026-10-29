@@ -1875,3 +1875,108 @@ fn written_struct_global_catches_divergent_error_state() {
         outcome.status
     );
 }
+
+// ---------------------------------------------------------------------------
+// __xmlRaiseError modelled as an observable trace call. libxml2's central error
+// primitive is variadic; each call site is rewritten into trace events, so both
+// versions are equivalent exactly when they report the same errors. The leading
+// handler/context pointers are compared by correspondence, the `level` newtype
+// by its inner scalar, the rest (and the format args) by content/value. Sound
+// as stateless because nothing in scope reads the error state it writes (the
+// `__xmlLastError()` accessor stays out of scope).
+const RAISE_DEFS: &[&str] = &[
+    "pub struct xmlErrorLevel(pub u32);",
+    "pub type xmlStructuredErrorFunc = Option<unsafe extern \"C\" fn()>;",
+    "pub type xmlGenericErrorFunc = Option<unsafe extern \"C\" fn()>;",
+    "extern \"C\" { pub fn __xmlRaiseError(\
+        schannel: xmlStructuredErrorFunc, channel: xmlGenericErrorFunc, \
+        data: *mut core::ffi::c_void, ctx: *mut core::ffi::c_void, \
+        node: *mut core::ffi::c_void, domain: core::ffi::c_int, \
+        code: core::ffi::c_int, level: xmlErrorLevel, \
+        file: *const core::ffi::c_char, line: core::ffi::c_int, \
+        str1: *const core::ffi::c_char, str2: *const core::ffi::c_char, \
+        str3: *const core::ffi::c_char, int1: core::ffi::c_int, \
+        col: core::ffi::c_int, msg: *const core::ffi::c_char, ...); }",
+];
+
+const RAISE_OLD: &str = r#"
+pub unsafe fn report(p: *const i32) -> i32 {
+    if p.is_null() { return -1; }
+    let v = *p;
+    __xmlRaiseError(None, None, core::ptr::null_mut(), core::ptr::null_mut(),
+        core::ptr::null_mut(), 1 as core::ffi::c_int, 100 as core::ffi::c_int,
+        xmlErrorLevel(2), core::ptr::null::<core::ffi::c_char>(), 0 as core::ffi::c_int,
+        core::ptr::null::<core::ffi::c_char>(), core::ptr::null::<core::ffi::c_char>(), core::ptr::null::<core::ffi::c_char>(),
+        0 as core::ffi::c_int, 0 as core::ffi::c_int,
+        b"e\0".as_ptr() as *const core::ffi::c_char);
+    v
+}
+"#;
+
+// Equivalent rewrite: a harmless extra binding; same error reported, same return.
+const RAISE_OK: &str = r#"
+pub unsafe fn report(p: *const i32) -> i32 {
+    if p.is_null() { return -1; }
+    let v = *p;
+    let _scratch = v.wrapping_mul(2);
+    __xmlRaiseError(None, None, core::ptr::null_mut(), core::ptr::null_mut(),
+        core::ptr::null_mut(), 1 as core::ffi::c_int, 100 as core::ffi::c_int,
+        xmlErrorLevel(2), core::ptr::null::<core::ffi::c_char>(), 0 as core::ffi::c_int,
+        core::ptr::null::<core::ffi::c_char>(), core::ptr::null::<core::ffi::c_char>(), core::ptr::null::<core::ffi::c_char>(),
+        0 as core::ffi::c_int, 0 as core::ffi::c_int,
+        b"e\0".as_ptr() as *const core::ffi::c_char);
+    v
+}
+"#;
+
+// Divergent rewrite: reports a different error code (101 vs 100) -- an
+// observably different error, which the trace must catch.
+const RAISE_BAD: &str = r#"
+pub unsafe fn report(p: *const i32) -> i32 {
+    if p.is_null() { return -1; }
+    let v = *p;
+    __xmlRaiseError(None, None, core::ptr::null_mut(), core::ptr::null_mut(),
+        core::ptr::null_mut(), 1 as core::ffi::c_int, 101 as core::ffi::c_int,
+        xmlErrorLevel(2), core::ptr::null::<core::ffi::c_char>(), 0 as core::ffi::c_int,
+        core::ptr::null::<core::ffi::c_char>(), core::ptr::null::<core::ffi::c_char>(), core::ptr::null::<core::ffi::c_char>(),
+        0 as core::ffi::c_int, 0 as core::ffi::c_int,
+        b"e\0".as_ptr() as *const core::ffi::c_char);
+    v
+}
+"#;
+
+#[test]
+fn raise_error_is_in_heap_scope() {
+    let old = FnUnit::parse(RAISE_OLD, RAISE_DEFS).unwrap();
+    assert!(
+        old.heap_body_in_scope().is_ok(),
+        "a __xmlRaiseError call rejected: {:?}",
+        old.heap_body_in_scope()
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn raise_error_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(RAISE_OLD, RAISE_DEFS).unwrap();
+    let new = FnUnit::parse(RAISE_OK, RAISE_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn raise_error_catches_divergent_error_report() {
+    let old = FnUnit::parse(RAISE_OLD, RAISE_DEFS).unwrap();
+    let new = FnUnit::parse(RAISE_BAD, RAISE_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent error report was proved equivalent: {:?}",
+        outcome.status
+    );
+}

@@ -564,10 +564,14 @@ impl Resolver<'_> {
                     {
                         Res::Item(e)
                     }
-                    // A modelled variadic I/O call (`printf`, …) is kept as a
-                    // bare call and rewritten into trace events later; its
-                    // (variadic) declaration isn't pulled in.
-                    [] if self.heap && crate::varmodel::is_variadic_modelled(&entry.name) => {
+                    // A modelled variadic I/O call (`printf`, …) or the error
+                    // primitive `__xmlRaiseError` is kept as a bare call and
+                    // rewritten into trace events later; its (variadic)
+                    // declaration isn't pulled in.
+                    [] if self.heap
+                        && (crate::varmodel::is_variadic_modelled(&entry.name)
+                            || crate::errormodel::is_error_fn(&entry.name)) =>
+                    {
                         Res::External(None)
                     }
                     [] => Res::Skip(Skip::new(
