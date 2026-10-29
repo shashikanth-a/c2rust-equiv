@@ -63,6 +63,109 @@ pub fn is_error_fn(name: &str) -> bool {
     spec(name).is_some()
 }
 
+/// The thread-local accessors that return a *registered handler* function
+/// pointer, which c2rust dispatches as `(*__A()).expect("..")(args)`. Each maps
+/// to the trace key (the handler's own name, stable across both versions) and
+/// the argument [`Spec`]. The global the accessor returns is a function pointer
+/// we never build: the dispatch is modelled directly as an observable trace
+/// call keyed by the handler name -- the same observational-equivalence stance
+/// as [`is_error_fn`] -- so the accessor and its fn-ptr global drop out of the
+/// unit entirely (the extractor skip-descends the accessor call, and this
+/// rewrite erases every use of it). `xmlGenericError` has the generic-error
+/// printer shape (`ctx: *mut c_void`, then a `printf` format tail); the
+/// register-node hooks take one node pointer. All return `()`.
+fn handler(accessor: &str) -> Option<(&'static str, Spec)> {
+    Some(match accessor {
+        "__xmlGenericError" => ("xmlGenericError", Spec { fnptr: 0, ptr_end: 1, level: None }),
+        "__xmlStructuredError" => {
+            ("xmlStructuredError", Spec { fnptr: 0, ptr_end: 2, level: None })
+        }
+        "__xmlRegisterNodeDefaultValue" => {
+            ("xmlRegisterNodeDefaultValue", Spec { fnptr: 0, ptr_end: 1, level: None })
+        }
+        "__xmlDeregisterNodeDefaultValue" => {
+            ("xmlDeregisterNodeDefaultValue", Spec { fnptr: 0, ptr_end: 1, level: None })
+        }
+        _ => return None,
+    })
+}
+
+/// Whether `name` is a modelled handler accessor (see [`handler`]).
+pub fn is_handler_accessor(name: &str) -> bool {
+    handler(name).is_some()
+}
+
+/// Peel `Paren`/`Group` wrappers off an expression.
+fn unwrap_group(mut e: &syn::Expr) -> &syn::Expr {
+    loop {
+        e = match e {
+            syn::Expr::Paren(p) => &p.expr,
+            syn::Expr::Group(g) => &g.expr,
+            _ => return e,
+        };
+    }
+}
+
+/// If `e` is a bare call `__A()` (no arguments) to a modelled handler accessor,
+/// that accessor's name.
+fn accessor_call_name(e: &syn::Expr) -> Option<String> {
+    let syn::Expr::Call(c) = unwrap_group(e) else {
+        return None;
+    };
+    if !c.args.is_empty() {
+        return None;
+    }
+    let syn::Expr::Path(p) = &*c.func else {
+        return None;
+    };
+    let name = p.path.segments.last()?.ident.to_string();
+    is_handler_accessor(&name).then_some(name)
+}
+
+/// If `e` is `(*__A())` -- a dereference of a handler-accessor call -- that
+/// accessor's name.
+fn deref_accessor_name(e: &syn::Expr) -> Option<String> {
+    let syn::Expr::Unary(u) = unwrap_group(e) else {
+        return None;
+    };
+    if !matches!(u.op, syn::UnOp::Deref(_)) {
+        return None;
+    }
+    accessor_call_name(&u.expr)
+}
+
+/// If `call` is a handler dispatch `(*__A()).expect("..")(args)` or
+/// `.unwrap()(args)` for a modelled handler accessor `__A`, that accessor's
+/// name.
+fn handler_dispatch_name(call: &syn::ExprCall) -> Option<String> {
+    let syn::Expr::MethodCall(mc) = &*call.func else {
+        return None;
+    };
+    if mc.method != "expect" && mc.method != "unwrap" {
+        return None;
+    }
+    deref_accessor_name(&mc.receiver)
+}
+
+/// Whether `call` is a handler dispatch (see [`handler_dispatch_name`]). The
+/// eligibility gate admits such a call (it is modelled, not a general indirect
+/// call), and this rewrite replaces it.
+pub fn is_handler_dispatch(call: &syn::ExprCall) -> bool {
+    handler_dispatch_name(call).is_some()
+}
+
+/// Whether `call` is a bare handler-accessor call `__A()`. The extractor
+/// skip-descends it so the accessor and its fn-ptr global are never pulled into
+/// the unit -- this rewrite erases every use of `__A()` (the dispatch and the
+/// `.is_some()`/`.is_none()` guards), so nothing references it in the scratch.
+pub fn is_handler_accessor_call(call: &syn::ExprCall) -> bool {
+    if !call.args.is_empty() {
+        return false;
+    }
+    matches!(&*call.func, syn::Expr::Path(p)
+        if p.path.segments.last().is_some_and(|s| is_handler_accessor(&s.ident.to_string())))
+}
+
 /// Whether an argument expression is a bare `None` (no type context), which
 /// must be recorded as the null pointer word rather than transmuted.
 fn is_none(arg: &syn::Expr) -> bool {
@@ -94,15 +197,41 @@ impl VisitMut for Rewrite {
     fn visit_expr_mut(&mut self, e: &mut syn::Expr) {
         // Rewrite inner expressions first (arguments may themselves be calls).
         syn::visit_mut::visit_expr_mut(self, e);
-        let syn::Expr::Call(call) = e else { return };
-        let syn::Expr::Path(p) = &*call.func else { return };
-        let Some(name) = p.path.segments.last().map(|s| s.ident.to_string()) else {
-            return;
-        };
-        if p.path.segments.len() != 1 || !is_error_fn(&name) {
-            return;
+        match e {
+            // A direct call to a modelled error external, or an accessor-
+            // dispatched registered handler `(*__A()).expect("..")(args)`.
+            syn::Expr::Call(call) => {
+                if let syn::Expr::Path(p) = &*call.func {
+                    if p.path.segments.len() == 1 {
+                        let name = p.path.segments[0].ident.to_string();
+                        if let Some(sp) = spec(&name) {
+                            *e = syn::parse_str(&block(&name, &sp, &call.args))
+                                .expect("error trace block parses");
+                            return;
+                        }
+                    }
+                }
+                if let Some(accessor) = handler_dispatch_name(call) {
+                    let (key, sp) = handler(&accessor).expect("handler accessor");
+                    *e = syn::parse_str(&block(key, &sp, &call.args))
+                        .expect("handler trace block parses");
+                }
+            }
+            // A handler presence guard `(*__A()).is_some()` / `.is_none()`:
+            // the handler is modelled as registered, so these fold to the
+            // constant, erasing the last reference to the accessor. A dead
+            // guarded dispatch (e.g. the register-node hooks, gated by the
+            // default-zero `__xmlRegisterCallbacks`) stays dead; a live one is
+            // traced -- either way sound.
+            syn::Expr::MethodCall(mc)
+                if (mc.method == "is_some" || mc.method == "is_none")
+                    && deref_accessor_name(&mc.receiver).is_some() =>
+            {
+                let v = if mc.method == "is_some" { "true" } else { "false" };
+                *e = syn::parse_str(v).expect("bool literal parses");
+            }
+            _ => {}
         }
-        *e = syn::parse_str(&block(&name, &call.args)).expect("error trace block parses");
     }
 }
 
@@ -111,9 +240,9 @@ impl VisitMut for Rewrite {
 /// the rest by [`TraceArg`]), and yield unit (the call returns `()`).
 fn block(
     name: &str,
+    sp: &Spec,
     args: &syn::punctuated::Punctuated<syn::Expr, syn::token::Comma>,
 ) -> String {
-    let sp = spec(name).expect("modelled error fn");
     let call_id = id(name);
     let mut binds = String::new();
     let mut steps = String::new();
@@ -131,10 +260,13 @@ fn block(
                 binds += &format!("let __a{i} = {};\n", arg.to_token_stream());
                 format!("core::mem::transmute::<_, usize>(__a{i}) as u128")
             } else {
-                // A `*mut c_void` context pointer: annotate so an untyped
-                // `null_mut()` or a cast coerces, then take its address word.
+                // A context/handle pointer: cast to `*mut c_void` so an untyped
+                // `null_mut()`, a `*mut c_void`, or a typed pointer (e.g. a
+                // register-node hook's `xmlNodePtr`) all coerce, then take its
+                // address word. Compared by correspondence, so the exact pointee
+                // type is irrelevant.
                 binds += &format!(
-                    "let __a{i}: *mut core::ffi::c_void = {};\n",
+                    "let __a{i}: *mut core::ffi::c_void = ({}) as *mut core::ffi::c_void;\n",
                     arg.to_token_stream()
                 );
                 format!("__a{i} as usize as u128")

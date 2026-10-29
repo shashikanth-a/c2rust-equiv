@@ -489,6 +489,12 @@ impl<'ast> Visit<'ast> for BodyChecker {
         if self.allow_pointers && crate::mutexmodel::is_mutex_call(c) {
             return;
         }
+        // A thread-local handler accessor call (`__xmlGenericError()` etc.) is
+        // erased by the scratch rewrite (see `crate::errormodel`); skip-descend
+        // it so its out-of-scope fn-pointer global is not required in the unit.
+        if self.allow_pointers && crate::errormodel::is_handler_accessor_call(c) {
+            return;
+        }
         // A direct call names a function by path (`foo(...)`). Any other callee
         // expression is an indirect call through a function pointer (e.g. a
         // struct field `((*x).cb)(...)`), whose target is a symbolic address we
@@ -499,6 +505,7 @@ impl<'ast> Visit<'ast> for BodyChecker {
             && crate::indirectmodel::is_indirect(c)
             && !self.type_env.indirect_is_modellable(c)
             && !crate::allocmodel::is_alloc_hook_call(c)
+            && !crate::errormodel::is_handler_dispatch(c)
         {
             self.set(Skip::new(
                 "indirect call",

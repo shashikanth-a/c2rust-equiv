@@ -837,6 +837,15 @@ impl<'ast> Visit<'ast> for Analyzer<'_> {
         if self.resolver.heap && crate::mutexmodel::is_mutex_call(c) {
             return;
         }
+        // A thread-local handler accessor `__xmlGenericError()` etc. is erased by
+        // the scratch rewrite (the dispatch through it becomes an observable
+        // trace call keyed by the handler name; see `crate::errormodel`), so
+        // skip-descend it: the accessor and its out-of-scope fn-pointer global
+        // never enter the unit. Catches the accessor wherever it appears -- the
+        // dispatch receiver and the `.is_some()`/`.is_none()` guards alike.
+        if self.resolver.heap && crate::errormodel::is_handler_accessor_call(c) {
+            return;
+        }
         // An indirect call -- through a function pointer held in a local (c2rust
         // emits `if let Some(cb) = (*x).field { cb(..) }`) or any non-path callee
         // -- targets a symbolic address on the heap path and can't be modelled
@@ -859,6 +868,7 @@ impl<'ast> Visit<'ast> for Analyzer<'_> {
             if indirect
                 && !self.type_env.indirect_is_modellable(c)
                 && !crate::allocmodel::is_alloc_hook_call(c)
+                && !crate::errormodel::is_handler_dispatch(c)
             {
                 self.skip.get_or_insert(Skip::new(
                     "indirect call",

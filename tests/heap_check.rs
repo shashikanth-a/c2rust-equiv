@@ -2057,6 +2057,150 @@ fn ctx_printer_catches_divergent_message() {
 }
 
 // ---------------------------------------------------------------------------
+// A c2rust registered-handler dispatch through a thread-local accessor:
+// `(*__xmlGenericError()).expect("..")(ctx, fmt, args)`. The accessor returns a
+// function-pointer global we never build; the dispatch is modelled as an
+// observable trace call keyed by the handler name (errormodel), and the
+// accessor + its fn-ptr global drop out of the unit entirely. The context
+// pointer is compared by correspondence, the format tail by content, so a
+// different reported value is a divergent error report and is caught.
+const HDISP_DEFS: &[&str] = &[];
+
+const HDISP_OLD: &str = r#"
+pub unsafe fn report(p: *const i32) -> i32 {
+    if p.is_null() { return -1; }
+    let x = *p;
+    (*__xmlGenericError()).expect("non-null function pointer")(
+        core::ptr::null_mut(),
+        b"%d\0".as_ptr() as *const core::ffi::c_char,
+        x,
+    );
+    x
+}
+"#;
+
+// Equivalent: an inert local binding, same reported value and return.
+const HDISP_OK: &str = r#"
+pub unsafe fn report(p: *const i32) -> i32 {
+    if p.is_null() { return -1; }
+    let x = *p;
+    let _t = x;
+    (*__xmlGenericError()).expect("non-null function pointer")(
+        core::ptr::null_mut(),
+        b"%d\0".as_ptr() as *const core::ffi::c_char,
+        x,
+    );
+    x
+}
+"#;
+
+// Divergent: reports `x + 1` through the handler though it still returns `x`,
+// so only the observable trace distinguishes the two.
+const HDISP_BAD: &str = r#"
+pub unsafe fn report(p: *const i32) -> i32 {
+    if p.is_null() { return -1; }
+    let x = *p;
+    (*__xmlGenericError()).expect("non-null function pointer")(
+        core::ptr::null_mut(),
+        b"%d\0".as_ptr() as *const core::ffi::c_char,
+        x + 1,
+    );
+    x
+}
+"#;
+
+#[test]
+fn handler_dispatch_is_in_heap_scope() {
+    let old = FnUnit::parse(HDISP_OLD, HDISP_DEFS).unwrap();
+    assert!(
+        old.heap_body_in_scope().is_ok(),
+        "a handler dispatch was rejected: {:?}",
+        old.heap_body_in_scope()
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn handler_dispatch_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(HDISP_OLD, HDISP_DEFS).unwrap();
+    let new = FnUnit::parse(HDISP_OK, HDISP_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn handler_dispatch_catches_divergent_report() {
+    let old = FnUnit::parse(HDISP_OLD, HDISP_DEFS).unwrap();
+    let new = FnUnit::parse(HDISP_BAD, HDISP_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent handler report was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
+// The guarded register-node hook c2rust emits in every node constructor:
+// `if __xmlRegisterCallbacks != 0 && (*__X()).is_some() { (*__X()).expect(..)(node); }`.
+// The accessor is erased and the `.is_some()` guard folds to `true`, while the
+// default-zero `__xmlRegisterCallbacks` keeps the branch dead -- so both
+// versions skip the callback identically and the node constructor proves. The
+// node-pointer argument (not a `*mut c_void`) must still compile in the dead
+// branch, exercising the handle-pointer cast.
+const REGHOOK_DEFS: &[&str] = &["static mut __xmlRegisterCallbacks: i32 = 0;"];
+
+const REGHOOK_OLD: &str = r#"
+pub unsafe fn mk(p: *mut core::ffi::c_void) -> i32 {
+    if p.is_null() { return -1; }
+    let node = p;
+    if __xmlRegisterCallbacks != 0 && (*__xmlRegisterNodeDefaultValue()).is_some() {
+        (*__xmlRegisterNodeDefaultValue()).expect("non-null function pointer")(node);
+    }
+    0
+}
+"#;
+
+const REGHOOK_OK: &str = r#"
+pub unsafe fn mk(p: *mut core::ffi::c_void) -> i32 {
+    if p.is_null() { return -1; }
+    let node = p;
+    let _n = node;
+    if __xmlRegisterCallbacks != 0 && (*__xmlRegisterNodeDefaultValue()).is_some() {
+        (*__xmlRegisterNodeDefaultValue()).expect("non-null function pointer")(node);
+    }
+    0
+}
+"#;
+
+#[test]
+fn register_hook_is_in_heap_scope() {
+    let old = FnUnit::parse(REGHOOK_OLD, REGHOOK_DEFS).unwrap();
+    assert!(
+        old.heap_body_in_scope().is_ok(),
+        "a register-node hook was rejected: {:?}",
+        old.heap_body_in_scope()
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn register_hook_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(REGHOOK_OLD, REGHOOK_DEFS).unwrap();
+    let new = FnUnit::parse(REGHOOK_OK, REGHOOK_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+// ---------------------------------------------------------------------------
 // A c2rust thread-local global accessor `__X() -> *mut T` modelled as its
 // main-thread branch `&raw mut X`. A function reads/writes the global through
 // the accessor; after the rewrite the accessor's per-thread indirection is
