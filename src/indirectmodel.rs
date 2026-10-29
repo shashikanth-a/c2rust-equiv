@@ -175,7 +175,9 @@ fn struct_name(ty: &syn::Type) -> Option<String> {
 /// no `-> !`, and every argument a scalar/float or pointer. Returns the
 /// per-argument kind tags and the return-type text on success.
 fn modellable_sig(f: &syn::TypeBareFn) -> Option<(Vec<u8>, String)> {
-    if f.variadic.is_some() || f.inputs.len() > 3 {
+    // Each argument is recorded as its own trace event, so any arity works; cap
+    // it only to bound trace usage (the widest SAX callback takes eight).
+    if f.variadic.is_some() || f.inputs.len() > 16 {
         return None;
     }
     if let syn::ReturnType::Type(_, t) = &f.output {
@@ -289,16 +291,6 @@ fn option_bare_fn(
 /// The replacement expression for a modellable indirect call: record the call
 /// in the shared trace keyed by the callback value, and rebuild the result.
 fn replacement(plan: &CallPlan) -> syn::Expr {
-    let mut slots = [
-        "0u128".to_owned(),
-        "0u128".to_owned(),
-        "0u128".to_owned(),
-    ];
-    let mut kinds = [3u8, 3, 3];
-    for (i, arg) in plan.args.iter().enumerate() {
-        slots[i] = arg_bits(arg, plan.arg_kinds[i]);
-        kinds[i] = plan.arg_kinds[i];
-    }
     // The callback value is the call id. Take it from the `Option<fn>` receiver
     // with `map_or` -- a null callback maps to 0 and never panics (c2rust's
     // `.expect(..)` would panic, which Kani can't classify; both versions model
@@ -307,19 +299,29 @@ fn replacement(plan: &CallPlan) -> syn::Expr {
     let recv = plan.callee.to_token_stream();
     let salt = oracle_id("<indirect>");
     let token = format!("(({recv}).map_or(0usize, |f| f as usize) as u64 ^ {salt}u64)");
-    let step = format!(
-        "(*core::ptr::addr_of_mut!(crate::support::TRACE)).step({token}, [{}, {}, {}], [{}u8, {}u8, {}u8])",
-        slots[0], slots[1], slots[2], kinds[0], kinds[1], kinds[2]
-    );
+    // Record each argument as its own trace event (one slot per step), so the
+    // call's arity is unbounded; both versions replay the same events in order.
+    let mut body =
+        format!("let __t = core::ptr::addr_of_mut!(crate::support::TRACE); let __id = {token};");
+    for (i, arg) in plan.args.iter().enumerate() {
+        let bits = arg_bits(arg, plan.arg_kinds[i]);
+        let kind = plan.arg_kinds[i];
+        body += &format!("(*__t).step(__id, [{bits}, 0, 0], [{kind}u8, 3u8, 3u8]);");
+    }
+    // A final event carries the call's symbolic result (distinct id so it is
+    // never confused with an argument event).
+    let ret_salt = oracle_id("<indirect-ret>");
+    let step = format!("(*__t).step(__id ^ {ret_salt}u64, [0, 0, 0], [3u8, 3u8, 3u8])");
     let ret = plan.ret.trim();
-    let expr = match float_width(ret) {
+    let tail = match float_width(ret) {
         Some(32) => format!("f32::from_bits({step} as u32) as {ret}"),
         Some(_) => format!("f64::from_bits({step} as u64) as {ret}"),
-        None if ret == "()" => format!("{{ let _ = {step}; }}"),
+        None if ret == "()" => format!("let _ = {step};"),
         None if ret.starts_with('*') => format!("{step} as usize as {ret}"),
         None => format!("{step} as {ret}"),
     };
-    syn::parse_str(&format!("unsafe {{ {expr} }}")).expect("generated indirect-call expr parses")
+    syn::parse_str(&format!("unsafe {{ {body} {tail} }}"))
+        .expect("generated indirect-call expr parses")
 }
 
 /// Whether every indirect call in `f`'s body is modellable by this rewrite.
@@ -440,12 +442,14 @@ mod tests {
     }
 
     #[test]
-    fn too_many_args_is_not_modellable() {
+    fn many_args_are_modellable() {
+        // Each argument is its own trace event, so arity beyond three is fine
+        // (a SAX callback like `startElementNs` takes eight).
         let src = r#"
-            struct s { cb: Option<unsafe extern "C" fn(i32, i32, i32, i32) -> i32> }
-            unsafe fn f(p: *mut s) -> i32 { (*p).cb.expect("x")(1, 2, 3, 4) }
+            struct s { cb: Option<unsafe extern "C" fn(i32, i32, i32, i32, i32) -> i32> }
+            unsafe fn f(p: *mut s) -> i32 { (*p).cb.expect("x")(1, 2, 3, 4, 5) }
         "#;
-        assert!(!all_indirect_calls_modellable_in(src, "f"));
+        assert!(all_indirect_calls_modellable_in(src, "f"));
     }
 
     #[test]

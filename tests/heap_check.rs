@@ -2133,3 +2133,70 @@ fn accessor_global_catches_divergent_write() {
         outcome.status
     );
 }
+
+// A many-argument indirect call (>3 args), as wide SAX callbacks are
+// (startElementNs takes eight). Each argument is its own trace event, so arity
+// is unbounded: both versions agree when they call the same callback with the
+// same arguments, and any changed argument is caught.
+const IC5_DEFS: &[&str] = &[
+    "pub type cb5_t = unsafe extern \"C\" fn(i64, i64, i64, i64, i64) -> i64;",
+    "#[repr(C)] pub struct S5 { pub cb: Option<cb5_t>, pub x: i64 }",
+];
+
+const IC5_OLD: &str = r#"
+pub unsafe fn run5(s: *mut S5) -> i64 {
+    if s.is_null() { return 0; }
+    (*s).cb.expect("non-null")((*s).x, 1, 2, 3, 4)
+}
+"#;
+
+const IC5_OK: &str = r#"
+pub unsafe fn run5(s: *mut S5) -> i64 {
+    if s.is_null() { return 0; }
+    let v = (*s).x;
+    (*s).cb.expect("non-null")(v, 1, 2, 3, 4)
+}
+"#;
+
+const IC5_BAD: &str = r#"
+pub unsafe fn run5(s: *mut S5) -> i64 {
+    if s.is_null() { return 0; }
+    (*s).cb.expect("non-null")((*s).x, 1, 2, 3, 5)
+}
+"#;
+
+#[test]
+fn many_arg_indirect_call_is_in_heap_scope() {
+    let old = FnUnit::parse(IC5_OLD, IC5_DEFS).unwrap();
+    assert!(
+        old.heap_body_in_scope().is_ok(),
+        "a 5-argument indirect call rejected: {:?}",
+        old.heap_body_in_scope()
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn many_arg_indirect_call_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(IC5_OLD, IC5_DEFS).unwrap();
+    let new = FnUnit::parse(IC5_OK, IC5_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn many_arg_indirect_call_catches_different_argument() {
+    let old = FnUnit::parse(IC5_OLD, IC5_DEFS).unwrap();
+    let new = FnUnit::parse(IC5_BAD, IC5_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a changed callback argument was proved equivalent: {:?}",
+        outcome.status
+    );
+}
