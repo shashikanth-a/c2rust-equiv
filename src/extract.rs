@@ -152,15 +152,25 @@ fn extract_in(
         if let syn::Item::Fn(f) = item {
             type_env.with_fn(f);
         }
+        // A thread-local global accessor is analysed as its main-thread branch
+        // (`&raw mut X`), not its out-of-scope per-thread indirection, so the
+        // global `X` enters the closure and the accessor is in scope. The
+        // kept item is rewritten to match when the unit is assembled below.
+        let rewritten = if heap {
+            crate::globalaccessmodel::rewritten(item)
+        } else {
+            None
+        };
+        let analysed = rewritten.as_ref().unwrap_or(item);
         let mut analyzer = Analyzer {
             resolver: &resolver,
             module: index.entries[e].module,
-            locals: locals(item, &resolver, index.entries[e].module),
+            locals: locals(analysed, &resolver, index.entries[e].module),
             found: vec![],
             skip: None,
             type_env,
         };
-        analyzer.visit_item(item);
+        analyzer.visit_item(analysed);
         if let Some(skip) = analyzer.skip {
             return Err(skip);
         }
@@ -220,6 +230,22 @@ fn extract_in(
         inliner.visit_item_fn_mut(&mut function);
         for c in &mut callees {
             inliner.visit_item_mut(c);
+        }
+        // Rewrite thread-local accessors to their main-thread branch, matching
+        // the clone analysed during closure building.
+        if let Some(g) = crate::globalaccessmodel::accessor_global_fn(&function) {
+            function.block = syn::parse_quote!({
+                return &raw mut #g;
+            });
+        }
+        crate::globalaccessmodel::rewrite(&mut callees);
+        // A unit that both reports an error (stateless in the trace model) and
+        // reads `xmlLastError` would observe stale error state -- out of scope.
+        if crate::globalaccessmodel::reporter_and_lasterror(&function, &callees) {
+            return Err(Skip::new(
+                "global",
+                "reads `xmlLastError` after a modelled error report".to_owned(),
+            ));
         }
     }
 

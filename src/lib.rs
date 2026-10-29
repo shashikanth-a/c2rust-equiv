@@ -26,6 +26,7 @@ mod varmodel;
 mod indirectmodel;
 mod mutexmodel;
 mod errormodel;
+mod globalaccessmodel;
 pub mod unit;
 
 pub use check::{check, heap_diagnose, heap_eligible, Method, Options, Outcome, Status};

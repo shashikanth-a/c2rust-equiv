@@ -2055,3 +2055,81 @@ fn ctx_printer_catches_divergent_message() {
         outcome.status
     );
 }
+
+// ---------------------------------------------------------------------------
+// A c2rust thread-local global accessor `__X() -> *mut T` modelled as its
+// main-thread branch `&raw mut X`. A function reads/writes the global through
+// the accessor; after the rewrite the accessor's per-thread indirection is
+// gone and `X` is an ordinary modelled global, compared by final state.
+const ACC_DEFS: &[&str] = &[
+    "static mut CFG: i32 = 0;",
+    "pub unsafe extern \"C\" fn xmlIsMainThread() -> i32 { 1 }",
+    "pub unsafe extern \"C\" fn __CFG() -> *mut i32 { \
+        if xmlIsMainThread() != 0 { return &raw mut CFG; } else { return &raw mut CFG; } }",
+];
+
+const ACC_OLD: &str = r#"
+pub unsafe fn setcfg(p: *const i32) -> i32 {
+    if p.is_null() { return -1; }
+    let g = __CFG();
+    *g = *p;
+    *g
+}
+"#;
+
+// Equivalent rewrite: same final global state, via a harmless temporary.
+const ACC_OK: &str = r#"
+pub unsafe fn setcfg(p: *const i32) -> i32 {
+    if p.is_null() { return -1; }
+    let v = *p;
+    let g = __CFG();
+    *g = v;
+    *g
+}
+"#;
+
+// Divergent rewrite: writes a different value to the global.
+const ACC_BAD: &str = r#"
+pub unsafe fn setcfg(p: *const i32) -> i32 {
+    if p.is_null() { return -1; }
+    let g = __CFG();
+    *g = (*p).wrapping_add(1);
+    *g
+}
+"#;
+
+#[test]
+fn accessor_global_is_in_heap_scope() {
+    let old = FnUnit::parse(ACC_OLD, ACC_DEFS).unwrap();
+    assert!(
+        old.heap_body_in_scope().is_ok(),
+        "a thread-local accessor use rejected: {:?}",
+        old.heap_body_in_scope()
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn accessor_global_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(ACC_OLD, ACC_DEFS).unwrap();
+    let new = FnUnit::parse(ACC_OK, ACC_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(4));
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn accessor_global_catches_divergent_write() {
+    let old = FnUnit::parse(ACC_OLD, ACC_DEFS).unwrap();
+    let new = FnUnit::parse(ACC_BAD, ACC_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(4));
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent global write was proved equivalent: {:?}",
+        outcome.status
+    );
+}
