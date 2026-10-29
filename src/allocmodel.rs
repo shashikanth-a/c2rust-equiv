@@ -14,12 +14,17 @@
 //! names never clash with a crate `extern` block). Both versions get identical
 //! definitions, so they allocate the same way and stay comparable. The symbols
 //! are reached by name, matching libxml2's default (`xmlMalloc == malloc`).
+//!
+//! The string-duplication hook `xmlMemStrdup` is handled the same way, with a
+//! native allocate-and-copy shim over the NUL-terminated input, matching its
+//! default (`xmlMemStrdup == xmlStrdup`, i.e. a `strdup`).
 
 use syn::visit::Visit;
 
 /// The allocator globals this models. `size_t` is `usize` in libxml2's output,
 /// so the shims take `usize`.
-const GLOBALS: &[&str] = &["xmlMalloc", "xmlMallocAtomic", "xmlRealloc", "xmlFree"];
+const GLOBALS: &[&str] =
+    &["xmlMalloc", "xmlMallocAtomic", "xmlRealloc", "xmlFree", "xmlMemStrdup"];
 
 /// Whether `name` is an allocator global this models.
 pub fn is_alloc_global(name: &str) -> bool {
@@ -61,6 +66,24 @@ unsafe extern "C" fn __equiv_realloc(
 unsafe extern "C" fn __equiv_free(p: *mut ::core::ffi::c_void) {
     __equiv_free_sym(p)
 }
+unsafe extern "C" fn __equiv_strdup(s: *const ::core::ffi::c_char) -> *mut ::core::ffi::c_char {
+    if s.is_null() {
+        return ::core::ptr::null_mut();
+    }
+    let mut n: usize = 0;
+    while *s.add(n) != 0 {
+        n += 1;
+    }
+    let p = __equiv_malloc_sym(n + 1) as *mut ::core::ffi::c_char;
+    if !p.is_null() {
+        let mut i: usize = 0;
+        while i <= n {
+            *p.add(i) = *s.add(i);
+            i += 1;
+        }
+    }
+    p
+}
 extern "C" {
     #[link_name = "malloc"]
     fn __equiv_malloc_sym(n: usize) -> *mut ::core::ffi::c_void;
@@ -80,6 +103,12 @@ fn global_def(name: &str) -> &'static str {
         "xmlMallocAtomic" => "static mut xmlMallocAtomic: Option<unsafe extern \"C\" fn(usize) -> *mut ::core::ffi::c_void> = Some(__equiv_malloc);",
         "xmlRealloc" => "static mut xmlRealloc: Option<unsafe extern \"C\" fn(*mut ::core::ffi::c_void, usize) -> *mut ::core::ffi::c_void> = Some(__equiv_realloc);",
         "xmlFree" => "static mut xmlFree: Option<unsafe extern \"C\" fn(*mut ::core::ffi::c_void)> = Some(__equiv_free);",
+        // The string-duplication hook `xmlStrdupFunc`. Modelled by a native
+        // allocate-and-copy shim over the NUL-terminated input (`gen_cstr`
+        // guarantees termination), so both versions produce a fresh buffer with
+        // identical content -- compared by correspondence + content like any
+        // heap string. `xmlMemStrdup == xmlStrdup` is libxml2's default.
+        "xmlMemStrdup" => "static mut xmlMemStrdup: Option<unsafe extern \"C\" fn(*const ::core::ffi::c_char) -> *mut ::core::ffi::c_char> = Some(__equiv_strdup);",
         _ => unreachable!(),
     }
 }
@@ -150,6 +179,20 @@ mod tests {
         assert!(src.contains("link_name = \"malloc\""));
         // Unreferenced globals are not defined.
         assert!(!src.contains("static mut xmlFree"));
+    }
+
+    #[test]
+    fn strdup_hook_is_defined_when_used() {
+        let mut it = items(
+            "pub unsafe fn f(s: *const ::core::ffi::c_char) -> *mut ::core::ffi::c_char { \
+               xmlMemStrdup.expect(\"\")(s) \
+             }",
+        );
+        inject(&mut it);
+        let src = it.iter().map(|i| i.to_token_stream().to_string()).collect::<String>();
+        assert!(src.contains("static mut xmlMemStrdup"));
+        assert!(src.contains("fn __equiv_strdup"));
+        assert!(!src.contains("static mut xmlMalloc :"));
     }
 
     #[test]

@@ -2057,6 +2057,79 @@ fn ctx_printer_catches_divergent_message() {
 }
 
 // ---------------------------------------------------------------------------
+// The string-duplication allocator hook `xmlMemStrdup.expect("..")(s)`, modelled
+// by a native allocate-and-copy shim (allocmodel). Both versions duplicate the
+// same NUL-terminated input into a fresh buffer with identical content, so they
+// prove equivalent; duplicating a different input is a divergent result that is
+// caught by the returned-string comparison.
+const STRDUP_OLD: &str = r#"
+pub unsafe fn dup(s: *const core::ffi::c_char) -> *mut core::ffi::c_char {
+    if s.is_null() { return core::ptr::null_mut(); }
+    xmlMemStrdup.expect("non-null function pointer")(s)
+}
+"#;
+
+const STRDUP_OK: &str = r#"
+pub unsafe fn dup(s: *const core::ffi::c_char) -> *mut core::ffi::c_char {
+    if s.is_null() { return core::ptr::null_mut(); }
+    let _k = s;
+    xmlMemStrdup.expect("non-null function pointer")(s)
+}
+"#;
+
+// Divergent: duplicates the second argument instead of the first, so the
+// returned string differs whenever the two inputs differ.
+const STRDUP2_OLD: &str = r#"
+pub unsafe fn dup2(s: *const core::ffi::c_char, t: *const core::ffi::c_char) -> *mut core::ffi::c_char {
+    if s.is_null() || t.is_null() { return core::ptr::null_mut(); }
+    xmlMemStrdup.expect("non-null function pointer")(s)
+}
+"#;
+
+const STRDUP2_BAD: &str = r#"
+pub unsafe fn dup2(s: *const core::ffi::c_char, t: *const core::ffi::c_char) -> *mut core::ffi::c_char {
+    if s.is_null() || t.is_null() { return core::ptr::null_mut(); }
+    xmlMemStrdup.expect("non-null function pointer")(t)
+}
+"#;
+
+#[test]
+fn strdup_hook_is_in_heap_scope() {
+    let old = FnUnit::parse(STRDUP_OLD, &[]).unwrap();
+    assert!(
+        old.heap_body_in_scope().is_ok(),
+        "a strdup hook call was rejected: {:?}",
+        old.heap_body_in_scope()
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn strdup_hook_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(STRDUP_OLD, &[]).unwrap();
+    let new = FnUnit::parse(STRDUP_OK, &[]).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn strdup_hook_catches_divergent_result() {
+    let old = FnUnit::parse(STRDUP2_OLD, &[]).unwrap();
+    let new = FnUnit::parse(STRDUP2_BAD, &[]).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent strdup result was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
+// ---------------------------------------------------------------------------
 // A c2rust registered-handler dispatch through a thread-local accessor:
 // `(*__xmlGenericError()).expect("..")(ctx, fmt, args)`. The accessor returns a
 // function-pointer global we never build; the dispatch is modelled as an
