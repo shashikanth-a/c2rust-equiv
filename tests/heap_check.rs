@@ -1980,3 +1980,78 @@ fn raise_error_catches_divergent_error_report() {
         outcome.status
     );
 }
+
+// ---------------------------------------------------------------------------
+// A ctx+format diagnostic printer `(ctx: *mut c_void, msg, ...)` -- the shape
+// of xmlParserError / xmlParserWarning / xmlGenericErrorDefaultFunc. Modelled
+// by the same errormodel spec (a one-pointer prefix, no level): the context
+// pointer by correspondence, the message by content.
+const PERR_DEFS: &[&str] = &[
+    "extern \"C\" { pub fn xmlParserError(ctx: *mut core::ffi::c_void, \
+        msg: *const core::ffi::c_char, ...); }",
+];
+
+const PERR_OLD: &str = r#"
+pub unsafe fn warn(p: *const i32) -> i32 {
+    if p.is_null() { return -1; }
+    let v = *p;
+    xmlParserError(core::ptr::null_mut(), b"a\0".as_ptr() as *const core::ffi::c_char);
+    v
+}
+"#;
+
+const PERR_OK: &str = r#"
+pub unsafe fn warn(p: *const i32) -> i32 {
+    if p.is_null() { return -1; }
+    let v = *p;
+    let _s = v;
+    xmlParserError(core::ptr::null_mut(), b"a\0".as_ptr() as *const core::ffi::c_char);
+    v
+}
+"#;
+
+// Divergent: reports a different message, which the trace must catch.
+const PERR_BAD: &str = r#"
+pub unsafe fn warn(p: *const i32) -> i32 {
+    if p.is_null() { return -1; }
+    let v = *p;
+    xmlParserError(core::ptr::null_mut(), b"b\0".as_ptr() as *const core::ffi::c_char);
+    v
+}
+"#;
+
+#[test]
+fn ctx_printer_is_in_heap_scope() {
+    let old = FnUnit::parse(PERR_OLD, PERR_DEFS).unwrap();
+    assert!(
+        old.heap_body_in_scope().is_ok(),
+        "an xmlParserError call rejected: {:?}",
+        old.heap_body_in_scope()
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn ctx_printer_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(PERR_OLD, PERR_DEFS).unwrap();
+    let new = FnUnit::parse(PERR_OK, PERR_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn ctx_printer_catches_divergent_message() {
+    let old = FnUnit::parse(PERR_OLD, PERR_DEFS).unwrap();
+    let new = FnUnit::parse(PERR_BAD, PERR_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent diagnostic message was proved equivalent: {:?}",
+        outcome.status
+    );
+}

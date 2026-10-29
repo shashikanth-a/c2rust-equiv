@@ -33,6 +33,8 @@ fn variadic_ret(name: &str) -> Option<&'static str> {
 fn variadic_dst(name: &str) -> Option<usize> {
     match name {
         "sprintf" | "vsprintf" | "snprintf" | "vsnprintf" => Some(0),
+        // libxml2's `xmlStrPrintf(buf, len, msg, ...)` formats into `buf`.
+        "xmlStrPrintf" => Some(0),
         _ => None,
     }
 }

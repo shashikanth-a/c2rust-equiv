@@ -30,23 +30,38 @@
 use quote::ToTokens;
 use syn::visit_mut::VisitMut;
 
-/// The error-reporting externals modelled as observable trace calls.
-pub fn is_error_fn(name: &str) -> bool {
-    name == "__xmlRaiseError"
+/// The pointer-prefix shape of a modelled error external: its leading
+/// arguments that are pointers (compared by correspondence, trace kind 2)
+/// rather than recorded by [`TraceArg`]. The first `fnptr` are function
+/// pointers (usually `None`), the next up to `ptr_end` are `*mut c_void`
+/// context pointers, and `level`, if set, names a C-enum-newtype argument
+/// recorded by its inner scalar. Everything after the prefix (and the variadic
+/// tail) goes through [`TraceArg`].
+struct Spec {
+    fnptr: usize,
+    ptr_end: usize,
+    level: Option<usize>,
 }
 
-/// The two leading function-pointer arguments (`schannel`, `channel`): compared
-/// by correspondence. Almost always `None`.
-const FNPTR_PREFIX: usize = 2;
+/// The modelled error/diagnostic externals and their argument shapes.
+fn spec(name: &str) -> Option<Spec> {
+    Some(match name {
+        // schannel, channel (fn ptrs), data, ctx, node (void*), ..., level, ...
+        "__xmlRaiseError" => Spec { fnptr: 2, ptr_end: 5, level: Some(7) },
+        // The generic/validity error printers: `(ctx: *mut c_void, msg, ...)`.
+        "xmlGenericErrorDefaultFunc"
+        | "xmlParserError"
+        | "xmlParserWarning"
+        | "xmlParserValidityError"
+        | "xmlParserValidityWarning" => Spec { fnptr: 0, ptr_end: 1, level: None },
+        _ => return None,
+    })
+}
 
-/// The end of the pointer prefix: after the two function pointers come three
-/// `*mut c_void` context pointers (`data`, `ctx`, `node`), also compared by
-/// correspondence. All five are recorded by address word (trace kind 2).
-const PTR_PREFIX: usize = 5;
-
-/// The index of the `level: xmlErrorLevel` argument -- a C-enum newtype whose
-/// inner scalar carries the value.
-const LEVEL_IDX: usize = 7;
+/// The error-reporting externals modelled as observable trace calls.
+pub fn is_error_fn(name: &str) -> bool {
+    spec(name).is_some()
+}
 
 /// Whether an argument expression is a bare `None` (no type context), which
 /// must be recorded as the null pointer word rather than transmuted.
@@ -98,11 +113,12 @@ fn block(
     name: &str,
     args: &syn::punctuated::Punctuated<syn::Expr, syn::token::Comma>,
 ) -> String {
+    let sp = spec(name).expect("modelled error fn");
     let call_id = id(name);
     let mut binds = String::new();
     let mut steps = String::new();
     for (i, arg) in args.iter().enumerate() {
-        if i < PTR_PREFIX {
+        if i < sp.ptr_end {
             // A handler or context pointer: compared by correspondence (kind 2),
             // so a different handler/context is caught but a corresponding
             // pointer with a different address is not.
@@ -110,7 +126,7 @@ fn block(
                 // A bare `None` (the common "no handler") has no type once
                 // rebound; record it as the null word directly.
                 "0u128".to_owned()
-            } else if i < FNPTR_PREFIX {
+            } else if i < sp.fnptr {
                 // A real (typed) function pointer transmutes to its address.
                 binds += &format!("let __a{i} = {};\n", arg.to_token_stream());
                 format!("core::mem::transmute::<_, usize>(__a{i}) as u128")
@@ -127,7 +143,7 @@ fn block(
             continue;
         }
         binds += &format!("let __a{i} = {};\n", arg.to_token_stream());
-        if i == LEVEL_IDX {
+        if sp.level == Some(i) {
             // The `level` C-enum newtype: record its inner scalar by value.
             steps += &format!(
                 "(*__t).step({call_id}u64, \
