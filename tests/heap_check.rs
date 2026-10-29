@@ -878,6 +878,71 @@ fn pointer_to_pointer_field_catches_divergence() {
     );
 }
 
+// A multi-field struct held by value as a field (`inner: Inner`), libxml2's
+// `xmlParserCtxt.lastError: xmlError` / `node_seq: xmlParserNodeInfoSeq` shape.
+// The nested struct (scalars + a pointer) is built, cloned and compared inline
+// via the value-returning `genval_`/`cloneval_`/`sameval_` companions.
+const BV_INNER: &str = "#[repr(C)] pub struct Inner { pub a: i32, pub p: *mut i32 }";
+const BV_OUTER: &str = "#[repr(C)] pub struct Outer { pub n: i32, pub inner: Inner }";
+
+const BV_OLD: &str = r#"
+pub unsafe fn outer_a(o: *mut Outer) -> i32 {
+    if o.is_null() { return -1; }
+    (*o).inner.a
+}
+"#;
+
+const BV_OK: &str = r#"
+pub unsafe fn outer_a(o: *mut Outer) -> i32 {
+    if o.is_null() { return -1; }
+    let i = &(*o).inner;
+    (*i).a
+}
+"#;
+
+const BV_BAD: &str = r#"
+pub unsafe fn outer_a(o: *mut Outer) -> i32 {
+    if o.is_null() { return -1; }
+    (*o).inner.a ^ 1
+}
+"#;
+
+#[test]
+fn by_value_struct_field_is_in_heap_scope() {
+    let unit = FnUnit::parse(BV_OLD, &[BV_INNER, BV_OUTER]).unwrap();
+    assert!(
+        c2rust_equiv::heap_diagnose(&unit).is_ok(),
+        "by-value struct field rejected: {:?}",
+        c2rust_equiv::heap_diagnose(&unit)
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn by_value_struct_field_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(BV_OLD, &[BV_INNER, BV_OUTER]).unwrap();
+    let new = FnUnit::parse(BV_OK, &[BV_INNER, BV_OUTER]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn by_value_struct_field_catches_divergence() {
+    let old = FnUnit::parse(BV_OLD, &[BV_INNER, BV_OUTER]).unwrap();
+    let new = FnUnit::parse(BV_BAD, &[BV_INNER, BV_OUTER]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent result was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 // A `*mut c_char` output buffer: uppercase the first byte in place. The heap
 // path compares the buffer's post-state, so a divergent write is caught.
 const OUTBUF_OLD: &str = r#"

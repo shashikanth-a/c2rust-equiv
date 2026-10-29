@@ -69,6 +69,14 @@ enum Field {
     /// type name. Needs the version module prefix to construct, hence the
     /// `old`/`new` arguments threaded into build/clone below.
     ScalarNewtype(String),
+    /// A multi-field struct held *by value* as a field (e.g. `lastError:
+    /// xmlError`, `node_seq: xmlParserNodeInfoSeq`). Built inline with
+    /// `genval_<T>` (no box, never null), copied with `cloneval_<T>`, compared
+    /// with `sameval_<T>` -- the value-returning companions of the pointer
+    /// builders. Only for non-union structs (a by-value union would be
+    /// ambiguous); the inner struct's own fields are built recursively, so it is
+    /// sound exactly as the pointer case is. The string is the type name.
+    StructValue(String),
 }
 
 /// The generated builder, cloner and comparer for one struct, plus the structs
@@ -355,6 +363,12 @@ fn classify(
                     return Ok(Field::ScalarNewtype(name));
                 }
             }
+            // A multi-field struct held by value (not a single-scalar newtype,
+            // not a union): build it inline. A union by value would be
+            // ambiguous (no discriminant), so it is left unsupported.
+            if !def.is_union && !def.fields.is_empty() {
+                return Ok(Field::StructValue(name));
+            }
         }
     }
     Err(format!(
@@ -465,6 +479,11 @@ pub fn generate(
             Ok(Field::Pointer(target)) => {
                 referenced.insert(target.clone());
                 fields.push((name.clone(), Field::Pointer(target)));
+            }
+            // A by-value struct field also needs its type's builders generated.
+            Ok(Field::StructValue(target)) => {
+                referenced.insert(target.clone());
+                fields.push((name.clone(), Field::StructValue(target)));
             }
             Ok(field) => fields.push((name.clone(), field)),
             Err(detail) => {
@@ -730,6 +749,12 @@ pub fn signature_shapes(
             // alias-resolved so it names what the scratch crate emits.
             Field::OpaqueWord(ty) => Ok(Shape::OpaqueArg(ty)),
             Field::ScalarNewtype(name) => Ok(Shape::ScalarNewtype(name)),
+            // A struct passed by value as a top-level argument/return is a
+            // different harness path (not built behind a pointer); leave it
+            // unsupported for now rather than mishandle it.
+            Field::StructValue(name) => {
+                Err(format!("`{name}` passed or returned by value"))
+            }
         }
     };
 
@@ -807,7 +832,12 @@ fn build_value(field: &Field, m: &str) -> String {
         // pointer type (e.g. `*const c_uchar` for xmlChar).
         Field::CStr => "gen_cstr() as _".to_owned(),
         Field::ScalarCell => "gen_cell()".to_owned(),
-        Field::Pointer(target) => format!("gen_{target}(depth - 1)"),
+        // `saturating_sub` so a by-value builder (`genval_`, which has no depth
+        // guard of its own) can't underflow: at depth 0 a pointer sub-field is
+        // built as null.
+        Field::Pointer(target) => format!("gen_{target}(depth.saturating_sub(1))"),
+        // A by-value struct: build it inline, never null.
+        Field::StructValue(target) => format!("genval_{target}(depth.saturating_sub(1))"),
         // A symbolic pointer-sized word reinterpreted as the field's own
         // nullable-fn-ptr type: covers null and every address, no value fixed.
         Field::OpaqueWord(ty) => {
@@ -830,6 +860,8 @@ fn clone_value(field: &Field, src: &str, m: &str) -> String {
         // Rewrap the inner value in the destination version's newtype (old::X
         // and new::X are distinct types with the same single scalar field).
         Field::ScalarNewtype(name) => format!("{m}::{name}({src}.0)"),
+        // A by-value struct: deep-copy it by value from a reference to the source.
+        Field::StructValue(target) => format!("cloneval_{target}(&{src}, map)"),
     }
 }
 
@@ -850,6 +882,10 @@ fn compare_stmt(field: &Field, a: &str, b: &str) -> String {
         Field::ScalarCell => format!("    if !same_cell({a}, {b}) {{ return false; }}\n"),
         Field::Pointer(target) => {
             format!("    if !same_{target}({a}, {b}, corr) {{ return false; }}\n")
+        }
+        // A by-value struct: compare by value through references to each side.
+        Field::StructValue(target) => {
+            format!("    if !sameval_{target}(&{a}, &{b}, corr) {{ return false; }}\n")
         }
     }
 }
@@ -895,7 +931,7 @@ fn builder(struct_name: &str, old: &str, fields: &[(String, Field)], tu: Option<
         inits += &format!("            {}: __tag,\n", tu.tag_field);
         inits += &format!("            {}: __uni,\n", tu.union_field);
     }
-    format!(
+    let gen = format!(
         "pub unsafe fn gen_{struct_name}(depth: usize) -> *mut {old}::{struct_name} {{\n\
          \x20   if depth == 0 || kani::any() {{\n\
          \x20       return core::ptr::null_mut();\n\
@@ -906,7 +942,21 @@ fn builder(struct_name: &str, old: &str, fields: &[(String, Field)], tu: Option<
          \x20   }};\n\
          \x20   Box::into_raw(Box::new(obj))\n\
          }}\n"
-    )
+    );
+    // A value-returning builder for when this struct is held by value as a
+    // field (never null). Only non-union structs are built by value, so the
+    // tagged-union `pre` never applies here.
+    if tu.is_none() {
+        return format!(
+            "{gen}\
+             pub unsafe fn genval_{struct_name}(depth: usize) -> {old}::{struct_name} {{\n\
+             \x20   {old}::{struct_name} {{\n\
+             {inits}\
+             \x20   }}\n\
+             }}\n"
+        );
+    }
+    gen
 }
 
 /// `clone_<T>(src, map) -> *mut new::T`: a deep copy from `old`'s layout into
@@ -942,6 +992,16 @@ fn cloner(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)], t
             Field::Pointer(target) => {
                 inits += &format!("        {name}: core::ptr::null_mut(),\n");
                 links += &format!("    (*dst).{name} = clone_{target}((*src).{name}, map);\n");
+            }
+            // A by-value struct: deep-copy it in the initializer. It can't form a
+            // cycle back to this container (it is inline, not independently
+            // pointed to), so no two-phase linking is needed; any cycle through
+            // its pointer sub-fields is resolved by `map` inside `cloneval_`.
+            Field::StructValue(_) => {
+                inits += &format!(
+                    "        {name}: {},\n",
+                    clone_value(field, &format!("(*src).{name}"), new)
+                );
             }
         }
     }
@@ -980,7 +1040,7 @@ fn cloner(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)], t
             "    (*dst).{uf} = match (*src).{tf} {{\n{uni_arms}        _ => {fallback},\n    }};\n"
         );
     }
-    format!(
+    let clone = format!(
         "pub unsafe fn clone_{struct_name}(\n\
          \x20   src: *const {old}::{struct_name},\n\
          \x20   map: &mut CloneMap,\n\
@@ -998,7 +1058,32 @@ fn cloner(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)], t
          {links}\
          \x20   dst\n\
          }}\n"
-    )
+    );
+    // A value-returning deep copy for the by-value case (non-union only). A
+    // by-value struct is never independently aliased, so this is single-phase:
+    // every field is copied directly, and a pointer sub-field's own `clone_<T>`
+    // still resolves sharing and cycles through `map`.
+    if tu.is_none() {
+        let mut val_inits = String::new();
+        for (name, field) in fields {
+            val_inits += &format!(
+                "        {name}: {},\n",
+                clone_value(field, &format!("(*src).{name}"), new)
+            );
+        }
+        return format!(
+            "{clone}\
+             pub unsafe fn cloneval_{struct_name}(\n\
+             \x20   src: *const {old}::{struct_name},\n\
+             \x20   map: &mut CloneMap,\n\
+             ) -> {new}::{struct_name} {{\n\
+             \x20   {new}::{struct_name} {{\n\
+             {val_inits}\
+             \x20   }}\n\
+             }}\n"
+        );
+    }
+    clone
 }
 
 /// `same_<T>(a, b, corr) -> bool`: equal scalars across `old::T` and `new::T`,
@@ -1039,7 +1124,7 @@ fn comparer(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)],
     // `corr` is the correspondence map; `link` returns false when adding the
     // pair would break functionality (a already mapped elsewhere) or
     // injectivity (b already mapped from elsewhere).
-    format!(
+    let same = format!(
         "pub unsafe fn same_{struct_name}(\n\
          \x20   a: *const {old}::{struct_name},\n\
          \x20   b: *const {new}::{struct_name},\n\
@@ -1056,7 +1141,24 @@ fn comparer(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)],
          {checks}\
          \x20   true\n\
          }}\n"
-    )
+    );
+    // A value comparer for the by-value case (non-union only): compare each
+    // field directly. There is no pointer identity to register here (the struct
+    // is inline); a pointer sub-field's own `same_<T>` still uses `corr`.
+    if tu.is_none() {
+        return format!(
+            "{same}\
+             pub unsafe fn sameval_{struct_name}(\n\
+             \x20   a: *const {old}::{struct_name},\n\
+             \x20   b: *const {new}::{struct_name},\n\
+             \x20   corr: &mut Corr,\n\
+             ) -> bool {{\n\
+             {checks}\
+             \x20   true\n\
+             }}\n"
+        );
+    }
+    same
 }
 
 #[cfg(test)]
@@ -1097,7 +1199,7 @@ mod tests {
         let src = "pub struct N { pub v: i32, pub next: *mut N }";
         let g = generate(&index(src), "N", &Default::default(), "old", "new").unwrap();
         assert_eq!(g.referenced, ["N".to_owned()].into_iter().collect());
-        assert!(g.builder.contains("next: gen_N(depth - 1),"));
+        assert!(g.builder.contains("next: gen_N(depth.saturating_sub(1)),"));
         assert!(g
             .comparer
             .contains("if !same_N((*a).next, (*b).next, corr) { return false; }"));
@@ -1156,7 +1258,7 @@ mod tests {
         assert!(g.builder.contains("flag: kani::any(),"));
         // The typedef'd pointer reaches `N` and references it.
         assert!(g.referenced.contains("N"));
-        assert!(g.builder.contains("next: gen_N(depth - 1),"));
+        assert!(g.builder.contains("next: gen_N(depth.saturating_sub(1)),"));
     }
 
     #[test]
@@ -1164,8 +1266,9 @@ mod tests {
         let src = "pub struct S { pub a: c_int, pub b: size_t, pub c: f64 }";
         let g = generate(&index(src), "S", &Default::default(), "old", "new").unwrap();
         assert!(g.referenced.is_empty());
-        // Three field initializers (the null-guard also calls `kani::any()`).
-        assert_eq!(g.builder.matches("kani::any(),").count(), 3);
+        // Three scalar field initializers, emitted in both the pointer builder
+        // `gen_S` and the by-value builder `genval_S` (same inits), so six.
+        assert_eq!(g.builder.matches("kani::any(),").count(), 6);
     }
 
     #[test]
