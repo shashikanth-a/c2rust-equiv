@@ -54,6 +54,12 @@ fn spec(name: &str) -> Option<Spec> {
         | "xmlParserWarning"
         | "xmlParserValidityError"
         | "xmlParserValidityWarning" => Spec { fnptr: 0, ptr_end: 1, level: None },
+        // json-c's error-setting primitive `_json_c_set_last_err(fmt, ...)`: a
+        // bare variadic printer (no leading pointer), modelled as an observable
+        // trace exactly like the libxml2 diagnostic printers. Sound as stateless
+        // for the same reason as __xmlRaiseError -- the error buffer it writes is
+        // read only through a separate accessor that stays out of scope.
+        "_json_c_set_last_err" => Spec { fnptr: 0, ptr_end: 0, level: None },
         _ => return None,
     })
 }

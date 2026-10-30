@@ -2195,6 +2195,79 @@ fn ctx_printer_catches_divergent_message() {
 }
 
 // ---------------------------------------------------------------------------
+// A bare variadic error printer with no pointer prefix (`fmt, ...`), json-c's
+// `_json_c_set_last_err`. Modelled as an observable trace over its format and
+// arguments (errormodel spec with ptr_end 0); a different reported message is a
+// divergence and is caught.
+const JSONERR_DEFS: &[&str] = &[
+    "extern \"C\" { pub fn _json_c_set_last_err(fmt: *const core::ffi::c_char, ...); }",
+];
+
+const JSONERR_OLD: &str = r#"
+pub unsafe fn fail(p: *const i32) -> i32 {
+    if p.is_null() { return -1; }
+    let v = *p;
+    _json_c_set_last_err(b"bad %d\0".as_ptr() as *const core::ffi::c_char, v);
+    v
+}
+"#;
+
+const JSONERR_OK: &str = r#"
+pub unsafe fn fail(p: *const i32) -> i32 {
+    if p.is_null() { return -1; }
+    let v = *p;
+    let _w = v;
+    _json_c_set_last_err(b"bad %d\0".as_ptr() as *const core::ffi::c_char, v);
+    v
+}
+"#;
+
+const JSONERR_BAD: &str = r#"
+pub unsafe fn fail(p: *const i32) -> i32 {
+    if p.is_null() { return -1; }
+    let v = *p;
+    _json_c_set_last_err(b"bad %d\0".as_ptr() as *const core::ffi::c_char, v.wrapping_add(1));
+    v
+}
+"#;
+
+#[test]
+fn json_set_last_err_is_in_heap_scope() {
+    let old = FnUnit::parse(JSONERR_OLD, JSONERR_DEFS).unwrap();
+    assert!(
+        old.heap_body_in_scope().is_ok(),
+        "a _json_c_set_last_err call rejected: {:?}",
+        old.heap_body_in_scope()
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn json_set_last_err_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(JSONERR_OLD, JSONERR_DEFS).unwrap();
+    let new = FnUnit::parse(JSONERR_OK, JSONERR_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn json_set_last_err_catches_divergent_message() {
+    let old = FnUnit::parse(JSONERR_OLD, JSONERR_DEFS).unwrap();
+    let new = FnUnit::parse(JSONERR_BAD, JSONERR_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent error message was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The string-duplication allocator hook `xmlMemStrdup.expect("..")(s)`, modelled
 // by a native allocate-and-copy shim (allocmodel). Both versions duplicate the
 // same NUL-terminated input into a fresh buffer with identical content, so they
