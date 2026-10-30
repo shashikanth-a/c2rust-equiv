@@ -2600,6 +2600,90 @@ fn aliased_chain_indirect_call_is_in_heap_scope() {
     );
 }
 
+// A callback dispatched through a NESTED-`let`-bound function pointer with
+// ALIAS-typed pointer arguments and an alias-typed pointer return -- lil's
+// command-callback shape: `if guard { let proc: CbT = ..; proc.expect(..)(ctx,
+// n, v) }`, where `Ctx`/`Val` are pointer typedefs and `CbT` the callback
+// typedef. Exercises both nested-local typing (the receiver `proc` is bound
+// inside the guard) and argument/return alias resolution.
+const NLCB_DEFS: &[&str] = &[
+    "pub type Ctx = *mut core::ffi::c_void;",
+    "pub type Val = *mut core::ffi::c_void;",
+    "pub type CbT = Option<unsafe extern \"C\" fn(Ctx, usize, Val) -> Val>;",
+    "#[repr(C)] pub struct Cmd { pub cb: CbT, pub pad: i64 }",
+];
+
+const NLCB_OLD: &str = r#"
+pub unsafe fn run(c: *mut Cmd, ctx: Ctx, n: usize, v: Val) -> Val {
+    if c.is_null() { return core::ptr::null_mut(); }
+    if (*c).cb.is_some() {
+        let mut proc: CbT = (*c).cb;
+        return proc.expect("non-null function pointer")(ctx, n, v);
+    }
+    core::ptr::null_mut()
+}
+"#;
+
+const NLCB_OK: &str = r#"
+pub unsafe fn run(c: *mut Cmd, ctx: Ctx, n: usize, v: Val) -> Val {
+    if c.is_null() { return core::ptr::null_mut(); }
+    if (*c).cb.is_some() {
+        let mut proc: CbT = (*c).cb;
+        let m = n;
+        return proc.expect("non-null function pointer")(ctx, m, v);
+    }
+    core::ptr::null_mut()
+}
+"#;
+
+// Divergent: passes a different count argument to the callback.
+const NLCB_BAD: &str = r#"
+pub unsafe fn run(c: *mut Cmd, ctx: Ctx, n: usize, v: Val) -> Val {
+    if c.is_null() { return core::ptr::null_mut(); }
+    if (*c).cb.is_some() {
+        let mut proc: CbT = (*c).cb;
+        return proc.expect("non-null function pointer")(ctx, n.wrapping_add(1), v);
+    }
+    core::ptr::null_mut()
+}
+"#;
+
+#[test]
+fn nested_local_callback_is_in_heap_scope() {
+    let old = FnUnit::parse(NLCB_OLD, NLCB_DEFS).unwrap();
+    assert!(
+        old.heap_body_in_scope().is_ok(),
+        "a nested-local aliased callback was rejected: {:?}",
+        old.heap_body_in_scope()
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn nested_local_callback_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(NLCB_OLD, NLCB_DEFS).unwrap();
+    let new = FnUnit::parse(NLCB_OK, NLCB_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn nested_local_callback_catches_different_argument() {
+    let old = FnUnit::parse(NLCB_OLD, NLCB_DEFS).unwrap();
+    let new = FnUnit::parse(NLCB_BAD, NLCB_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a changed callback argument was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 #[test]
 #[ignore = "requires `cargo kani` on PATH; slow"]
 fn aliased_chain_indirect_call_proves_equivalent_rewrite() {

@@ -117,16 +117,13 @@ impl TypeEnv {
                 }
             }
         }
-        // Annotated locals (`let mut x: T = ..`), which c2rust emits widely.
-        for stmt in &f.block.stmts {
-            if let syn::Stmt::Local(local) = stmt {
-                if let syn::Pat::Type(pt) = &local.pat {
-                    if let syn::Pat::Ident(id) = &*pt.pat {
-                        self.vars.insert(id.ident.to_string(), (*pt.ty).clone());
-                    }
-                }
-            }
-        }
+        // Annotated locals (`let mut x: T = ..`), which c2rust emits widely --
+        // at ANY depth, since c2rust nests a callback and its `let`-bound
+        // function pointer inside the conditional that guards the call
+        // (`if cond { let mut proc: CbT = ..; proc.expect(..)(..) }`). A
+        // top-level-only scan would miss exactly those, so walk the whole body.
+        let mut v = LocalTypes { vars: &mut self.vars };
+        syn::visit::Visit::visit_block(&mut v, &f.block);
     }
 
     /// The type of an lvalue expression, by a small structural walk: a variable,
@@ -167,6 +164,25 @@ impl TypeEnv {
     }
 }
 
+/// Collects every annotated `let x: T` binding in a function body, at any
+/// nesting depth, into the variable-type map. c2rust emits callback dispatches
+/// inside the conditional that guards them, with the function pointer bound by
+/// a nested `let`, so a top-level-only scan would leave the receiver untyped.
+struct LocalTypes<'a> {
+    vars: &'a mut BTreeMap<String, syn::Type>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for LocalTypes<'_> {
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        if let syn::Pat::Type(pt) = &local.pat {
+            if let syn::Pat::Ident(id) = &*pt.pat {
+                self.vars.insert(id.ident.to_string(), (*pt.ty).clone());
+            }
+        }
+        syn::visit::visit_local(self, local);
+    }
+}
+
 /// The name of a struct type (a bare path's last segment), if it is one.
 fn struct_name(ty: &syn::Type) -> Option<String> {
     match ty {
@@ -179,7 +195,10 @@ fn struct_name(ty: &syn::Type) -> Option<String> {
 /// [`crate::strmodel`]'s `is_trace_sig`: not variadic, at most three arguments,
 /// no `-> !`, and every argument a scalar/float or pointer. Returns the
 /// per-argument kind tags and the return-type text on success.
-fn modellable_sig(f: &syn::TypeBareFn) -> Option<(Vec<u8>, String)> {
+fn modellable_sig(
+    f: &syn::TypeBareFn,
+    aliases: &BTreeMap<String, syn::Type>,
+) -> Option<(Vec<u8>, String)> {
     // Each argument is recorded as its own trace event, so any arity works; cap
     // it only to bound trace usage (the widest SAX callback takes eight).
     if f.variadic.is_some() || f.inputs.len() > 16 {
@@ -192,27 +211,36 @@ fn modellable_sig(f: &syn::TypeBareFn) -> Option<(Vec<u8>, String)> {
     }
     let mut kinds = Vec::with_capacity(f.inputs.len());
     for arg in &f.inputs {
-        kinds.push(arg_kind(&arg.ty)?);
+        kinds.push(arg_kind(&arg.ty, aliases)?);
     }
+    // Resolve the return type through aliases too: c2rust types a callback's
+    // return as e.g. `lil_value_t` (= `*mut _lil_value_t`), and the replacement
+    // needs to see it is a pointer to cast the trace result correctly.
     let ret = match &f.output {
         syn::ReturnType::Default => "()".to_owned(),
-        syn::ReturnType::Type(_, t) => t.to_token_stream().to_string(),
+        syn::ReturnType::Type(_, t) => {
+            crate::heapgen::resolve_alias(t, aliases).to_token_stream().to_string()
+        }
     };
     Some((kinds, ret))
 }
 
 /// The trace kind tag for an argument type: 2 for a pointer, 1 for a C string
 /// pointer, 0 for a scalar/float. `None` if it is neither (e.g. a struct by
-/// value or a nested fn pointer), which makes the call unmodellable.
-fn arg_kind(ty: &syn::Type) -> Option<u8> {
-    if let syn::Type::Ptr(ptr) = ty {
-        let pointee = last_segment(&ptr.elem);
+/// value or a nested fn pointer), which makes the call unmodellable. Type
+/// aliases are resolved first, so a callback argument typed through a c2rust
+/// typedef (`lil_t = *mut _lil_t`, `xmlNodePtr = *mut xmlNode`) is recognised as
+/// the pointer it is rather than rejected as an unknown name.
+fn arg_kind(ty: &syn::Type, aliases: &BTreeMap<String, syn::Type>) -> Option<u8> {
+    let resolved = crate::heapgen::resolve_alias(ty, aliases);
+    if let syn::Type::Ptr(ptr) = &resolved {
+        let pointee = last_segment(&crate::heapgen::resolve_alias(&ptr.elem, aliases));
         return Some(match pointee.as_deref() {
             Some("c_char") | Some("c_uchar") => 1,
             _ => 2,
         });
     }
-    let name = last_segment(ty)?;
+    let name = last_segment(&resolved)?;
     let s = name.as_str();
     if float_width(s).is_some()
         || crate::scalar::primitive(s).is_some()
@@ -255,7 +283,7 @@ fn plan_call(call: &syn::ExprCall, env: &TypeEnv) -> Option<CallPlan> {
     // The receiver must type to `Option<bare fn>` (through aliases); read it.
     let recv_ty = env.type_of(&mc.receiver)?;
     let bare = option_bare_fn(&recv_ty, &env.aliases)?;
-    let (arg_kinds, ret) = modellable_sig(&bare)?;
+    let (arg_kinds, ret) = modellable_sig(&bare, &env.aliases)?;
     if call.args.len() != bare.inputs.len() {
         return None;
     }
