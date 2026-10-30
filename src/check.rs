@@ -294,9 +294,12 @@ pub fn heap_diagnose(unit: &FnUnit) -> Result<(), String> {
     let index = index_of(unit).ok_or("index")?;
     let shapes = heapgen::signature_shapes(&index, &unit.function.sig)
         .map_err(|u| format!("signature: {}", u.detail))?;
-    if !shapes.needs_heap() {
-        return Err("not-heap".to_owned());
-    }
+    // A pointer-free ("not-heap") signature is allowed through here: this is
+    // reached only after the scalar path has already rejected the function (the
+    // eligibility pass and `check` both try scalar first), so routing it through
+    // the heap path gives it the heap path's modelling (globals, foreign-call
+    // traces, mutex no-ops) with a trivial empty heap. The body and generate
+    // checks below still gate it.
     unit.heap_body_in_scope()
         .map_err(|s| format!("body: {} ({})", s.detail, s.category))?;
     let mut roots = shapes.structs.clone();
@@ -343,7 +346,14 @@ fn heap_plan(old: &FnUnit, new: &FnUnit) -> Option<(SigShapes, String)> {
     let index = index_of(old)?;
     let shapes = heapgen::signature_shapes(&index, &old.function.sig).ok()?;
     if !shapes.needs_heap() {
-        return None;
+        // A pointer-free signature: let the scalar path (native testing) own it
+        // unless the scalar path rejects it -- a global, foreign call, IO or
+        // mutex the heap path can model. Only then route it through the heap
+        // harness (symbolic scalar args, compare the return and any modelled
+        // global's final state), a superset of the scalar check.
+        if old.validate().is_ok() {
+            return None;
+        }
     }
     // The rewrite must have the same shape, or it isn't a drop-in replacement.
     let new_shapes = heapgen::signature_shapes(&index_of(new)?, &new.function.sig).ok()?;

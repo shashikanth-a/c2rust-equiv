@@ -159,12 +159,17 @@ fn extern_c_function_pointers_still_compile() {
 }
 
 #[test]
-fn skipped_raw_pointer() {
+fn raw_pointer_takes_the_heap_path() {
+    // A scalar-signature function whose only pointer is a body-local one is
+    // rejected by the scalar path but handled by the heap path (symbolic scalar
+    // args, nothing to build), so it routes there. Without Kani the heap path
+    // reports it needs Kani rather than running; the point is it is no longer
+    // out of scope as a "raw pointer" skip.
     let status = run(PTR, PTR, false);
     let Status::Skipped { category, .. } = status else {
         panic!("{status}")
     };
-    assert_eq!(category, "raw pointer");
+    assert_eq!(category, "heap");
 }
 
 #[test]

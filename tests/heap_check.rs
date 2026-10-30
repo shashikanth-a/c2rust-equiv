@@ -3084,3 +3084,48 @@ fn mutex_global_catches_divergent_work() {
         outcome.status
     );
 }
+
+// A pointer-free (scalar-signature) function that reads and writes a scalar
+// `static mut` global. The scalar path rejects any global; routing it through
+// the heap path (which has no heap to build for an all-scalar signature) gives
+// it the heap path's global modelling -- the static mut is carried per-version
+// from its initializer and its final value compared. Proves an equivalent
+// rewrite and catches a divergent global write.
+const SCG_DEFS: &[&str] = &["pub static mut COUNTER: i64 = 0;"];
+const SCG_OLD: &str = r#"
+pub unsafe fn add(x: i64) -> i64 {
+    COUNTER = COUNTER.wrapping_add(x);
+    COUNTER
+}
+"#;
+const SCG_OK: &str = r#"
+pub unsafe fn add(x: i64) -> i64 {
+    let c = COUNTER.wrapping_add(x);
+    COUNTER = c;
+    c
+}
+"#;
+const SCG_BAD: &str = r#"
+pub unsafe fn add(x: i64) -> i64 {
+    COUNTER = COUNTER.wrapping_add(x).wrapping_add(1);
+    COUNTER
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn scalar_sig_global_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(SCG_OLD, SCG_DEFS).unwrap();
+    let new = FnUnit::parse(SCG_OK, SCG_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(matches!(outcome.status, Status::Proved { .. }), "expected Proved, got {:?}", outcome.status);
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn scalar_sig_global_catches_divergent_write() {
+    let old = FnUnit::parse(SCG_OLD, SCG_DEFS).unwrap();
+    let new = FnUnit::parse(SCG_BAD, SCG_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(!matches!(outcome.status, Status::Proved { .. }), "a divergent global write was proved equivalent: {:?}", outcome.status);
+}
