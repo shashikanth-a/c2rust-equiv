@@ -851,6 +851,17 @@ fn locals(item: &syn::Item, resolver: &Resolver, module: usize) -> HashSet<Strin
             self.0.insert(f.sig.ident.to_string());
             syn::visit::visit_item_fn(self, f);
         }
+        fn visit_item_static(&mut self, s: &'ast syn::ItemStatic) {
+            // A function-local `static` (c2rust's lowering of a C function-static
+            // variable, e.g. genann's lazily-built sigmoid `lookup` table) is a
+            // real, in-scope item in the body; its name is not an out-of-scope
+            // path. It is emitted verbatim in the scratch, so a reference to it
+            // resolves locally. Sound for differential equivalence: both versions
+            // hold their own copy from the same initializer and the harness calls
+            // each once, so a lazily-initialised static is built identically.
+            self.0.insert(s.ident.to_string());
+            syn::visit::visit_item_static(self, s);
+        }
     }
     let mut l = Locals(HashSet::new());
     l.visit_item(item);

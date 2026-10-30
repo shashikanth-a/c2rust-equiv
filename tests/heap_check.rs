@@ -2195,6 +2195,92 @@ fn ctx_printer_catches_divergent_message() {
 }
 
 // ---------------------------------------------------------------------------
+// A function-local `static` (c2rust's lowering of a C function-static), lazily
+// initialised -- genann's cached sigmoid `lookup` table shape. The static lives
+// in the body and is emitted verbatim; a reference to it resolves locally. Both
+// versions hold their own copy from the same initializer and the harness calls
+// each once, so the table is built identically.
+const FLS_OLD: &str = r#"
+pub unsafe fn cached(p: *const i32) -> i32 {
+    if p.is_null() { return -1; }
+    static mut INIT: i32 = 0;
+    static mut TABLE: [i32; 4] = [0; 4];
+    if INIT == 0 {
+        let mut i = 0usize;
+        while i < 4 { TABLE[i] = (i as i32) * 2; i += 1; }
+        INIT = 1;
+    }
+    TABLE[((*p) & 3) as usize]
+}
+"#;
+
+const FLS_OK: &str = r#"
+pub unsafe fn cached(p: *const i32) -> i32 {
+    if p.is_null() { return -1; }
+    static mut INIT: i32 = 0;
+    static mut TABLE: [i32; 4] = [0; 4];
+    if INIT == 0 {
+        let mut i = 0usize;
+        while i < 4 { TABLE[i] = (i as i32) + (i as i32); i += 1; }
+        INIT = 1;
+    }
+    let idx = ((*p) & 3) as usize;
+    TABLE[idx]
+}
+"#;
+
+// Divergent: builds the table with a different formula.
+const FLS_BAD: &str = r#"
+pub unsafe fn cached(p: *const i32) -> i32 {
+    if p.is_null() { return -1; }
+    static mut INIT: i32 = 0;
+    static mut TABLE: [i32; 4] = [0; 4];
+    if INIT == 0 {
+        let mut i = 0usize;
+        while i < 4 { TABLE[i] = (i as i32) * 3; i += 1; }
+        INIT = 1;
+    }
+    TABLE[((*p) & 3) as usize]
+}
+"#;
+
+#[test]
+fn fn_local_static_is_in_heap_scope() {
+    let old = FnUnit::parse(FLS_OLD, &[]).unwrap();
+    assert!(
+        old.heap_body_in_scope().is_ok(),
+        "a function-local static was rejected: {:?}",
+        old.heap_body_in_scope()
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn fn_local_static_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(FLS_OLD, &[]).unwrap();
+    let new = FnUnit::parse(FLS_OK, &[]).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn fn_local_static_catches_divergence() {
+    let old = FnUnit::parse(FLS_OLD, &[]).unwrap();
+    let new = FnUnit::parse(FLS_BAD, &[]).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent function-local table was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
+// ---------------------------------------------------------------------------
 // A bare variadic error printer with no pointer prefix (`fmt, ...`), json-c's
 // `_json_c_set_last_err`. Modelled as an observable trace over its format and
 // arguments (errormodel spec with ptr_end 0); a different reported message is a
