@@ -3225,3 +3225,46 @@ fn error_report_read_catches_interleaving() {
     let outcome = check(&old, &new, &opts());
     assert!(!matches!(outcome.status, Status::Proved { .. }), "an interleaved error-state read was proved equivalent (UNSOUND): {:?}", outcome.status);
 }
+
+// A standard I/O stream global (`__stderrp`). It is a foreign `*mut FILE` with
+// no crate definition; the allocator/global model injects a module-local
+// non-null sentinel (`*mut c_void`, identical in both versions). A function
+// that checks or stashes the stream is in scope and proves; a divergent result
+// is still caught.
+const STDIO_DEFS: &[&str] =
+    &["extern \"C\" { pub static mut __stderrp: *mut core::ffi::c_void; }"];
+const STDIO_OLD: &str = r#"
+pub unsafe fn f(x: i32) -> i32 {
+    if __stderrp.is_null() { return -1; }
+    x
+}
+"#;
+const STDIO_OK: &str = r#"
+pub unsafe fn f(x: i32) -> i32 {
+    let s = __stderrp;
+    if s.is_null() { return -1; }
+    x
+}
+"#;
+const STDIO_BAD: &str = r#"
+pub unsafe fn f(x: i32) -> i32 {
+    if __stderrp.is_null() { return -1; }
+    x + 1
+}
+"#;
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn stdio_global_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(STDIO_OLD, STDIO_DEFS).unwrap();
+    let new = FnUnit::parse(STDIO_OK, STDIO_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(matches!(outcome.status, Status::Proved { .. }), "expected Proved, got {:?}", outcome.status);
+}
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn stdio_global_catches_divergence() {
+    let old = FnUnit::parse(STDIO_OLD, STDIO_DEFS).unwrap();
+    let new = FnUnit::parse(STDIO_BAD, STDIO_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(!matches!(outcome.status, Status::Proved { .. }), "a divergent result was proved equivalent: {:?}", outcome.status);
+}

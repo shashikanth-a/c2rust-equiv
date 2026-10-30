@@ -23,8 +23,22 @@ use syn::visit::Visit;
 
 /// The allocator globals this models. `size_t` is `usize` in libxml2's output,
 /// so the shims take `usize`.
-const GLOBALS: &[&str] =
-    &["xmlMalloc", "xmlMallocAtomic", "xmlRealloc", "xmlFree", "xmlMemStrdup"];
+const GLOBALS: &[&str] = &[
+    "xmlMalloc",
+    "xmlMallocAtomic",
+    "xmlRealloc",
+    "xmlFree",
+    "xmlMemStrdup",
+    // The C standard I/O streams: foreign `*mut FILE` globals libxml2 writes to
+    // through `fprintf`/`fputc` (themselves modelled as observable traces) or
+    // stashes as a `void*` user-data handle. They are opaque stream identities,
+    // never dereferenced, so a module-local non-null sentinel (identical in both
+    // versions) models them -- spelled `*mut c_void` so the definition needn't
+    // pull the `FILE` struct, matching the `__stderrp as *mut c_void` use sites.
+    "__stderrp",
+    "__stdoutp",
+    "__stdinp",
+];
 
 /// Whether `name` is an allocator global this models.
 pub fn is_alloc_global(name: &str) -> bool {
@@ -109,6 +123,16 @@ fn global_def(name: &str) -> &'static str {
         // identical content -- compared by correspondence + content like any
         // heap string. `xmlMemStrdup == xmlStrdup` is libxml2's default.
         "xmlMemStrdup" => "static mut xmlMemStrdup: Option<unsafe extern \"C\" fn(*const ::core::ffi::c_char) -> *mut ::core::ffi::c_char> = Some(__equiv_strdup);",
+        // A non-null sentinel stream identity, the same in both versions. Never
+        // dereferenced (every I/O call on it is a modelled trace); a function
+        // that checks `!is_null()` sees the same answer in both.
+        "__stderrp" | "__stdoutp" | "__stdinp" => {
+            match name {
+                "__stderrp" => "static mut __stderrp: *mut ::core::ffi::c_void = 1usize as *mut ::core::ffi::c_void;",
+                "__stdoutp" => "static mut __stdoutp: *mut ::core::ffi::c_void = 1usize as *mut ::core::ffi::c_void;",
+                _ => "static mut __stdinp: *mut ::core::ffi::c_void = 1usize as *mut ::core::ffi::c_void;",
+            }
+        }
         _ => unreachable!(),
     }
 }
