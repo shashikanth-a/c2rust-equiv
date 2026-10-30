@@ -258,12 +258,21 @@ fn kani_undefined_behaviour_in_new_is_not_proved() {
         return;
     }
     let status = run(UNCHECKED_OLD, UNCHECKED_NEW, true);
-    // Natively, the old version panics and the rewrite returns a value.
-    assert_eq!(found_by(&status), Some(Method::Kani), "{status}");
-    let Status::Counterexample { old_out, .. } = status else {
-        unreachable!()
-    };
-    assert!(old_out.starts_with("panicked"), "{old_out}");
+    // The old version panics on an out-of-bounds index; the rewrite uses
+    // `get_unchecked`, which is undefined behaviour past the bounds. The tool
+    // must not prove the two equivalent. Kani finds the differing index;
+    // replaying it natively then either observes old's panic against new's
+    // value (a counterexample) or the out-of-bounds read crashes the replay
+    // process (an error) -- which one happens depends on the platform and the
+    // concrete index Kani picks, but both mean "not proved", which is the
+    // guarantee here.
+    assert!(
+        !matches!(status, Status::Proved { .. }),
+        "UB in the rewrite must not be proved equivalent: {status}"
+    );
+    if let Status::Counterexample { old_out, .. } = &status {
+        assert!(old_out.starts_with("panicked"), "{old_out}");
+    }
 }
 
 #[test]
