@@ -77,6 +77,23 @@ enum Field {
     /// ambiguous); the inner struct's own fields are built recursively, so it is
     /// sound exactly as the pointer case is. The string is the type name.
     StructValue(String),
+    /// A fixed-size array of a non-scalar struct element (`cell: [hashcell_t;
+    /// 256]`). Each element is an independent by-value struct, so the array is
+    /// built, cloned, and compared element-wise with the same `genval_`/
+    /// `cloneval_`/`sameval_` companions as [`Field::StructValue`] -- the array
+    /// generalisation of the by-value nested struct. Sound exactly as that case
+    /// is (each element built symbolically, compared under the correspondence
+    /// map). The string is the element struct's name, the usize the length.
+    StructArray(String, usize),
+    /// A fixed-size array of pointer-sized opaque words (`callback:
+    /// [lil_callback_proc_t; 8]` -- an array of nullable function pointers, or
+    /// of `void*`/`T**`). Each element is built symbolically over all values (a
+    /// transmuted `kani::any::<usize>()`), the whole array copied by value (it
+    /// is `Copy`) and compared by identity (`==`). The array generalisation of
+    /// `Field::OpaqueWord`; sound for the same reason -- carried data, never
+    /// called/dereferenced (a call through such a pointer is rejected). The
+    /// string is the element type, the usize the length.
+    OpaqueArray(String, usize),
     /// A union held by value as a field, whose discriminant can't be inferred.
     /// Built as symbolic raw bytes (`gen_union`), copied byte-identically into
     /// both versions (`clone_union`) and compared byte-wise (`same_union`) -- an
@@ -279,6 +296,20 @@ fn last_segment(ty: &syn::Type) -> Option<String> {
 /// and the crate-local type aliases. The type is first resolved through aliases
 /// (`type json_bool = c_int` -> `c_int`), then classified; a pointer's pointee
 /// is likewise resolved so a `*mut Alias` reaches the struct it names.
+/// The constant length of a fixed-size array type, if it is an integer literal
+/// (what c2rust emits, e.g. `[hashcell_t; 256]`). A non-literal length (a const
+/// expression) returns `None`, leaving the array unsupported rather than guessed.
+fn array_len(len: &syn::Expr) -> Option<usize> {
+    let mut e = len;
+    while let syn::Expr::Group(g) = e {
+        e = &g.expr;
+    }
+    if let syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Int(n), .. }) = e {
+        return n.base10_parse::<usize>().ok();
+    }
+    None
+}
+
 fn classify(
     ty: &syn::Type,
     table: &BTreeMap<String, StructDef>,
@@ -363,6 +394,22 @@ fn classify(
                 || scalar::libc_typedef(&name).is_some()
             {
                 return Ok(Field::ScalarArray);
+            }
+        }
+        // An array of a non-scalar element, built element-wise by classifying
+        // the element type. A buildable by-value struct becomes a
+        // `StructArray` (the array generalisation of `StructValue`, e.g. lil's
+        // `cell: [hashcell_t; 256]`); a function pointer / `void*` / `T**`
+        // element becomes an `OpaqueArray` of pointer-sized words carried by
+        // identity (e.g. lil's `callback: [lil_callback_proc_t; 8]`), never
+        // called -- the same soundness as the scalar `OpaqueWord` field. Any
+        // other element (a union without a discriminant, a non-aggregate
+        // pointee) stays unsupported.
+        if let Some(len) = array_len(&arr.len) {
+            match classify(&arr.elem, table, aliases) {
+                Ok(Field::StructValue(name)) => return Ok(Field::StructArray(name, len)),
+                Ok(Field::OpaqueWord(ety)) => return Ok(Field::OpaqueArray(ety, len)),
+                _ => {}
             }
         }
         return Err("array of a non-scalar element type".to_owned());
@@ -539,6 +586,12 @@ fn generate_in(
             Ok(Field::StructValue(target)) => {
                 referenced.insert(target.clone());
                 fields.push((name.clone(), Field::StructValue(target)));
+            }
+            // An array of a by-value struct element: likewise needs the element
+            // type's companions generated.
+            Ok(Field::StructArray(target, n)) => {
+                referenced.insert(target.clone());
+                fields.push((name.clone(), Field::StructArray(target, n)));
             }
             Ok(field) => fields.push((name.clone(), field)),
             Err(detail) => {
@@ -814,6 +867,14 @@ pub fn signature_shapes(
             Field::StructValue(name) => {
                 Err(format!("`{name}` passed or returned by value"))
             }
+            // An array passed/returned by value as a top-level argument is a
+            // separate harness path; leave unsupported (it is built as a field).
+            Field::StructArray(name, _) => {
+                Err(format!("array of `{name}` passed or returned by value"))
+            }
+            Field::OpaqueArray(_, _) => {
+                Err("opaque-pointer array passed or returned by value".to_owned())
+            }
             // A union passed by value as a top-level argument/return: likewise a
             // separate harness path; leave unsupported.
             Field::OpaqueUnion(name) => {
@@ -902,6 +963,15 @@ fn build_value(field: &Field, m: &str) -> String {
         Field::Pointer(target) => format!("gen_{target}(depth.saturating_sub(1))"),
         // A by-value struct: build it inline, never null.
         Field::StructValue(target) => format!("genval_{target}(depth.saturating_sub(1))"),
+        // An array of by-value structs: build each element inline.
+        Field::StructArray(target, n) => format!(
+            "core::array::from_fn::<_, {n}, _>(|_| genval_{target}(depth.saturating_sub(1)))"
+        ),
+        // An array of opaque pointer words: each a symbolic transmuted usize.
+        Field::OpaqueArray(ty, n) => format!(
+            "core::array::from_fn::<_, {n}, _>(|_| \
+             core::mem::transmute::<usize, {ty}>(kani::any::<usize>()))"
+        ),
         // A symbolic pointer-sized word reinterpreted as the field's own
         // nullable-fn-ptr type: covers null and every address, no value fixed.
         Field::OpaqueWord(ty) => {
@@ -919,8 +989,11 @@ fn build_value(field: &Field, m: &str) -> String {
 /// `m` (the destination module).
 fn clone_value(field: &Field, src: &str, m: &str) -> String {
     match field {
-        // `Copy` values (scalars, arrays, and the opaque fn-ptr word) copy over.
-        Field::Scalar(_) | Field::ScalarArray | Field::OpaqueWord(_) => src.to_owned(),
+        // `Copy` values (scalars, arrays, and the opaque fn-ptr word(s)) copy over.
+        Field::Scalar(_)
+        | Field::ScalarArray
+        | Field::OpaqueWord(_)
+        | Field::OpaqueArray(..) => src.to_owned(),
         Field::CStr => format!("clone_cstr({src} as *const core::ffi::c_char) as _"),
         Field::ScalarCell => format!("clone_cell({src})"),
         Field::Pointer(target) => format!("clone_{target}({src}, map)"),
@@ -929,6 +1002,10 @@ fn clone_value(field: &Field, src: &str, m: &str) -> String {
         Field::ScalarNewtype(name) => format!("{m}::{name}({src}.0)"),
         // A by-value struct: deep-copy it by value from a reference to the source.
         Field::StructValue(target) => format!("cloneval_{target}(&{src}, map)"),
+        // An array of by-value structs: deep-copy each element.
+        Field::StructArray(target, n) => format!(
+            "core::array::from_fn::<_, {n}, _>(|__i| cloneval_{target}(&({src})[__i], map))"
+        ),
         // A by-value union: byte-copy from old layout to new (inferred types).
         Field::OpaqueUnion(_) => format!("clone_union(&{src})"),
     }
@@ -938,8 +1015,11 @@ fn clone_value(field: &Field, src: &str, m: &str) -> String {
 /// `false` on a difference.
 fn compare_stmt(field: &Field, a: &str, b: &str) -> String {
     match field {
-        // Scalars, arrays, and the opaque fn-ptr word compare by value/identity.
-        Field::Scalar(_) | Field::ScalarArray | Field::OpaqueWord(_) => {
+        // Scalars, arrays, and the opaque fn-ptr word(s) compare by value/identity.
+        Field::Scalar(_)
+        | Field::ScalarArray
+        | Field::OpaqueWord(_)
+        | Field::OpaqueArray(..) => {
             format!("    if {a} != {b} {{ return false; }}\n")
         }
         // A newtype enum: compare the inner scalar (old::X and new::X differ as
@@ -956,6 +1036,10 @@ fn compare_stmt(field: &Field, a: &str, b: &str) -> String {
         Field::StructValue(target) => {
             format!("    if !sameval_{target}(&{a}, &{b}, corr) {{ return false; }}\n")
         }
+        // An array of by-value structs: compare element-wise.
+        Field::StructArray(target, n) => format!(
+            "    for __i in 0..{n} {{ if !sameval_{target}(&({a})[__i], &({b})[__i], corr) {{ return false; }} }}\n"
+        ),
         // A by-value union: compare its bytes (post-state), types inferred.
         Field::OpaqueUnion(_) => {
             format!("    if !same_union(&{a}, &{b}) {{ return false; }}\n")
@@ -1044,7 +1128,10 @@ fn cloner(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)], t
         match field {
             // Scalars, scalar arrays, and the opaque fn-ptr word are `Copy`:
             // copy them in the initializer.
-            Field::Scalar(_) | Field::ScalarArray | Field::OpaqueWord(_) => {
+            Field::Scalar(_)
+            | Field::ScalarArray
+            | Field::OpaqueWord(_)
+            | Field::OpaqueArray(..) => {
                 inits += &format!("        {name}: (*src).{name},\n")
             }
             // A C string is copied whole; it can't form cycles, so no linking.
@@ -1071,6 +1158,15 @@ fn cloner(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)], t
             // pointed to), so no two-phase linking is needed; any cycle through
             // its pointer sub-fields is resolved by `map` inside `cloneval_`.
             Field::StructValue(_) => {
+                inits += &format!(
+                    "        {name}: {},\n",
+                    clone_value(field, &format!("(*src).{name}"), new)
+                );
+            }
+            // An array of by-value structs: deep-copy element-wise in the
+            // initializer (inline, so no cycle back to this container; any cycle
+            // through an element's pointer sub-fields is resolved by `map`).
+            Field::StructArray(..) => {
                 inits += &format!(
                     "        {name}: {},\n",
                     clone_value(field, &format!("(*src).{name}"), new)

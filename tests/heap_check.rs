@@ -943,6 +943,144 @@ fn by_value_struct_field_catches_divergence() {
     );
 }
 
+// A fixed-size array of a by-value struct element (`cells: [Cell; 3]`), lil's
+// `_hashmap_t { cell: [hashcell_t; 256] }` shape. Each element is built,
+// cloned, and compared element-wise via the `genval_`/`cloneval_`/`sameval_`
+// companions -- the array generalisation of the by-value struct field.
+const SA_CELL: &str = "#[repr(C)] #[derive(Copy, Clone)] pub struct Cell { pub a: i32, pub p: *mut i32 }";
+const SA_OUTER: &str = "#[repr(C)] pub struct Grid { pub n: i32, pub cells: [Cell; 3] }";
+
+const SA_OLD: &str = r#"
+pub unsafe fn grid_a(g: *mut Grid) -> i32 {
+    if g.is_null() { return -1; }
+    (*g).cells[1].a
+}
+"#;
+
+const SA_OK: &str = r#"
+pub unsafe fn grid_a(g: *mut Grid) -> i32 {
+    if g.is_null() { return -1; }
+    let c = &(*g).cells[1];
+    (*c).a
+}
+"#;
+
+// Divergent: reads a different element, which differs since the elements are
+// independent.
+const SA_BAD: &str = r#"
+pub unsafe fn grid_a(g: *mut Grid) -> i32 {
+    if g.is_null() { return -1; }
+    (*g).cells[2].a
+}
+"#;
+
+#[test]
+fn struct_array_field_is_in_heap_scope() {
+    let unit = FnUnit::parse(SA_OLD, &[SA_CELL, SA_OUTER]).unwrap();
+    assert!(
+        c2rust_equiv::heap_diagnose(&unit).is_ok(),
+        "struct-array field rejected: {:?}",
+        c2rust_equiv::heap_diagnose(&unit)
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn struct_array_field_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(SA_OLD, &[SA_CELL, SA_OUTER]).unwrap();
+    let new = FnUnit::parse(SA_OK, &[SA_CELL, SA_OUTER]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn struct_array_field_catches_divergence() {
+    let old = FnUnit::parse(SA_OLD, &[SA_CELL, SA_OUTER]).unwrap();
+    let new = FnUnit::parse(SA_BAD, &[SA_CELL, SA_OUTER]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent array element was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
+// A fixed-size array of opaque function pointers (`cbs: [Cb; 3]`), lil's
+// `_lil_t { callback: [lil_callback_proc_t; 8] }` shape. Each element is a
+// symbolic pointer-sized word, carried and compared by identity (never called).
+const OA_DEFS: &[&str] = &[
+    "pub type Cb = Option<unsafe extern \"C\" fn(i32) -> i32>;",
+    "#[repr(C)] pub struct Holder { pub cbs: [Cb; 3], pub tag: i32 }",
+];
+
+const OA_OLD: &str = r#"
+pub unsafe fn holder_tag(h: *mut Holder) -> i32 {
+    if h.is_null() { return -1; }
+    (*h).cbs[0] = None;
+    (*h).tag
+}
+"#;
+
+const OA_OK: &str = r#"
+pub unsafe fn holder_tag(h: *mut Holder) -> i32 {
+    if h.is_null() { return -1; }
+    (*h).cbs[0] = None;
+    let t = (*h).tag;
+    t
+}
+"#;
+
+// Divergent: nulls a different array element, so the compared post-state of the
+// callback array differs whenever that element was non-null.
+const OA_BAD: &str = r#"
+pub unsafe fn holder_tag(h: *mut Holder) -> i32 {
+    if h.is_null() { return -1; }
+    (*h).cbs[1] = None;
+    (*h).tag
+}
+"#;
+
+#[test]
+fn opaque_array_field_is_in_heap_scope() {
+    let unit = FnUnit::parse(OA_OLD, OA_DEFS).unwrap();
+    assert!(
+        c2rust_equiv::heap_diagnose(&unit).is_ok(),
+        "opaque-array field rejected: {:?}",
+        c2rust_equiv::heap_diagnose(&unit)
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn opaque_array_field_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(OA_OLD, OA_DEFS).unwrap();
+    let new = FnUnit::parse(OA_OK, OA_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn opaque_array_field_catches_divergence() {
+    let old = FnUnit::parse(OA_OLD, OA_DEFS).unwrap();
+    let new = FnUnit::parse(OA_BAD, OA_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent callback-array write was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 // A by-value union of unknown discriminant (`v: U`), libxml2's
 // `xmlSchemaVal.value` shape. Built as symbolic raw bytes, byte-identical
 // across versions. A function reading a *scalar* variant consistently proves;

@@ -102,6 +102,66 @@ pub fn extract_heap_composed(
     extract_in(index, entry, true, summaries)
 }
 
+/// Research (not used by the tool): the full set of heap-path extraction
+/// blockers a function hits across its whole reachable closure, as `(category,
+/// detail)` pairs -- every skip, not just the first, exploring every reachable
+/// item without short-circuiting. Drives blocker-set / wall-combination
+/// analysis so levers can target the walls whose *joint* removal flips the most
+/// functions, rather than one-at-a-time first-blocker guessing.
+pub fn all_blockers(
+    index: &CrateIndex,
+    entry: usize,
+    summaries: &BTreeMap<String, syn::ItemFn>,
+) -> Vec<(String, String)> {
+    let summary_names: BTreeSet<String> = summaries
+        .keys()
+        .filter(|name| **name != index.entries[entry].name)
+        .cloned()
+        .collect();
+    let aliases = crate::heapgen::alias_table(index);
+    let structs = crate::heapgen::data_struct_fields(index);
+    let resolver = Resolver {
+        index,
+        heap: true,
+        summaries: &summary_names,
+        aliases: &aliases,
+        structs: &structs,
+    };
+    let mut out = Vec::new();
+    let mut closure = BTreeSet::new();
+    let mut queue = VecDeque::from([entry]);
+    while let Some(e) = queue.pop_front() {
+        if !closure.insert(e) {
+            continue;
+        }
+        let Some(item) = index.entries[e].item.as_ref() else {
+            continue;
+        };
+        let mut type_env = crate::indirectmodel::TypeEnv::from_index(index);
+        if let syn::Item::Fn(f) = item {
+            type_env.with_fn(f);
+        }
+        let rewritten = crate::globalaccessmodel::rewritten(item);
+        let analysed = rewritten.as_ref().unwrap_or(item);
+        let mut analyzer = Analyzer {
+            resolver: &resolver,
+            module: index.entries[e].module,
+            locals: locals(analysed, &resolver, index.entries[e].module),
+            found: vec![],
+            skip: None,
+            all: vec![],
+            type_env,
+        };
+        analyzer.visit_item(analysed);
+        for s in analyzer.all {
+            out.push((s.category, s.detail));
+        }
+        // Keep exploring regardless of blockers, so the whole closure is seen.
+        queue.extend(analyzer.found);
+    }
+    out
+}
+
 fn extract_in(
     index: &CrateIndex,
     entry: usize,
@@ -168,6 +228,7 @@ fn extract_in(
             locals: locals(analysed, &resolver, index.entries[e].module),
             found: vec![],
             skip: None,
+            all: vec![],
             type_env,
         };
         analyzer.visit_item(analysed);
@@ -808,17 +869,27 @@ struct Analyzer<'a> {
     locals: HashSet<String>,
     found: Vec<usize>,
     skip: Option<Skip>,
+    /// Every skip seen (not just the first), for research-mode blocker-set
+    /// analysis; the real extraction only reads `skip`.
+    all: Vec<Skip>,
     /// Struct-field and current-function variable types, so a modellable
     /// indirect (function-pointer) call can be recognised and admitted.
     type_env: crate::indirectmodel::TypeEnv,
 }
 
 impl Analyzer<'_> {
+    /// Record a skip: keep the first in `skip` (the real extraction's verdict)
+    /// and append every one to `all` (research-mode blocker-set analysis).
+    fn note(&mut self, s: Skip) {
+        self.all.push(s.clone());
+        self.skip.get_or_insert(s);
+    }
+
     fn path(&mut self, path: &syn::Path, ns: Ns) {
         match self.resolver.resolve(self.module, &self.locals, path, ns) {
             Res::Item(e) => self.found.push(e),
             Res::Skip(skip) => {
-                self.skip.get_or_insert(skip);
+                self.note(skip);
             }
             Res::Local | Res::External(_) => {}
         }
@@ -870,7 +941,7 @@ impl<'ast> Visit<'ast> for Analyzer<'_> {
                 && !crate::allocmodel::is_alloc_hook_call(c)
                 && !crate::errormodel::is_handler_dispatch(c)
             {
-                self.skip.get_or_insert(Skip::new(
+                self.note(Skip::new(
                     "indirect call",
                     format!(
                         "calls through a function pointer: {}",
@@ -952,7 +1023,7 @@ impl<'ast> Visit<'ast> for Analyzer<'_> {
             syn::visit::visit_item_static(self, s);
             return;
         }
-        self.skip.get_or_insert(Skip::new(
+        self.note(Skip::new(
             "global",
             format!("declares static `{}`", s.ident),
         ));
@@ -990,7 +1061,7 @@ impl<'ast> Visit<'ast> for Analyzer<'_> {
 
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
         if let Some(skip) = macro_skip(mac) {
-            self.skip.get_or_insert(skip);
+            self.note(skip);
         } else if let Ok(args) = macro_args(mac) {
             for arg in &args {
                 self.visit_expr(arg);

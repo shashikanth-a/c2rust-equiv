@@ -31,5 +31,7 @@ pub mod unit;
 
 pub use check::{check, heap_diagnose, heap_eligible, Method, Options, Outcome, Status};
 pub use crate_index::CrateIndex;
-pub use extract::{extract, extract_heap, extract_heap_composed, extract_unvalidated};
+pub use extract::{
+    all_blockers, extract, extract_heap, extract_heap_composed, extract_unvalidated,
+};
 pub use unit::{FnUnit, Skip};
