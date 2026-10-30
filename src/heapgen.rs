@@ -476,7 +476,12 @@ fn opaque_word_type(ty: &syn::Type, aliases: &BTreeMap<String, syn::Type>) -> St
     struct StripAbi;
     impl VisitMut for StripAbi {
         fn visit_type_bare_fn_mut(&mut self, f: &mut syn::TypeBareFn) {
-            f.abi = None;
+            // Keep `extern "C"` on a C-variadic fn pointer: a Rust-ABI variadic
+            // is illegal (E0045). It is held by identity, never called, so the
+            // field type need only name a valid pointer-sized type.
+            if f.variadic.is_none() {
+                f.abi = None;
+            }
             syn::visit_mut::visit_type_bare_fn_mut(self, f);
         }
     }

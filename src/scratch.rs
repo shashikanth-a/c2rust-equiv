@@ -492,7 +492,14 @@ fn make_standalone(item: &mut syn::Item) {
     struct RustAbi;
     impl VisitMut for RustAbi {
         fn visit_type_bare_fn_mut(&mut self, f: &mut syn::TypeBareFn) {
-            f.abi = None;
+            // A C-variadic fn pointer must keep its `extern "C"` ABI: a Rust-ABI
+            // variadic is illegal (E0045). Such a pointer is only ever held by
+            // identity (never called on the heap path -- its call site is
+            // rewritten to a trace), so the panic-abort concern that motivates
+            // the Rust-ABI rewrite does not apply to it.
+            if f.variadic.is_none() {
+                f.abi = None;
+            }
             syn::visit_mut::visit_type_bare_fn_mut(self, f);
         }
     }

@@ -1686,6 +1686,69 @@ fn indirect_call_catches_different_argument() {
     );
 }
 
+// A *variadic* callback through a nested SAX-handler field, the shape of
+// libxml2's printf-style diagnostics `(*(*ctxt).sax).warning.expect("..")(ud,
+// msg, args...)`. The fixed prefix (user-data pointer, format string) is typed
+// from the signature; each variadic tail argument is classified from its
+// call-site expression and recorded as its own trace event, so a rewrite that
+// passes a different tail argument diverges and is caught rather than silently
+// collapsed. (indirectmodel's variadic handling + tail_kind.)
+const SV_DEFS: &[&str] = &[
+    "pub type warn_t = unsafe extern \"C\" fn(*const core::ffi::c_char, ...) -> ();",
+    "#[repr(C)] pub struct Sax { pub warning: Option<warn_t> }",
+    "#[repr(C)] pub struct Ctxt { pub sax: *mut Sax, pub n: i32 }",
+];
+
+const SV_OLD: &str = r#"
+pub unsafe fn run(c: *mut Ctxt, msg: *const core::ffi::c_char) {
+    if c.is_null() || (*c).sax.is_null() { return; }
+    (*(*c).sax).warning.expect("non-null function pointer")(msg, (*c).n as i32);
+}
+"#;
+
+// Equivalent: the tail value is bound to a local first, same value passed.
+const SV_OK: &str = r#"
+pub unsafe fn run(c: *mut Ctxt, msg: *const core::ffi::c_char) {
+    if c.is_null() || (*c).sax.is_null() { return; }
+    let k = (*c).n;
+    (*(*c).sax).warning.expect("non-null function pointer")(msg, k as i32);
+}
+"#;
+
+// Wrong: the variadic tail argument differs, so the recorded trace diverges.
+const SV_BAD: &str = r#"
+pub unsafe fn run(c: *mut Ctxt, msg: *const core::ffi::c_char) {
+    if c.is_null() || (*c).sax.is_null() { return; }
+    (*(*c).sax).warning.expect("non-null function pointer")(msg, (*c).n.wrapping_add(1) as i32);
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn variadic_sax_callback_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(SV_OLD, SV_DEFS).unwrap();
+    let new = FnUnit::parse(SV_OK, SV_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn variadic_sax_callback_catches_different_tail_argument() {
+    let old = FnUnit::parse(SV_OLD, SV_DEFS).unwrap();
+    let new = FnUnit::parse(SV_BAD, SV_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a different variadic tail argument was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 // A function-pointer *argument* (not a struct field): built as an opaque
 // symbolic word and passed to both versions, then called via the modelled
 // indirect call. Proves equivalent when both call it with the same argument;

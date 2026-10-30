@@ -200,8 +200,11 @@ fn modellable_sig(
     aliases: &BTreeMap<String, syn::Type>,
 ) -> Option<(Vec<u8>, String)> {
     // Each argument is recorded as its own trace event, so any arity works; cap
-    // it only to bound trace usage (the widest SAX callback takes eight).
-    if f.variadic.is_some() || f.inputs.len() > 16 {
+    // it only to bound trace usage (the widest SAX callback takes eight). A
+    // variadic callback is admitted here: the fixed prefix is classified below,
+    // and `plan_call` classifies each variadic tail argument from its call site,
+    // rejecting the call if any tail argument can't be typed.
+    if f.inputs.len() > 16 {
         return None;
     }
     if let syn::ReturnType::Type(_, t) = &f.output {
@@ -260,6 +263,28 @@ fn last_segment(ty: &syn::Type) -> Option<String> {
     }
 }
 
+/// The trace kind of a variadic tail argument, classified from the call-site
+/// expression: an explicit cast `e as T` by its target type (c2rust's usual
+/// shape, since C varargs are promoted with an explicit cast), otherwise by the
+/// expression's resolved lvalue type. Returns `None` -- which rejects the whole
+/// call as out of scope -- when the argument can't be typed, or is a float: the
+/// trace records a scalar by value-cast to `u128`, exact for integers, string
+/// and pointer identities, but bit-lossy for floats (two distinct floats could
+/// collapse to one trace value), so a float tail is conservatively rejected.
+fn tail_kind(arg: &syn::Expr, env: &TypeEnv) -> Option<u8> {
+    let ty = match arg {
+        syn::Expr::Paren(p) => return tail_kind(&p.expr, env),
+        syn::Expr::Group(g) => return tail_kind(&g.expr, env),
+        syn::Expr::Cast(c) => (*c.ty).clone(),
+        _ => env.type_of(arg)?,
+    };
+    let resolved = crate::heapgen::resolve_alias(&ty, &env.aliases);
+    if last_segment(&resolved).as_deref().and_then(float_width).is_some() {
+        return None;
+    }
+    arg_kind(&resolved, &env.aliases)
+}
+
 /// The bits expression for one argument, given its kind tag (as
 /// [`crate::strmodel::arg_kind_bits`], but on an expression rather than a name).
 fn arg_bits(arg: &syn::Expr, kind: u8) -> String {
@@ -283,8 +308,24 @@ fn plan_call(call: &syn::ExprCall, env: &TypeEnv) -> Option<CallPlan> {
     // The receiver must type to `Option<bare fn>` (through aliases); read it.
     let recv_ty = env.type_of(&mc.receiver)?;
     let bare = option_bare_fn(&recv_ty, &env.aliases)?;
-    let (arg_kinds, ret) = modellable_sig(&bare, &env.aliases)?;
-    if call.args.len() != bare.inputs.len() {
+    let (mut arg_kinds, ret) = modellable_sig(&bare, &env.aliases)?;
+    let fixed = bare.inputs.len();
+    if bare.variadic.is_some() {
+        // A variadic callback (libxml2's `warning`/`error`/`fatalError`, printf-
+        // style diagnostics). The fixed prefix is classified from the signature;
+        // each variadic tail argument is classified from its call-site
+        // expression, and the whole call is rejected -- kept out of scope, which
+        // is sound -- if any tail argument can't be typed as an integer/string/
+        // pointer. Each argument is still recorded as its own ordered trace
+        // event, so a rewrite that passes a different tail diverges and is
+        // caught rather than silently collapsed.
+        if call.args.len() < fixed {
+            return None;
+        }
+        for arg in call.args.iter().skip(fixed) {
+            arg_kinds.push(tail_kind(arg, env)?);
+        }
+    } else if call.args.len() != fixed {
         return None;
     }
     Some(CallPlan {
@@ -522,6 +563,14 @@ mod sax_tests {
         pub unsafe fn w(ctxt: *mut xmlParserCtxt) {
             (*(*ctxt).sax).warning.expect("non-null function pointer")((*ctxt).ud);
         }
+        pub unsafe fn wv(ctxt: *mut xmlParserCtxt, msg: *const i8, name: *const u8, n: i32) {
+            (*(*ctxt).sax).warning.expect("non-null function pointer")(
+                (*ctxt).ud, msg, name as *const i8, n as i32,
+            );
+        }
+        pub unsafe fn wu(ctxt: *mut xmlParserCtxt, msg: *const i8) {
+            (*(*ctxt).sax).warning.expect("non-null function pointer")((*ctxt).ud, msg, mystery());
+        }
     "#;
 
     fn env() -> (Vec<syn::Item>, TypeEnv) {
@@ -539,10 +588,34 @@ mod sax_tests {
     }
 
     #[test]
-    fn variadic_nested_sax_callback_is_not_modellable() {
+    fn variadic_call_below_fixed_arity_is_not_modellable() {
+        // `w` passes one argument where the fixed prefix needs two; a call that
+        // doesn't even cover the fixed signature is rejected.
         let (its, mut env) = env();
         let f = its.iter().find_map(|i| match i { syn::Item::Fn(f) if f.sig.ident=="w" => Some(f.clone()), _=>None }).unwrap();
         env.with_fn(&f);
-        assert!(!all_indirect_calls_modellable(&f, &its), "variadic SAX callback must NOT be modellable");
+        assert!(!all_indirect_calls_modellable(&f, &its), "variadic call below fixed arity must NOT be modellable");
+    }
+
+    #[test]
+    fn variadic_tail_classifiable_is_modellable() {
+        // A variadic diagnostic whose tail arguments are all typeable (a cast
+        // string pointer and a cast integer) is modelled, each recorded as its
+        // own trace event.
+        let (its, mut env) = env();
+        let f = its.iter().find_map(|i| match i { syn::Item::Fn(f) if f.sig.ident=="wv" => Some(f.clone()), _=>None }).unwrap();
+        env.with_fn(&f);
+        assert!(all_indirect_calls_modellable(&f, &its), "classifiable variadic tail should be modellable");
+    }
+
+    #[test]
+    fn variadic_tail_untypeable_is_rejected() {
+        // A tail argument that can't be typed (an un-annotated call result) is
+        // conservatively rejected, so a divergent tail is never silently
+        // collapsed to the same trace.
+        let (its, mut env) = env();
+        let f = its.iter().find_map(|i| match i { syn::Item::Fn(f) if f.sig.ident=="wu" => Some(f.clone()), _=>None }).unwrap();
+        env.with_fn(&f);
+        assert!(!all_indirect_calls_modellable(&f, &its), "untypeable variadic tail must NOT be modellable");
     }
 }
