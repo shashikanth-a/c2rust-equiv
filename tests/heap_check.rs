@@ -343,6 +343,63 @@ fn variadic_printf_catches_different_argument() {
     );
 }
 
+// A variadic input parser (`sscanf`) modelled as an observable trace: its
+// arguments -- the input string and format by content, the output pointer by
+// identity -- are recorded, a shared symbolic count is returned, and the output
+// is left unwritten. Both versions make the identical call, so an equivalent
+// use proves and a divergent one is caught.
+const SSCANF_DECL: &str =
+    "extern \"C\" { fn sscanf(_: *const core::ffi::c_char, _: *const core::ffi::c_char, ...) -> core::ffi::c_int; }";
+
+const SC_OLD: &str = r#"
+pub unsafe fn h(s: *const core::ffi::c_char, out: *mut i32) -> i32 {
+    if s.is_null() || out.is_null() { return -1; }
+    sscanf(s, b"%d\0".as_ptr() as *const core::ffi::c_char, out)
+}
+"#;
+
+const SC_OK: &str = r#"
+pub unsafe fn h(s: *const core::ffi::c_char, out: *mut i32) -> i32 {
+    if s.is_null() || out.is_null() { return -1; }
+    let fmt = b"%d\0".as_ptr() as *const core::ffi::c_char;
+    sscanf(s, fmt, out)
+}
+"#;
+
+// Wrong: the returned count is offset, diverging from the recorded result.
+const SC_BAD: &str = r#"
+pub unsafe fn h(s: *const core::ffi::c_char, out: *mut i32) -> i32 {
+    if s.is_null() || out.is_null() { return -1; }
+    sscanf(s, b"%d\0".as_ptr() as *const core::ffi::c_char, out) + 1
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn variadic_sscanf_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(SC_OLD, &[SSCANF_DECL]).unwrap();
+    let new = FnUnit::parse(SC_OK, &[SSCANF_DECL]).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn variadic_sscanf_catches_divergence() {
+    let old = FnUnit::parse(SC_OLD, &[SSCANF_DECL]).unwrap();
+    let new = FnUnit::parse(SC_BAD, &[SSCANF_DECL]).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent sscanf use proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 // A string-argument external (`note`) traced by content: both versions must
 // pass the same string bytes, not the same address.
 const NOTE_DECL: &str = "extern \"C\" { fn note(_: *const core::ffi::c_char); }";

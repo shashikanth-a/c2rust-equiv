@@ -23,6 +23,19 @@ fn variadic_ret(name: &str) -> Option<&'static str> {
             "::core::ffi::c_int"
         }
         "syslog" | "vsyslog" => "()",
+        // Variadic input parsers (`sscanf(buf, fmt, &a, &b, ..)`) and the
+        // `open`/`fcntl` syscalls, modelled as observable trace calls: every
+        // argument -- including the output pointers, by heap-bijection identity
+        // -- is recorded, and a shared symbolic result is returned. The output
+        // locations are NOT written (left at their symbolic pre-call state), so
+        // a function that relies on the parsed value proves nothing unsoundly:
+        // both versions see the identical (unmodelled) outcome, and any use
+        // that genuinely diverges is caught by the recorded arguments and the
+        // heap comparison. This is conservative (it may fail to prove a true
+        // equivalence), never a false proof.
+        "sscanf" | "fscanf" | "vsscanf" | "vfscanf" | "__isoc99_sscanf"
+        | "__isoc99_fscanf" => "::core::ffi::c_int",
+        "open" | "openat" | "fcntl" => "::core::ffi::c_int",
         _ => return None,
     })
 }

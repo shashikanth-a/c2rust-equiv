@@ -165,6 +165,28 @@ macro_rules! trace_arg_cstr {
 }
 trace_arg_cstr!(*const i8, *mut i8, *const u8, *mut u8);
 
+// Non-string scalar pointers (e.g. `sscanf`'s output targets `*mut i32`):
+// recorded by identity (kind 2), compared through the heap bijection, so two
+// corresponding objects compare equal regardless of their concrete addresses.
+// Pointer types without an impl (a struct pointer, say) still fail to compile,
+// leaving that call unmodelled rather than modelled unsoundly.
+macro_rules! trace_arg_ptr {
+    ($($t:ty),*) => {$(
+        impl TraceArg for $t {
+            fn bits(&self) -> u128 { *self as usize as u128 }
+            fn kind(&self) -> u8 { 2 }
+        }
+    )*};
+}
+trace_arg_ptr!(
+    *const i16, *mut i16, *const u16, *mut u16,
+    *const i32, *mut i32, *const u32, *mut u32,
+    *const i64, *mut i64, *const u64, *mut u64,
+    *const isize, *mut isize, *const usize, *mut usize,
+    *const f32, *mut f32, *const f64, *mut f64,
+    *const core::ffi::c_void, *mut core::ffi::c_void
+);
+
 /// The most external calls a run records. Observable-behaviour equivalence
 /// (VOC / CoVaC): the first version records its external-call trace, the second
 /// must replay it exactly, so both make the same calls in the same order.
