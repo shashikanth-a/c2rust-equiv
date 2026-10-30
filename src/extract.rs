@@ -563,7 +563,13 @@ impl Resolver<'_> {
         let segs = scalar::idents(path);
         let first = segs[0].as_str();
         if path.leading_colon.is_none() {
-            if ns == Ns::Value && segs.len() == 1 && locals.contains(first) {
+            // A local name: a binding or parameter (value, single segment), or a
+            // function-local type whose variants/associated items resolve in the
+            // body (e.g. c2rust's goto-dispatch `enum C2Rust_Block { .. }`,
+            // referenced `C2Rust_Block::found`). A local name shadows any crate
+            // item, and the local definition is emitted verbatim in the unit, so
+            // the whole path is in scope.
+            if locals.contains(first) {
                 return Res::Local;
             }
             if let Some(full) = self.index.modules[module].uses.get(first) {
@@ -1020,6 +1026,23 @@ fn locals(item: &syn::Item, resolver: &Resolver, module: usize) -> HashSet<Strin
             // each once, so a lazily-initialised static is built identically.
             self.0.insert(s.ident.to_string());
             syn::visit::visit_item_static(self, s);
+        }
+        // Function-local type definitions (c2rust lowers a C `goto` into a
+        // `loop`+`match` over a body-local `enum C2Rust_Block { .. }`, referenced
+        // as `C2Rust_Block::found`). The type and its variants are emitted
+        // verbatim in the body, so such references resolve locally rather than
+        // being out-of-scope crate paths.
+        fn visit_item_enum(&mut self, e: &'ast syn::ItemEnum) {
+            self.0.insert(e.ident.to_string());
+            syn::visit::visit_item_enum(self, e);
+        }
+        fn visit_item_struct(&mut self, s: &'ast syn::ItemStruct) {
+            self.0.insert(s.ident.to_string());
+            syn::visit::visit_item_struct(self, s);
+        }
+        fn visit_item_union(&mut self, u: &'ast syn::ItemUnion) {
+            self.0.insert(u.ident.to_string());
+            syn::visit::visit_item_union(self, u);
         }
     }
     let mut l = Locals(HashSet::new());

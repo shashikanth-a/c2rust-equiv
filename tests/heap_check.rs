@@ -817,6 +817,112 @@ fn opaque_foreign_type_catches_divergence() {
     );
 }
 
+// A c2rust goto-dispatch body: a C `goto` lowered to a `loop` over a
+// function-local `enum C2Rust_Block { .. }`, referenced as `C2Rust_Block::found`
+// in value and pattern position. The local type and its variants resolve in the
+// body (they are emitted verbatim), so the function is in scope rather than
+// being rejected on the unresolved `C2Rust_Block::*` paths. Here it sums a list.
+const GOTO_DEFS: &[&str] = &["#[repr(C)] pub struct Node { pub val: i32, pub next: *mut Node }"];
+
+const GOTO_OLD: &str = r#"
+pub unsafe fn f(p: *mut Node) -> i32 {
+    if p.is_null() { return 0; }
+    enum C2Rust_Block { Add, Step, Done }
+    let mut blk = C2Rust_Block::Add;
+    let mut acc: i32 = 0;
+    let mut cur = p;
+    loop {
+        match blk {
+            C2Rust_Block::Add => { acc += (*cur).val; blk = C2Rust_Block::Step; }
+            C2Rust_Block::Step => {
+                if (*cur).next.is_null() { blk = C2Rust_Block::Done; }
+                else { cur = (*cur).next; blk = C2Rust_Block::Add; }
+            }
+            C2Rust_Block::Done => { return acc; }
+        }
+    }
+}
+"#;
+
+// Equivalent: the same dispatch, accumulating in the `Step` block instead.
+const GOTO_OK: &str = r#"
+pub unsafe fn f(p: *mut Node) -> i32 {
+    if p.is_null() { return 0; }
+    enum C2Rust_Block { Add, Step, Done }
+    let mut blk = C2Rust_Block::Add;
+    let mut acc: i32 = 0;
+    let mut cur = p;
+    loop {
+        match blk {
+            C2Rust_Block::Add => { blk = C2Rust_Block::Step; }
+            C2Rust_Block::Step => {
+                acc += (*cur).val;
+                if (*cur).next.is_null() { blk = C2Rust_Block::Done; }
+                else { cur = (*cur).next; blk = C2Rust_Block::Add; }
+            }
+            C2Rust_Block::Done => { return acc; }
+        }
+    }
+}
+"#;
+
+// Wrong: doubles each value, so the sum differs for a non-empty list.
+const GOTO_BAD: &str = r#"
+pub unsafe fn f(p: *mut Node) -> i32 {
+    if p.is_null() { return 0; }
+    enum C2Rust_Block { Add, Step, Done }
+    let mut blk = C2Rust_Block::Add;
+    let mut acc: i32 = 0;
+    let mut cur = p;
+    loop {
+        match blk {
+            C2Rust_Block::Add => { acc += (*cur).val * 2; blk = C2Rust_Block::Step; }
+            C2Rust_Block::Step => {
+                if (*cur).next.is_null() { blk = C2Rust_Block::Done; }
+                else { cur = (*cur).next; blk = C2Rust_Block::Add; }
+            }
+            C2Rust_Block::Done => { return acc; }
+        }
+    }
+}
+"#;
+
+#[test]
+fn goto_dispatch_local_enum_is_in_heap_scope() {
+    let old = FnUnit::parse(GOTO_OLD, GOTO_DEFS).unwrap();
+    assert!(
+        old.heap_body_in_scope().is_ok(),
+        "goto-dispatch local-enum function rejected: {:?}",
+        old.heap_body_in_scope()
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn goto_dispatch_local_enum_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(GOTO_OLD, GOTO_DEFS).unwrap();
+    let new = FnUnit::parse(GOTO_OK, GOTO_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn goto_dispatch_local_enum_catches_divergence() {
+    let old = FnUnit::parse(GOTO_OLD, GOTO_DEFS).unwrap();
+    let new = FnUnit::parse(GOTO_BAD, GOTO_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(8));
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent goto-dispatch rewrite was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 // Lock/unlock wrapper calls around real work: without the mutex model the call
 // to `xmlMutexLock` (and its global argument) would put the function out of
 // scope; with it, the calls are dropped as sequential no-ops and the actual
