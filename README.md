@@ -71,6 +71,50 @@ For every input, both versions return the same value, or both panic.
    then random inputs from a recorded seed. A pass is reported as
    `tested(n_cases, seed)`: no difference was found, which is not a proof.
 
+### The heap path
+
+Functions with pointer or struct arguments, or that touch globals, foreign
+calls or I/O, go through a second path. Instead of only scalar inputs, the
+harness builds a **symbolic heap**: it generates a bounded symbolic object for
+each pointer argument (structs, fixed arrays, discriminated unions, nested
+pointers), runs both versions on corresponding inputs linked by a pointer
+**bijection**, and compares the final heap state structurally — so a divergent
+write is caught, not just a divergent return value. Equivalence here is
+*observable behaviour* (in the sense of VOC / CoVaC): beyond the result and the
+heap, both versions must make the same sequence of external effects.
+
+External effects that can't be executed under verification are **modelled**, so
+that both versions are treated identically and any real divergence still shows
+up:
+
+- **Foreign calls and I/O** become observable-call traces: each call records
+  its arguments (scalars by value, strings by content, pointers by bijection)
+  and returns one shared symbolic result, so both versions must call the same
+  function with corresponding arguments in the same order. This covers calls of
+  any arity, the `printf`/`sprintf` family, `sscanf`/`scanf`, `open`/`fcntl`,
+  and indirect calls through function-pointer struct fields, globals,
+  callback-table elements, and thread-local accessors.
+- **Globals** are compared by final state: a scalar, struct or array `static
+  mut` starts from its shared initialiser and its final value must agree; a
+  read-only data global is carried as an identical copy (and rejected if the
+  unit writes it). Error reporting (`xmlLastError`) is modelled this way, which
+  is what makes "the error state is observable" hold.
+- **Standard idioms** are modelled or normalised: an uncontended mutex as a
+  sequential no-op, the allocator hooks (`xmlMalloc` …) and stdio stream globals
+  as fixed definitions, a C incomplete type (`extern "C" { pub type X; }`) as an
+  opaque pointer target, a C `goto` lowered to a `loop`+`match` over a
+  function-local `enum`, and c2rust's per-file duplicate anonymous types,
+  constants and `extern` redeclarations.
+
+The guiding rule is soundness, not coverage: where an effect's real semantics
+can't be reproduced (a syscall's effect on the filesystem, the bytes a `scanf`
+parses, a dereferenced symbolic pointer returned by a modelled callback), the
+value is left shared-symbolic and the function is conservatively left
+*unproved* rather than proved on an unfaithful model. A model may make the tool
+fail to prove a true equivalence; it never makes it prove a false one. Every
+model has Kani tests in both directions — it proves an equivalent rewrite and
+catches a divergent one.
+
 Each function gets one status: `proved(bounded, unwind=N)`,
 `counterexample(inputs, old_out, new_out)`, `tested(n_cases, seed)`,
 `skipped(reason)` or `error(reason)`.
@@ -86,17 +130,33 @@ both versions share, hiding the real difference. See `specs/README.md`.
 
 ## Scope and limitations
 
-- Only functions with scalar arguments and return values (integers, floats,
-  `bool`, `char`, including C type aliases such as `c_int`) are checked, with no
-  raw pointers, globals, foreign calls or I/O, transitively through callees.
-  Everything else is `skipped`, with the reason.
+In scope (transitively through callees):
+
+- **Scalar** functions: integers, floats, `bool`, `char`, and C type aliases
+  such as `c_int`.
+- **Heap** functions (see "The heap path"): pointers to structs, fixed arrays
+  and discriminated unions; scalar/struct/array `static mut` globals (compared
+  by final state) and read-only data globals; foreign calls and I/O modelled as
+  observable-call traces; indirect calls through function-pointer fields,
+  globals, callback tables and accessors; the standard C idioms listed above.
+
+Everything else is `skipped`, with the reason. Still out of scope:
+
+- A foreign call whose compared output depends on its *real* semantics beyond
+  the shared-symbolic model (a filesystem syscall's effect, the value a `scanf`
+  parses) — admitted but conservatively left unproved, never proved on the
+  model. A by-value struct argument to a foreign call, a call with more than 16
+  arguments, an undiscriminated union, or inline assembly is skipped outright.
 - Name resolution is syntactic. It handles `use` imports, `crate::`/`super::`
-  paths and `extern "C"` declarations, but not glob imports, macros other than
-  `assert!`/`panic!`-style ones, or trait methods on crate types.
+  paths, `extern "C"` declarations and function-local type definitions, but not
+  glob imports, macros other than `assert!`/`panic!`-style ones, or trait
+  methods on crate types.
 - Kani is slow on some arithmetic. Proving two 16-bit divisions equal takes
   about 40 seconds per harness on an M-series Mac, and 32-bit division hits the
   default 60-second timeout. Float-heavy functions get a shorter timeout
-  (default 20s), because those proofs are often slow too.
+  (default 20s), because those proofs are often slow too. A function can be *in
+  scope* (its harness builds) yet still fall back to testing or time out when
+  proved — eligibility and provability are separate.
 - Functions are checked one at a time. Each check builds a small crate, which
   takes a few seconds.
 - Cache keys include the tool's version but not its build, so clear the cache
@@ -114,19 +174,33 @@ both versions share, hiding the real difference. See `specs/README.md`.
 
 ## Results
 
-On C2Rust output for two crates, on an M-series Mac with Kani 0.68. Timings
-are for runs without cache hits.
+On C2Rust output, on an M-series Mac with Kani 0.68.
 
-**How many functions are in scope.**
+**How many functions are in scope (eligibility).** With the heap path, "in
+scope" means the equivalence harness builds and the function is modelled
+soundly; whether Kani then proves it (versus timing out or falling back to
+testing) is separate. Measured per crate:
 
-| Crate | Functions | In scope | Main reasons for skipping |
+| Crate | Functions | In scope | Coverage |
 |---|---|---|---|
-| C2Rust's C unit tests (51 files) | 95 | 19 (20%) | raw pointers (67), globals (3), crate types (3) |
-| SQLite 3.53.4 (102 files) | 2,772 | 34 (1.2%) | raw pointers (2,669), globals (47), foreign calls (11) |
+| lil | 162 | 159 | 98.1% |
+| genann | 25 | 24 | 96.0% |
+| libxml2 | 4,867 | 3,851 | 79.1% |
+| json-c | 265 | 201 | 75.8% |
+| tmux | 1,389 | 199 | 14.3% |
 
-**LLM rewrites.** An LLM was asked to rewrite every in-scope function into
-more idiomatic Rust, keeping its signature and behaviour. It wasn't told about
-this tool.
+Small, algorithmic crates approach their ceiling. The large systems crates sit
+lower because their remaining functions are tightly co-blocked (a foreign call,
+a global and an indirect dispatch at once) or depend on effects that can't be
+soundly modelled (filesystem syscalls, FILE-buffer internals); tmux is lowest
+because most of it is built on libevent's opaque event-loop machinery.
+
+**LLM rewrites.** The next two experiments check that the verdicts are sound —
+that `proved` means equivalent and a real change is caught. They were run on
+the scalar path over C2Rust's C unit tests and a transpiled SQLite 3.53.4
+(timings for runs without cache hits). An LLM was asked to rewrite every
+in-scope function into more idiomatic Rust, keeping its signature and
+behaviour. It wasn't told about this tool.
 
 | Rewrites | Checked | Proved (bounded) | Counterexamples | Tested only | Skipped | Median / p95 time |
 |---|---|---|---|---|---|---|

@@ -47,19 +47,31 @@ struct Spec {
 fn spec(name: &str) -> Option<Spec> {
     Some(match name {
         // schannel, channel (fn ptrs), data, ctx, node (void*), ..., level, ...
-        "__xmlRaiseError" => Spec { fnptr: 2, ptr_end: 5, level: Some(7) },
+        "__xmlRaiseError" => Spec {
+            fnptr: 2,
+            ptr_end: 5,
+            level: Some(7),
+        },
         // The generic/validity error printers: `(ctx: *mut c_void, msg, ...)`.
         "xmlGenericErrorDefaultFunc"
         | "xmlParserError"
         | "xmlParserWarning"
         | "xmlParserValidityError"
-        | "xmlParserValidityWarning" => Spec { fnptr: 0, ptr_end: 1, level: None },
+        | "xmlParserValidityWarning" => Spec {
+            fnptr: 0,
+            ptr_end: 1,
+            level: None,
+        },
         // json-c's error-setting primitive `_json_c_set_last_err(fmt, ...)`: a
         // bare variadic printer (no leading pointer), modelled as an observable
         // trace exactly like the libxml2 diagnostic printers. Sound as stateless
         // for the same reason as __xmlRaiseError -- the error buffer it writes is
         // read only through a separate accessor that stays out of scope.
-        "_json_c_set_last_err" => Spec { fnptr: 0, ptr_end: 0, level: None },
+        "_json_c_set_last_err" => Spec {
+            fnptr: 0,
+            ptr_end: 0,
+            level: None,
+        },
         _ => return None,
     })
 }
@@ -82,16 +94,38 @@ pub fn is_error_fn(name: &str) -> bool {
 /// register-node hooks take one node pointer. All return `()`.
 fn handler(accessor: &str) -> Option<(&'static str, Spec)> {
     Some(match accessor {
-        "__xmlGenericError" => ("xmlGenericError", Spec { fnptr: 0, ptr_end: 1, level: None }),
-        "__xmlStructuredError" => {
-            ("xmlStructuredError", Spec { fnptr: 0, ptr_end: 2, level: None })
-        }
-        "__xmlRegisterNodeDefaultValue" => {
-            ("xmlRegisterNodeDefaultValue", Spec { fnptr: 0, ptr_end: 1, level: None })
-        }
-        "__xmlDeregisterNodeDefaultValue" => {
-            ("xmlDeregisterNodeDefaultValue", Spec { fnptr: 0, ptr_end: 1, level: None })
-        }
+        "__xmlGenericError" => (
+            "xmlGenericError",
+            Spec {
+                fnptr: 0,
+                ptr_end: 1,
+                level: None,
+            },
+        ),
+        "__xmlStructuredError" => (
+            "xmlStructuredError",
+            Spec {
+                fnptr: 0,
+                ptr_end: 2,
+                level: None,
+            },
+        ),
+        "__xmlRegisterNodeDefaultValue" => (
+            "xmlRegisterNodeDefaultValue",
+            Spec {
+                fnptr: 0,
+                ptr_end: 1,
+                level: None,
+            },
+        ),
+        "__xmlDeregisterNodeDefaultValue" => (
+            "xmlDeregisterNodeDefaultValue",
+            Spec {
+                fnptr: 0,
+                ptr_end: 1,
+                level: None,
+            },
+        ),
         _ => return None,
     })
 }
@@ -247,7 +281,11 @@ impl VisitMut for Rewrite {
                 if (mc.method == "is_some" || mc.method == "is_none")
                     && deref_accessor_name(&mc.receiver).is_some() =>
             {
-                let v = if mc.method == "is_some" { "true" } else { "false" };
+                let v = if mc.method == "is_some" {
+                    "true"
+                } else {
+                    "false"
+                };
                 *e = syn::parse_str(v).expect("bool literal parses");
             }
             _ => {}
@@ -344,14 +382,11 @@ fn block(
         };
         let mut body = String::from("let __le = core::ptr::addr_of_mut!(xmlLastError); ");
         for (f, ty) in scalars {
-            body += &format!("{} as {ty}; ", field(format!("{f}")));
+            body += &format!("{} as {ty}; ", field(f.to_string()));
         }
         // The `level` field is a C-enum newtype `xmlErrorLevel(c_uint)`; write
         // its inner scalar directly so its constructor need not be named.
-        body += &format!(
-            "{} as core::ffi::c_uint; ",
-            field("level.0".to_owned())
-        );
+        body += &format!("{} as core::ffi::c_uint; ", field("level.0".to_owned()));
         // The pointer fields (the formatted message and friends) are set to null,
         // not a trace value: the formatted content isn't modelled, so a function
         // that observably uses one is kept out of scope by the extractor's
@@ -393,7 +428,10 @@ mod tests {
             .iter()
             .map(|i| i.to_token_stream().to_string())
             .collect::<String>();
-        assert!(!src.contains("__xmlRaiseError ("), "call should be gone: {src}");
+        assert!(
+            !src.contains("__xmlRaiseError ("),
+            "call should be gone: {src}"
+        );
         assert!(src.contains("TRACE"), "{src}");
         // The three `*mut c_void` context pointers recorded by address word.
         assert!(src.contains("as usize"), "{src}");

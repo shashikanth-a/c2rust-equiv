@@ -151,7 +151,10 @@ impl Analysis {
             syn::Expr::Call(call) => match &*call.func {
                 syn::Expr::Path(p)
                     if p.path.segments.last().is_some_and(|s| {
-                        matches!(s.ident.to_string().as_str(), "malloc" | "calloc" | "realloc")
+                        matches!(
+                            s.ident.to_string().as_str(),
+                            "malloc" | "calloc" | "realloc"
+                        )
                     }) =>
                 {
                     Prov::Local

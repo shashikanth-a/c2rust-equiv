@@ -182,11 +182,7 @@ fn translate_block(
     None
 }
 
-fn translate_expr(
-    g: &mut EGraph<Peg, ()>,
-    e: &syn::Expr,
-    env: &HashMap<String, Id>,
-) -> Option<Id> {
+fn translate_expr(g: &mut EGraph<Peg, ()>, e: &syn::Expr, env: &HashMap<String, Id>) -> Option<Id> {
     match e {
         syn::Expr::Lit(l) => match &l.lit {
             syn::Lit::Int(n) => Some(g.add(Peg::Num(n.base10_parse().ok()?))),

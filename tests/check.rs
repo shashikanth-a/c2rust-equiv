@@ -126,7 +126,12 @@ fn testing_identical_panics() {
 #[test]
 fn no_arguments_and_unit_return() {
     let status = run("fn f() -> i32 { 1 + 1 }", "fn f() -> i32 { 2 }", false);
-    assert!(matches!(status, Status::Tested { .. }), "{status}");
+    // Equivalent with Kani off: either the algebraic backend proves `1 + 1 == 2`
+    // or, failing that, differential testing finds no difference. Both are fine.
+    assert!(
+        matches!(status, Status::Proved { .. } | Status::Tested { .. }),
+        "{status}"
+    );
     let status = run(
         "fn f(x: u8) { let _ = x; }",
         "fn f(x: u8) { assert!(x != 7); }",

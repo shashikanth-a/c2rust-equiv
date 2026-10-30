@@ -82,9 +82,7 @@ pub fn summarize(name: &str, sig: &syn::Signature, ws: &WriteSet) -> Option<syn:
     // 1. Record each argument as an observable-call event.
     for (n, t) in &ps {
         let (bits, kind) = arg_kind_bits(n, t);
-        body += &format!(
-            "(*__t).step({id}u64, [{bits}, 0, 0], [{kind}u8, 3u8, 3u8]);\n"
-        );
+        body += &format!("(*__t).step({id}u64, [{bits}, 0, 0], [{kind}u8, 3u8, 3u8]);\n");
     }
 
     // 2. Havoc each written pointer-parameter pointee to a shared symbolic
@@ -95,9 +93,8 @@ pub fn summarize(name: &str, sig: &syn::Signature, ws: &WriteSet) -> Option<syn:
         let (pname, pty) = ps.get(i)?;
         let pointee = pointee_type(pty)?;
         if is_cstr_pointee(&pointee) {
-            body += &format!(
-                "(*__t).fill_cstr({havoc_id}u64, {pname} as *mut core::ffi::c_char);\n"
-            );
+            body +=
+                &format!("(*__t).fill_cstr({havoc_id}u64, {pname} as *mut core::ffi::c_char);\n");
         } else if is_scalar(&pointee) {
             let v = format!("(*__t).step({havoc_id}u64, [0, 0, 0], [3u8, 3u8, 3u8])");
             let val = match float_width(&pointee) {

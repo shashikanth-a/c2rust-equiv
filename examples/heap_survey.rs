@@ -32,7 +32,9 @@ fn bucket(reason: &str) -> String {
 }
 
 fn main() {
-    let root = std::env::args().nth(1).expect("usage: heap_survey <crate-dir> [i/n]");
+    let root = std::env::args()
+        .nth(1)
+        .expect("usage: heap_survey <crate-dir> [i/n]");
     // Optional shard `i/n`: process only every n-th function starting at i, so
     // a project's survey can be split across n parallel worker processes and
     // their counts summed. The crate is still loaded whole (needed for the
@@ -82,7 +84,7 @@ fn main() {
 
     eprintln!("eligible {eligible}/{total}");
     let mut sorted: Vec<_> = buckets.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.sort_by_key(|x| std::cmp::Reverse(x.1));
     for (k, n) in sorted {
         let ex = examples.get(&k).map(|v| v.join(", ")).unwrap_or_default();
         // Tab-delimited (count, key, examples) so a shard runner can sum counts

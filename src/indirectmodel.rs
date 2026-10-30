@@ -113,7 +113,8 @@ impl TypeEnv {
             }
             syn::Item::Fn(f) => {
                 if let Some(g) = crate::globalaccessmodel::accessor_global_fn(f) {
-                    self.accessors.insert(f.sig.ident.to_string(), g.to_string());
+                    self.accessors
+                        .insert(f.sig.ident.to_string(), g.to_string());
                 }
             }
             _ => {}
@@ -140,7 +141,9 @@ impl TypeEnv {
         // function pointer inside the conditional that guards the call
         // (`if cond { let mut proc: CbT = ..; proc.expect(..)(..) }`). A
         // top-level-only scan would miss exactly those, so walk the whole body.
-        let mut v = LocalTypes { vars: &mut self.vars };
+        let mut v = LocalTypes {
+            vars: &mut self.vars,
+        };
         syn::visit::Visit::visit_block(&mut v, &f.block);
     }
 
@@ -155,7 +158,10 @@ impl TypeEnv {
                 let name = p.path.get_ident()?.to_string();
                 // A local binding/parameter, else a global `static` (a callback
                 // held in a function-pointer global).
-                self.vars.get(&name).or_else(|| self.globals.get(&name)).cloned()
+                self.vars
+                    .get(&name)
+                    .or_else(|| self.globals.get(&name))
+                    .cloned()
             }
             syn::Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => {
                 // `*__X()` -- dereferencing a thread-local accessor call -- is
@@ -265,9 +271,9 @@ fn modellable_sig(
     // needs to see it is a pointer to cast the trace result correctly.
     let ret = match &f.output {
         syn::ReturnType::Default => "()".to_owned(),
-        syn::ReturnType::Type(_, t) => {
-            crate::heapgen::resolve_alias(t, aliases).to_token_stream().to_string()
-        }
+        syn::ReturnType::Type(_, t) => crate::heapgen::resolve_alias(t, aliases)
+            .to_token_stream()
+            .to_string(),
     };
     Some((kinds, ret))
 }
@@ -323,7 +329,11 @@ fn tail_kind(arg: &syn::Expr, env: &TypeEnv) -> Option<u8> {
         _ => env.type_of(arg)?,
     };
     let resolved = crate::heapgen::resolve_alias(&ty, &env.aliases);
-    if last_segment(&resolved).as_deref().and_then(float_width).is_some() {
+    if last_segment(&resolved)
+        .as_deref()
+        .and_then(float_width)
+        .is_some()
+    {
         return None;
     }
     arg_kind(&resolved, &env.aliases)
@@ -539,7 +549,10 @@ mod tests {
         // The callback value becomes the trace id via `map_or` (no panicking
         // `expect`, which Kani cannot classify), keyed off the `free_fn` field.
         assert!(out.contains("map_or"), "callback token via map_or: {out}");
-        assert!(out.contains("free_fn"), "keyed on the callback field: {out}");
+        assert!(
+            out.contains("free_fn"),
+            "keyed on the callback field: {out}"
+        );
     }
 
     #[test]
@@ -626,9 +639,18 @@ mod sax_tests {
     #[test]
     fn fixed_arg_nested_sax_callback_is_modellable() {
         let (its, mut env) = env();
-        let f = its.iter().find_map(|i| match i { syn::Item::Fn(f) if f.sig.ident=="p" => Some(f.clone()), _=>None }).unwrap();
+        let f = its
+            .iter()
+            .find_map(|i| match i {
+                syn::Item::Fn(f) if f.sig.ident == "p" => Some(f.clone()),
+                _ => None,
+            })
+            .unwrap();
         env.with_fn(&f);
-        assert!(all_indirect_calls_modellable(&f, &its), "fixed-arg nested SAX callback should be modellable");
+        assert!(
+            all_indirect_calls_modellable(&f, &its),
+            "fixed-arg nested SAX callback should be modellable"
+        );
     }
 
     #[test]
@@ -636,9 +658,18 @@ mod sax_tests {
         // `w` passes one argument where the fixed prefix needs two; a call that
         // doesn't even cover the fixed signature is rejected.
         let (its, mut env) = env();
-        let f = its.iter().find_map(|i| match i { syn::Item::Fn(f) if f.sig.ident=="w" => Some(f.clone()), _=>None }).unwrap();
+        let f = its
+            .iter()
+            .find_map(|i| match i {
+                syn::Item::Fn(f) if f.sig.ident == "w" => Some(f.clone()),
+                _ => None,
+            })
+            .unwrap();
         env.with_fn(&f);
-        assert!(!all_indirect_calls_modellable(&f, &its), "variadic call below fixed arity must NOT be modellable");
+        assert!(
+            !all_indirect_calls_modellable(&f, &its),
+            "variadic call below fixed arity must NOT be modellable"
+        );
     }
 
     #[test]
@@ -647,9 +678,18 @@ mod sax_tests {
         // string pointer and a cast integer) is modelled, each recorded as its
         // own trace event.
         let (its, mut env) = env();
-        let f = its.iter().find_map(|i| match i { syn::Item::Fn(f) if f.sig.ident=="wv" => Some(f.clone()), _=>None }).unwrap();
+        let f = its
+            .iter()
+            .find_map(|i| match i {
+                syn::Item::Fn(f) if f.sig.ident == "wv" => Some(f.clone()),
+                _ => None,
+            })
+            .unwrap();
         env.with_fn(&f);
-        assert!(all_indirect_calls_modellable(&f, &its), "classifiable variadic tail should be modellable");
+        assert!(
+            all_indirect_calls_modellable(&f, &its),
+            "classifiable variadic tail should be modellable"
+        );
     }
 
     #[test]
@@ -658,8 +698,17 @@ mod sax_tests {
         // conservatively rejected, so a divergent tail is never silently
         // collapsed to the same trace.
         let (its, mut env) = env();
-        let f = its.iter().find_map(|i| match i { syn::Item::Fn(f) if f.sig.ident=="wu" => Some(f.clone()), _=>None }).unwrap();
+        let f = its
+            .iter()
+            .find_map(|i| match i {
+                syn::Item::Fn(f) if f.sig.ident == "wu" => Some(f.clone()),
+                _ => None,
+            })
+            .unwrap();
         env.with_fn(&f);
-        assert!(!all_indirect_calls_modellable(&f, &its), "untypeable variadic tail must NOT be modellable");
+        assert!(
+            !all_indirect_calls_modellable(&f, &its),
+            "untypeable variadic tail must NOT be modellable"
+        );
     }
 }

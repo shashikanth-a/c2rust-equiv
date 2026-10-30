@@ -680,8 +680,10 @@ fn scalar_global_side_effect_catches_divergence() {
 // requires pulling the table in too). Both versions get an identical const
 // copy, so a divergent *use* of the table is caught while the data itself never
 // differs. Exercises the struct-of-scalars `is_data_type` extension end to end.
-const RANGE_DEF: &str = "#[repr(C)] #[derive(Copy, Clone)] pub struct Range { pub low: u32, pub high: u32 }";
-const GROUP_DEF: &str = "#[repr(C)] #[derive(Copy, Clone)] pub struct Group { pub n: i32, pub ranges: *const Range }";
+const RANGE_DEF: &str =
+    "#[repr(C)] #[derive(Copy, Clone)] pub struct Range { pub low: u32, pub high: u32 }";
+const GROUP_DEF: &str =
+    "#[repr(C)] #[derive(Copy, Clone)] pub struct Group { pub n: i32, pub ranges: *const Range }";
 // `static mut` as c2rust emits these (a plain `static` with a raw-pointer field
 // isn't `Sync`); the heap path treats a non-scalar `static mut` as a read-only
 // data global regardless, since it emits no final-value comparison for it.
@@ -1511,7 +1513,8 @@ fn by_value_struct_field_catches_divergence() {
 // `_hashmap_t { cell: [hashcell_t; 256] }` shape. Each element is built,
 // cloned, and compared element-wise via the `genval_`/`cloneval_`/`sameval_`
 // companions -- the array generalisation of the by-value struct field.
-const SA_CELL: &str = "#[repr(C)] #[derive(Copy, Clone)] pub struct Cell { pub a: i32, pub p: *mut i32 }";
+const SA_CELL: &str =
+    "#[repr(C)] #[derive(Copy, Clone)] pub struct Cell { pub a: i32, pub p: *mut i32 }";
 const SA_OUTER: &str = "#[repr(C)] pub struct Grid { pub n: i32, pub cells: [Cell; 3] }";
 
 const SA_OLD: &str = r#"
@@ -1651,7 +1654,8 @@ fn opaque_array_field_catches_divergence() {
 // a divergent read is caught; and -- crucially for soundness -- reading a
 // pointer variant and dereferencing it is NOT falsely proved (it reads an
 // arbitrary address). `tag` is an ordinary scalar; no discriminant is inferred.
-const OU_UNION: &str = "#[repr(C)] #[derive(Copy, Clone)] pub union U { pub n: i32, pub p: *mut i32 }";
+const OU_UNION: &str =
+    "#[repr(C)] #[derive(Copy, Clone)] pub union U { pub n: i32, pub p: *mut i32 }";
 const OU_STRUCT: &str = "#[repr(C)] pub struct Val { pub tag: i32, pub v: U }";
 
 // Reads the scalar variant `v.n` -- same bytes both sides, so equivalent.
@@ -2180,7 +2184,13 @@ fn algebraic_backend_proves_without_kani() {
     let new = FnUnit::parse("pub fn g(x: i64, y: i64) -> i64 { y + x }", &[]).unwrap();
     let outcome = check(&old, &new, &opts());
     assert!(
-        matches!(outcome.status, Status::Proved { bounded: false, unwind: 0 }),
+        matches!(
+            outcome.status,
+            Status::Proved {
+                bounded: false,
+                unwind: 0
+            }
+        ),
         "expected an algebraic proof, got {:?}",
         outcome.status
     );
@@ -2551,7 +2561,6 @@ fn alloc_hook_catches_divergence() {
     );
 }
 
-
 // ---------------------------------------------------------------------------
 // A written struct `static mut` global modelled as observable output. libxml2's
 // error path writes `static mut xmlLastError: xmlError { code, line, message*,
@@ -2560,8 +2569,7 @@ fn alloc_hook_catches_divergence() {
 // state field-by-field with `sameval_`. Writing it is therefore in scope, and a
 // divergent write to the error state is caught. `ERRST` stands in for xmlError:
 // scalar fields plus a message pointer (left null here, so comparable).
-const ERRST_DEF: &str =
-    "pub struct ErrSt { pub code: i32, pub line: i32, pub msg: *mut i8 }";
+const ERRST_DEF: &str = "pub struct ErrSt { pub code: i32, pub line: i32, pub msg: *mut i8 }";
 const LASTERR_DEF: &str =
     "pub static mut LASTERR: ErrSt = ErrSt { code: 0, line: 0, msg: core::ptr::null_mut() };";
 
@@ -2981,9 +2989,8 @@ fn fn_local_static_catches_divergence() {
 // `_json_c_set_last_err`. Modelled as an observable trace over its format and
 // arguments (errormodel spec with ptr_end 0); a different reported message is a
 // divergence and is caught.
-const JSONERR_DEFS: &[&str] = &[
-    "extern \"C\" { pub fn _json_c_set_last_err(fmt: *const core::ffi::c_char, ...); }",
-];
+const JSONERR_DEFS: &[&str] =
+    &["extern \"C\" { pub fn _json_c_set_last_err(fmt: *const core::ffi::c_char, ...); }"];
 
 const JSONERR_OLD: &str = r#"
 pub unsafe fn fail(p: *const i32) -> i32 {
@@ -3745,7 +3752,11 @@ fn scalar_sig_global_proves_equivalent_rewrite() {
     let old = FnUnit::parse(SCG_OLD, SCG_DEFS).unwrap();
     let new = FnUnit::parse(SCG_OK, SCG_DEFS).unwrap();
     let outcome = check(&old, &new, &opts());
-    assert!(matches!(outcome.status, Status::Proved { .. }), "expected Proved, got {:?}", outcome.status);
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
 }
 
 #[test]
@@ -3754,7 +3765,11 @@ fn scalar_sig_global_catches_divergent_write() {
     let old = FnUnit::parse(SCG_OLD, SCG_DEFS).unwrap();
     let new = FnUnit::parse(SCG_BAD, SCG_DEFS).unwrap();
     let outcome = check(&old, &new, &opts());
-    assert!(!matches!(outcome.status, Status::Proved { .. }), "a divergent global write was proved equivalent: {:?}", outcome.status);
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent global write was proved equivalent: {:?}",
+        outcome.status
+    );
 }
 
 // libxml2's error-reporting + error-state-read pattern. `__xmlRaiseError` is
@@ -3834,7 +3849,11 @@ fn error_report_read_proves_equivalent_rewrite() {
     let mut o = opts();
     o.kani_timeout = std::time::Duration::from_secs(600);
     let outcome = check(&old, &new, &o);
-    assert!(matches!(outcome.status, Status::Proved { .. }), "expected Proved, got {:?}", outcome.status);
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
 }
 #[test]
 #[ignore = "requires `cargo kani` on PATH; slow"]
@@ -3842,7 +3861,11 @@ fn error_report_read_catches_divergent_code() {
     let old = FnUnit::parse(ERR_OLD, ERR_DEFS).unwrap();
     let new = FnUnit::parse(ERR_BAD, ERR_DEFS).unwrap();
     let outcome = check(&old, &new, &opts());
-    assert!(!matches!(outcome.status, Status::Proved { .. }), "a divergent reported code was proved equivalent: {:?}", outcome.status);
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent reported code was proved equivalent: {:?}",
+        outcome.status
+    );
 }
 #[test]
 #[ignore = "requires `cargo kani` on PATH; slow"]
@@ -3850,7 +3873,11 @@ fn error_report_read_catches_interleaving() {
     let old = FnUnit::parse(ERRI_OLD, ERR_DEFS).unwrap();
     let new = FnUnit::parse(ERRI_NEW, ERR_DEFS).unwrap();
     let outcome = check(&old, &new, &opts());
-    assert!(!matches!(outcome.status, Status::Proved { .. }), "an interleaved error-state read was proved equivalent (UNSOUND): {:?}", outcome.status);
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "an interleaved error-state read was proved equivalent (UNSOUND): {:?}",
+        outcome.status
+    );
 }
 
 // A standard I/O stream global (`__stderrp`). It is a foreign `*mut FILE` with
@@ -3858,8 +3885,7 @@ fn error_report_read_catches_interleaving() {
 // non-null sentinel (`*mut c_void`, identical in both versions). A function
 // that checks or stashes the stream is in scope and proves; a divergent result
 // is still caught.
-const STDIO_DEFS: &[&str] =
-    &["extern \"C\" { pub static mut __stderrp: *mut core::ffi::c_void; }"];
+const STDIO_DEFS: &[&str] = &["extern \"C\" { pub static mut __stderrp: *mut core::ffi::c_void; }"];
 const STDIO_OLD: &str = r#"
 pub unsafe fn f(x: i32) -> i32 {
     if __stderrp.is_null() { return -1; }
@@ -3885,7 +3911,11 @@ fn stdio_global_proves_equivalent_rewrite() {
     let old = FnUnit::parse(STDIO_OLD, STDIO_DEFS).unwrap();
     let new = FnUnit::parse(STDIO_OK, STDIO_DEFS).unwrap();
     let outcome = check(&old, &new, &opts());
-    assert!(matches!(outcome.status, Status::Proved { .. }), "expected Proved, got {:?}", outcome.status);
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
 }
 #[test]
 #[ignore = "requires `cargo kani` on PATH; slow"]
@@ -3893,5 +3923,9 @@ fn stdio_global_catches_divergence() {
     let old = FnUnit::parse(STDIO_OLD, STDIO_DEFS).unwrap();
     let new = FnUnit::parse(STDIO_BAD, STDIO_DEFS).unwrap();
     let outcome = check(&old, &new, &opts());
-    assert!(!matches!(outcome.status, Status::Proved { .. }), "a divergent result was proved equivalent: {:?}", outcome.status);
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent result was proved equivalent: {:?}",
+        outcome.status
+    );
 }

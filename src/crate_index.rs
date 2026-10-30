@@ -1,10 +1,10 @@
 //! An index of the items in a crate's source files.
 
-use std::sync::OnceLock;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// A module: a file, or an inline `mod m { .. }` inside one.
 #[derive(Debug)]

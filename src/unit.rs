@@ -580,7 +580,7 @@ impl<'ast> Visit<'ast> for BodyChecker {
                 "indirect call",
                 format!(
                     "calls through a function pointer: {}",
-                    quote::ToTokens::to_token_stream(&*c.func).to_string()
+                    quote::ToTokens::to_token_stream(&*c.func)
                 ),
             ));
         }

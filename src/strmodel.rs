@@ -94,7 +94,11 @@ pub(crate) fn arg_kind_bits(name: &str, ty: &str) -> (String, u8) {
         // A pointer: a `c_char`/`c_uchar` pointee is a string (compared by
         // content), anything else is compared through the heap bijection.
         let pointee = t.rsplit("::").next().unwrap_or(t).trim();
-        let kind = if pointee == "c_char" || pointee == "c_uchar" { 1 } else { 2 };
+        let kind = if pointee == "c_char" || pointee == "c_uchar" {
+            1
+        } else {
+            2
+        };
         (format!("({name} as usize as u128)"), kind)
     } else if float_width(ty).is_some() {
         (format!("({name}.to_bits() as u128)"), 0)
@@ -119,7 +123,11 @@ fn trace_body(name: &str, args: &[(String, String)], ret: &str) -> String {
     // The statements preceding the result, and the `step` whose shared symbolic
     // value becomes the call's result.
     let (prefix, v) = if args.len() <= 3 {
-        let mut slots = [String::from("0u128"), String::from("0u128"), String::from("0u128")];
+        let mut slots = [
+            String::from("0u128"),
+            String::from("0u128"),
+            String::from("0u128"),
+        ];
         let mut kinds = [3u8, 3, 3];
         for (i, (n, t)) in args.iter().enumerate() {
             let (bits, kind) = arg_kind_bits(n, t);
@@ -137,11 +145,11 @@ fn trace_body(name: &str, args: &[(String, String)], ret: &str) -> String {
         // indirect-call model does), then a final event with a distinct id for
         // the shared symbolic result. Both versions emit the identical
         // sequence, so a divergent argument is caught, not collapsed.
-        let mut prefix =
-            String::from("let __t = core::ptr::addr_of_mut!(crate::support::TRACE);");
+        let mut prefix = String::from("let __t = core::ptr::addr_of_mut!(crate::support::TRACE);");
         for (n, t) in args {
             let (bits, kind) = arg_kind_bits(n, t);
-            prefix += &format!("(*__t).step({id}u64, [{bits}, 0u128, 0u128], [{kind}u8, 3u8, 3u8]);");
+            prefix +=
+                &format!("(*__t).step({id}u64, [{bits}, 0u128, 0u128], [{kind}u8, 3u8, 3u8]);");
         }
         let ret_id = oracle_id(&format!("{name}#ret"));
         let v = format!("(*__t).step({ret_id}u64, [0u128, 0u128, 0u128], [3u8, 3u8, 3u8])");
@@ -284,9 +292,9 @@ fn body(name: &str, a: &[&str], ret: &str) -> Option<String> {
     // C string comparisons are on `unsigned char`; cast through `u8` so a
     // model matches C regardless of `c_char`'s platform signedness.
     let block = match (name, a) {
-        ("strlen", [s]) => format!(
-            "{{ let mut n: usize = 0; while *{s}.add(n) != 0 {{ n += 1; }} n as {ret} }}"
-        ),
+        ("strlen", [s]) => {
+            format!("{{ let mut n: usize = 0; while *{s}.add(n) != 0 {{ n += 1; }} n as {ret} }}")
+        }
         ("strcmp", [s1, s2]) => format!(
             "{{ let mut i: usize = 0; loop {{ \
                let x = *{s1}.add(i) as u8 as i32; let y = *{s2}.add(i) as u8 as i32; \
@@ -313,13 +321,12 @@ fn body(name: &str, a: &[&str], ret: &str) -> Option<String> {
         ),
         // A failed assertion aborts in C; model it as a panic, which Kani
         // treats as cutting the path (so it never counts as a divergence).
-        ("__assert_rtn" | "__assert_fail", _) => {
-            "{ panic!(\"assertion failed\") }".to_owned()
-        }
+        ("__assert_rtn" | "__assert_fail", _) => "{ panic!(\"assertion failed\") }".to_owned(),
         // errno: a single per-run cell, zero-initialised. Both versions get
         // their own, so errno-dependent behaviour stays consistent in-run.
         ("__error" | "__errno_location", []) => {
-            "{ static mut ERRNO: core::ffi::c_int = 0; core::ptr::addr_of_mut!(ERRNO) as _ }".to_owned()
+            "{ static mut ERRNO: core::ffi::c_int = 0; core::ptr::addr_of_mut!(ERRNO) as _ }"
+                .to_owned()
         }
         _ => return None,
     };
@@ -361,12 +368,13 @@ mod tests {
 
     #[test]
     fn extern_block_of_only_strings_is_removed() {
-        let mut it = items(
-            "extern \"C\" { fn strcmp(a: *const i8, b: *const i8) -> i32; }",
-        );
+        let mut it = items("extern \"C\" { fn strcmp(a: *const i8, b: *const i8) -> i32; }");
         inject(&mut it);
         assert!(!it.iter().any(|i| matches!(i, syn::Item::ForeignMod(_))));
-        assert_eq!(it.iter().filter(|i| matches!(i, syn::Item::Fn(_))).count(), 1);
+        assert_eq!(
+            it.iter().filter(|i| matches!(i, syn::Item::Fn(_))).count(),
+            1
+        );
     }
 
     #[test]
@@ -375,7 +383,10 @@ mod tests {
         for (src, _) in [
             ("fn strlen(s: *const i8) -> u64;", "strlen"),
             ("fn strcmp(a: *const i8, b: *const i8) -> i32;", "strcmp"),
-            ("fn strncmp(a: *const i8, b: *const i8, n: u64) -> i32;", "strncmp"),
+            (
+                "fn strncmp(a: *const i8, b: *const i8, n: u64) -> i32;",
+                "strncmp",
+            ),
             ("fn strchr(s: *const i8, c: i32) -> *mut i8;", "strchr"),
             ("fn strrchr(s: *const i8, c: i32) -> *mut i8;", "strrchr"),
         ] {
@@ -403,18 +414,27 @@ mod tests {
         // shim -- one `step` per argument plus a result event -- parses.
         let src = "fn fread(p: *mut u8, sz: u64, n: u64, s: *mut u8) -> u64;";
         let f: syn::ForeignItemFn = syn::parse_str(src).unwrap();
-        assert!(is_trace_sig(&f.sig), "4-arg scalar/ptr sig should be trace-modellable");
+        assert!(
+            is_trace_sig(&f.sig),
+            "4-arg scalar/ptr sig should be trace-modellable"
+        );
         let def = define("fread", &f.sig).expect("shim defined");
         let text = def.to_token_stream().to_string();
         syn::parse_str::<syn::ItemFn>(&text).unwrap();
-        assert_eq!(text.matches(". step (").count(), 5, "4 arg events + 1 result event");
+        assert_eq!(
+            text.matches(". step (").count(),
+            5,
+            "4 arg events + 1 result event"
+        );
     }
 
     #[test]
     fn seventeen_arg_foreign_fn_is_not_modelled() {
-        let args = (0..17).map(|i| format!("a{i}: i32")).collect::<Vec<_>>().join(", ");
-        let f: syn::ForeignItemFn =
-            syn::parse_str(&format!("fn big({args}) -> i32;")).unwrap();
+        let args = (0..17)
+            .map(|i| format!("a{i}: i32"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let f: syn::ForeignItemFn = syn::parse_str(&format!("fn big({args}) -> i32;")).unwrap();
         assert!(!is_trace_sig(&f.sig));
     }
 }

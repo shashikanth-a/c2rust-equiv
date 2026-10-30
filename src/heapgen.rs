@@ -304,7 +304,11 @@ fn array_len(len: &syn::Expr) -> Option<usize> {
     while let syn::Expr::Group(g) = e {
         e = &g.expr;
     }
-    if let syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Int(n), .. }) = e {
+    if let syn::Expr::Lit(syn::ExprLit {
+        lit: syn::Lit::Int(n),
+        ..
+    }) = e
+    {
         return n.base10_parse::<usize>().ok();
     }
     None
@@ -368,7 +372,11 @@ fn classify(
                 None if name == "c_void" => {
                     return Ok(Field::OpaqueWord(opaque_word_type(ty, aliases)));
                 }
-                None => return Err(format!("pointer to `{name}`, which is not a plain aggregate")),
+                None => {
+                    return Err(format!(
+                        "pointer to `{name}`, which is not a plain aggregate"
+                    ))
+                }
             }
         }
         // A pointer to a pointer (`T**`), c2rust's growable arrays -- e.g.
@@ -496,7 +504,9 @@ pub(crate) fn is_option_fn(ty: &syn::Type, aliases: &BTreeMap<String, syn::Type>
     // global as a named alias (`xmlExternalEntityLoader = Option<fn ..>`), not a
     // bare `Option<..>`, so the `Option` is visible only after following it.
     let resolved = resolve_alias(ty, aliases);
-    let syn::Type::Path(p) = &resolved else { return false };
+    let syn::Type::Path(p) = &resolved else {
+        return false;
+    };
     let Some(seg) = p.path.segments.last() else {
         return false;
     };
@@ -506,7 +516,8 @@ pub(crate) fn is_option_fn(ty: &syn::Type, aliases: &BTreeMap<String, syn::Type>
     let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
         return false;
     };
-    let [syn::GenericArgument::Type(inner)] = args.args.iter().collect::<Vec<_>>().as_slice() else {
+    let [syn::GenericArgument::Type(inner)] = args.args.iter().collect::<Vec<_>>().as_slice()
+    else {
         return false;
     };
     matches!(resolve_alias(inner, aliases), syn::Type::BareFn(_))
@@ -667,12 +678,18 @@ fn tagged_union(
         .cloned()
         .or_else(|| crate::taggedunion::mine_accessors(index, union_field, &subnames))
         .ok_or_else(|| {
-            unsupported(union_field, "could not infer the union's discriminant".to_owned())
+            unsupported(
+                union_field,
+                "could not infer the union's discriminant".to_owned(),
+            )
         })?;
     if !def.fields.iter().any(|(n, _)| n == &map.tag_field) {
         return Err(unsupported(
             union_field,
-            format!("inferred tag `{}` is not a field of the struct", map.tag_field),
+            format!(
+                "inferred tag `{}` is not a field of the struct",
+                map.tag_field
+            ),
         ));
     }
 
@@ -873,9 +890,7 @@ pub fn signature_shapes(
             // A struct passed by value as a top-level argument/return is a
             // different harness path (not built behind a pointer); leave it
             // unsupported for now rather than mishandle it.
-            Field::StructValue(name) => {
-                Err(format!("`{name}` passed or returned by value"))
-            }
+            Field::StructValue(name) => Err(format!("`{name}` passed or returned by value")),
             // An array passed/returned by value as a top-level argument is a
             // separate harness path; leave unsupported (it is built as a field).
             Field::StructArray(name, _) => {
@@ -886,9 +901,7 @@ pub fn signature_shapes(
             }
             // A union passed by value as a top-level argument/return: likewise a
             // separate harness path; leave unsupported.
-            Field::OpaqueUnion(name) => {
-                Err(format!("union `{name}` passed or returned by value"))
-            }
+            Field::OpaqueUnion(name) => Err(format!("union `{name}` passed or returned by value")),
         }
     };
 
@@ -999,10 +1012,9 @@ fn build_value(field: &Field, m: &str) -> String {
 fn clone_value(field: &Field, src: &str, m: &str) -> String {
     match field {
         // `Copy` values (scalars, arrays, and the opaque fn-ptr word(s)) copy over.
-        Field::Scalar(_)
-        | Field::ScalarArray
-        | Field::OpaqueWord(_)
-        | Field::OpaqueArray(..) => src.to_owned(),
+        Field::Scalar(_) | Field::ScalarArray | Field::OpaqueWord(_) | Field::OpaqueArray(..) => {
+            src.to_owned()
+        }
         Field::CStr => format!("clone_cstr({src} as *const core::ffi::c_char) as _"),
         Field::ScalarCell => format!("clone_cell({src})"),
         Field::Pointer(target) => format!("clone_{target}({src}, map)"),
@@ -1060,7 +1072,12 @@ fn compare_stmt(field: &Field, a: &str, b: &str) -> String {
 /// choice, else a fresh object with symbolic scalars and recursively built
 /// pointees. A tagged union field picks a symbolic discriminant and builds the
 /// matching variant, so the tag and the live union field are consistent.
-fn builder(struct_name: &str, old: &str, fields: &[(String, Field)], tu: Option<&TaggedUnion>) -> String {
+fn builder(
+    struct_name: &str,
+    old: &str,
+    fields: &[(String, Field)],
+    tu: Option<&TaggedUnion>,
+) -> String {
     let mut inits = String::new();
     for (name, field) in fields {
         inits += &format!("            {name}: {},\n", build_value(field, old));
@@ -1128,7 +1145,13 @@ fn builder(struct_name: &str, old: &str, fields: &[(String, Field)], tu: Option<
 /// `clone_<T>(src, map) -> *mut new::T`: a deep copy from `old`'s layout into
 /// `new`'s. The pointer is registered in `map` before the fields recurse, so
 /// shared objects become shared and cycles terminate instead of looping.
-fn cloner(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)], tu: Option<&TaggedUnion>) -> String {
+fn cloner(
+    struct_name: &str,
+    old: &str,
+    new: &str,
+    fields: &[(String, Field)],
+    tu: Option<&TaggedUnion>,
+) -> String {
     // Scalars are copied in the initializer; pointer fields start null and are
     // filled after the object is registered, so a cycle back to it resolves.
     let mut inits = String::new();
@@ -1140,12 +1163,13 @@ fn cloner(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)], t
             Field::Scalar(_)
             | Field::ScalarArray
             | Field::OpaqueWord(_)
-            | Field::OpaqueArray(..) => {
-                inits += &format!("        {name}: (*src).{name},\n")
-            }
+            | Field::OpaqueArray(..) => inits += &format!("        {name}: (*src).{name},\n"),
             // A C string is copied whole; it can't form cycles, so no linking.
             Field::CStr => {
-                inits += &format!("        {name}: {},\n", clone_value(field, &format!("(*src).{name}"), new));
+                inits += &format!(
+                    "        {name}: {},\n",
+                    clone_value(field, &format!("(*src).{name}"), new)
+                );
             }
             // A scalar cell: copy the pointed-to value; no cycles.
             Field::ScalarCell => {
@@ -1274,7 +1298,13 @@ fn cloner(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)], t
 /// `same_<T>(a, b, corr) -> bool`: equal scalars across `old::T` and `new::T`,
 /// matching null-ness, and corresponding pointees, with `corr` kept functional
 /// and injective.
-fn comparer(struct_name: &str, old: &str, new: &str, fields: &[(String, Field)], tu: Option<&TaggedUnion>) -> String {
+fn comparer(
+    struct_name: &str,
+    old: &str,
+    new: &str,
+    fields: &[(String, Field)],
+    tu: Option<&TaggedUnion>,
+) -> String {
     let mut checks = String::new();
     for (name, field) in fields {
         checks += &compare_stmt(field, &format!("(*a).{name}"), &format!("(*b).{name}"));
@@ -1480,9 +1510,21 @@ mod tests {
         // value, and copied/compared by identity.
         let src = "pub struct S { pub cb: Option<unsafe extern \"C\" fn(i32) -> i32>, pub n: i32 }";
         let g = generate(&index(src), "S", &Default::default(), "old", "new").unwrap();
-        assert!(g.builder.contains("transmute::<usize"), "symbolic word: {}", g.builder);
-        assert!(!g.builder.contains("None"), "never a fixed default: {}", g.builder);
-        assert!(g.comparer.contains("(*a).cb != (*b).cb"), "compared by identity: {}", g.comparer);
+        assert!(
+            g.builder.contains("transmute::<usize"),
+            "symbolic word: {}",
+            g.builder
+        );
+        assert!(
+            !g.builder.contains("None"),
+            "never a fixed default: {}",
+            g.builder
+        );
+        assert!(
+            g.comparer.contains("(*a).cb != (*b).cb"),
+            "compared by identity: {}",
+            g.comparer
+        );
     }
 
     fn sig(s: &str) -> syn::Signature {
@@ -1543,8 +1585,12 @@ mod tests {
         // Built/cloned/compared through `gen_cstr`/`clone_cstr`/`same_cstr`,
         // with casts to the field's own pointer type (c_char vs c_uchar).
         assert!(g.builder.contains("name: gen_cstr() as _,"));
-        assert!(g.cloner.contains("name: clone_cstr((*src).name as *const core::ffi::c_char) as _,"));
-        assert!(g.comparer.contains("same_cstr((*a).name as *const core::ffi::c_char"));
+        assert!(g
+            .cloner
+            .contains("name: clone_cstr((*src).name as *const core::ffi::c_char) as _,"));
+        assert!(g
+            .comparer
+            .contains("same_cstr((*a).name as *const core::ffi::c_char"));
     }
 
     #[test]
@@ -1581,7 +1627,14 @@ mod tests {
         let s = signature_shapes(&idx, &sig("fn f(out: *mut c_int, inp: *const i64)")).unwrap();
         assert_eq!(s.args, vec![Shape::ScalarCell, Shape::ScalarCell]);
         // A pointer-to-scalar field is a cell too.
-        let g = generate(&index("pub struct S { pub p: *mut i32 }"), "S", &Default::default(), "old", "new").unwrap();
+        let g = generate(
+            &index("pub struct S { pub p: *mut i32 }"),
+            "S",
+            &Default::default(),
+            "old",
+            "new",
+        )
+        .unwrap();
         assert!(g.builder.contains("p: gen_cell(),"));
         assert!(g.cloner.contains("p: clone_cell((*src).p),"));
         assert!(g.comparer.contains("if !same_cell((*a).p, (*b).p)"));
@@ -1661,17 +1714,25 @@ mod tests {
         // the by-value union is then built byte-wise (symbolic raw bytes),
         // which needs no discriminant and is sound. The ordinary field is still
         // built normally.
-        let src = "pub struct Obj { pub t: c_int, pub d: U }\npub union U { pub a: i32, pub b: f64 }";
+        let src =
+            "pub struct Obj { pub t: c_int, pub d: U }\npub union U { pub a: i32, pub b: f64 }";
         let g = generate(&index(src), "Obj", &Default::default(), "old", "new").unwrap();
         assert!(g.builder.contains("d: gen_union()"), "got: {}", g.builder);
-        assert!(g.cloner.contains("d: clone_union(&(*src).d)"), "got: {}", g.cloner);
-        assert!(g.comparer.contains("same_union(&(*a).d, &(*b).d)"), "got: {}", g.comparer);
+        assert!(
+            g.cloner.contains("d: clone_union(&(*src).d)"),
+            "got: {}",
+            g.cloner
+        );
+        assert!(
+            g.comparer.contains("same_union(&(*a).d, &(*b).d)"),
+            "got: {}",
+            g.comparer
+        );
     }
 
     #[test]
     fn multi_field_union_pointer_needs_a_discriminant() {
-        let src =
-            "pub struct S { pub u: *mut U }\npub union U { pub i: i32, pub p: *mut S }";
+        let src = "pub struct S { pub u: *mut U }\npub union U { pub i: i32, pub p: *mut S }";
         let err = generate(&index(src), "S", &Default::default(), "old", "new").unwrap_err();
         assert_eq!(err.field, "u");
         assert!(err.detail.contains("discriminant"), "got: {}", err.detail);

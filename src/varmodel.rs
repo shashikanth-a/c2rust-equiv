@@ -33,8 +33,9 @@ fn variadic_ret(name: &str) -> Option<&'static str> {
         // that genuinely diverges is caught by the recorded arguments and the
         // heap comparison. This is conservative (it may fail to prove a true
         // equivalence), never a false proof.
-        "sscanf" | "fscanf" | "vsscanf" | "vfscanf" | "__isoc99_sscanf"
-        | "__isoc99_fscanf" => "::core::ffi::c_int",
+        "sscanf" | "fscanf" | "vsscanf" | "vfscanf" | "__isoc99_sscanf" | "__isoc99_fscanf" => {
+            "::core::ffi::c_int"
+        }
         "open" | "openat" | "fcntl" => "::core::ffi::c_int",
         _ => return None,
     })
@@ -82,7 +83,9 @@ impl VisitMut for Rewrite {
         // Rewrite inner expressions first (arguments may themselves be calls).
         syn::visit_mut::visit_expr_mut(self, e);
         let syn::Expr::Call(call) = e else { return };
-        let syn::Expr::Path(p) = &*call.func else { return };
+        let syn::Expr::Path(p) = &*call.func else {
+            return;
+        };
         let Some(name) = p.path.segments.last().map(|s| s.ident.to_string()) else {
             return;
         };
@@ -100,7 +103,11 @@ impl VisitMut for Rewrite {
 /// The replacement block for a buffer-writing formatter (`sprintf` etc.):
 /// record every argument but the destination, then fill the destination with
 /// the shared symbolic output.
-fn dst_block(name: &str, dst_idx: usize, args: &syn::punctuated::Punctuated<syn::Expr, syn::token::Comma>) -> String {
+fn dst_block(
+    name: &str,
+    dst_idx: usize,
+    args: &syn::punctuated::Punctuated<syn::Expr, syn::token::Comma>,
+) -> String {
     let call_id = id(name);
     let mut binds = String::new();
     let mut steps = String::new();
@@ -128,7 +135,11 @@ fn dst_block(name: &str, dst_idx: usize, args: &syn::punctuated::Punctuated<syn:
 
 /// The replacement block: bind each argument, record it as a trace event, and
 /// yield a shared symbolic result cast to the call's return type.
-fn block(name: &str, ret: &str, args: &syn::punctuated::Punctuated<syn::Expr, syn::token::Comma>) -> String {
+fn block(
+    name: &str,
+    ret: &str,
+    args: &syn::punctuated::Punctuated<syn::Expr, syn::token::Comma>,
+) -> String {
     let call_id = id(name);
     let mut binds = String::new();
     let mut steps = String::new();
@@ -163,11 +174,13 @@ mod tests {
 
     #[test]
     fn rewrites_printf_call_into_trace_events() {
-        let mut it = items(
-            "pub unsafe fn f(x: i32) { printf(b\"%d\\0\".as_ptr() as *const i8, x); }",
-        );
+        let mut it =
+            items("pub unsafe fn f(x: i32) { printf(b\"%d\\0\".as_ptr() as *const i8, x); }");
         rewrite(&mut it);
-        let src = it.iter().map(|i| i.to_token_stream().to_string()).collect::<String>();
+        let src = it
+            .iter()
+            .map(|i| i.to_token_stream().to_string())
+            .collect::<String>();
         assert!(src.contains("TRACE"), "{src}");
         assert!(src.contains("TraceArg :: bits"), "{src}");
         assert!(!src.contains("printf ("), "call should be gone: {src}");
@@ -177,7 +190,10 @@ mod tests {
     fn leaves_other_calls_alone() {
         let mut it = items("pub fn f() -> i32 { g(1) }\npub fn g(x: i32) -> i32 { x }");
         rewrite(&mut it);
-        let src = it.iter().map(|i| i.to_token_stream().to_string()).collect::<String>();
+        let src = it
+            .iter()
+            .map(|i| i.to_token_stream().to_string())
+            .collect::<String>();
         assert!(src.contains("g (1)"), "{src}");
     }
 }

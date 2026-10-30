@@ -116,7 +116,10 @@ impl Status {
         match self {
             // An algebraic equality-saturation proof (Subsystem B) is unbounded
             // and holds for all inputs; a Kani proof is bounded by the unwind.
-            Status::Proved { bounded: false, unwind: 0 } => "proved(algebraic)".to_owned(),
+            Status::Proved {
+                bounded: false,
+                unwind: 0,
+            } => "proved(algebraic)".to_owned(),
             Status::Proved { unwind, .. } => format!("proved(bounded, unwind={unwind})"),
             Status::Counterexample {
                 inputs,
@@ -148,6 +151,29 @@ pub struct Outcome {
     pub total_ms: u64,
 }
 
+/// Whether two signatures have the same argument types (ignoring names) and the
+/// same return type. Used to gate the algebraic proof, which compares bodies
+/// structurally and so is only sound when the interfaces match.
+fn same_param_and_return_types(a: &syn::Signature, b: &syn::Signature) -> bool {
+    use quote::ToTokens;
+    let arg_types = |s: &syn::Signature| -> Vec<String> {
+        s.inputs
+            .iter()
+            .map(|arg| match arg {
+                syn::FnArg::Typed(pt) => pt.ty.to_token_stream().to_string(),
+                syn::FnArg::Receiver(r) => r.to_token_stream().to_string(),
+            })
+            .collect()
+    };
+    let ret_type = |s: &syn::Signature| -> String {
+        match &s.output {
+            syn::ReturnType::Default => String::new(),
+            syn::ReturnType::Type(_, t) => t.to_token_stream().to_string(),
+        }
+    };
+    arg_types(a) == arg_types(b) && ret_type(a) == ret_type(b)
+}
+
 /// Check whether `new` behaves the same as `old`: for every input, both return
 /// the same value (floats compared by bits) or both panic.
 ///
@@ -161,8 +187,14 @@ pub fn check(old: &FnUnit, new: &FnUnit, opts: &Options) -> Outcome {
     // saturation first (no Kani, no environment model, and unbounded -- it holds
     // for all inputs, not only within an unwinding bound). It is sound: a
     // `Some(true)` is a real proof; anything else falls through to the Kani /
-    // differential path below.
-    if let Some(true) = crate::peg::equivalent(&old.function, &new.function) {
+    // differential path below. Only attempt it when both functions take and
+    // return exactly the same types: structural equality of two bodies implies
+    // behavioural equivalence only then, so a signature change (identity on
+    // `i32` vs on `i64`) is left to the checks below, which skip it rather than
+    // proving it. Argument *names* may differ -- a pure rename is a valid
+    // equivalent rewrite -- so compare the types, not the whole signature.
+    let sigs_match = same_param_and_return_types(&old.function.sig, &new.function.sig);
+    if sigs_match && crate::peg::equivalent(&old.function, &new.function) == Some(true) {
         return Outcome {
             status: Status::Proved {
                 bounded: false,
@@ -304,8 +336,12 @@ pub fn heap_diagnose(unit: &FnUnit) -> Result<(), String> {
         .map_err(|s| format!("body: {} ({})", s.detail, s.category))?;
     let mut roots = shapes.structs.clone();
     roots.extend(struct_global_roots(unit));
-    heapgen::generate_all(&index, &roots, &unit.union_tags, "old", "new")
-        .map_err(|u| format!("generate: {} field `{}`: {}", u.struct_name, u.field, u.detail))?;
+    heapgen::generate_all(&index, &roots, &unit.union_tags, "old", "new").map_err(|u| {
+        format!(
+            "generate: {} field `{}`: {}",
+            u.struct_name, u.field, u.detail
+        )
+    })?;
     Ok(())
 }
 

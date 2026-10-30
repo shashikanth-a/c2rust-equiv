@@ -7,27 +7,27 @@
 
 mod allocmodel;
 pub mod cache;
-pub mod compose;
-mod modref;
-mod summary;
 pub mod check;
+pub mod compose;
 pub mod crate_index;
+mod errormodel;
 pub mod extract;
+mod globalaccessmodel;
 pub mod heapgen;
+mod indirectmodel;
 pub mod kani;
+mod modref;
+mod mutexmodel;
 pub mod peg;
 mod process;
 pub mod report;
 mod scalar;
 mod scratch;
 mod strmodel;
+mod summary;
 pub mod taggedunion;
-mod varmodel;
-mod indirectmodel;
-mod mutexmodel;
-mod errormodel;
-mod globalaccessmodel;
 pub mod unit;
+mod varmodel;
 
 pub use check::{check, heap_diagnose, heap_eligible, Method, Options, Outcome, Status};
 pub use crate_index::CrateIndex;

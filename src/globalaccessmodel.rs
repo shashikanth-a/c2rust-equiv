@@ -99,8 +99,7 @@ pub fn rewritten(item: &syn::Item) -> Option<syn::Item> {
 /// unit is kept out of heap scope; a unit that reads only the scalar fields
 /// (code/domain/level/line/int1/int2), which the model populates faithfully per
 /// report, is in scope.
-const LASTERROR_PTR_FIELDS: &[&str] =
-    &["message", "file", "str1", "str2", "str3", "ctxt", "node"];
+const LASTERROR_PTR_FIELDS: &[&str] = &["message", "file", "str1", "str2", "str3", "ctxt", "node"];
 
 /// Whether these items access a pointer field *of `xmlLastError`* -- a field
 /// access `<e>.<ptr-field>` whose base `<e>` is the global `xmlLastError` or a
@@ -146,4 +145,3 @@ pub fn reads_lasterror_pointer_field(function: &syn::ItemFn, callees: &[syn::Ite
     }
     v.0
 }
-

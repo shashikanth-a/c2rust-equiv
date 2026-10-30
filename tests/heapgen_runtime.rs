@@ -94,7 +94,8 @@ fn generated_code_behaves_on_shared_and_cyclic_heaps() {
         "#![allow(warnings)]\n\
          pub mod old {{ {DEF} }}\n\
          pub mod new {{ {DEF} }}\n\
-         pub mod kani {{ pub fn any<T>() -> T {{ unimplemented!() }} }}\n\
+         pub mod kani {{ pub fn any<T>() -> T {{ unimplemented!() }} \
+         pub trait Arbitrary {{}} impl<T> Arbitrary for T {{}} }}\n\
          use kani::any;\n\
          {support}\n{builder}\n{cloner}\n{comparer}\n{DRIVER}",
         support = heap_support(),

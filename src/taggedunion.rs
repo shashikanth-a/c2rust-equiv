@@ -176,9 +176,10 @@ pub fn mine_accessors(
     impl<'a, 'ast> Visit<'ast> for Miner<'a> {
         fn visit_expr_match(&mut self, m: &'ast syn::ExprMatch) {
             // Does any arm of this match touch our union field?
-            let touches = m.arms.iter().any(|a| {
-                !accessed_subfields(&a.body, self.union_field, self.subfields).is_empty()
-            });
+            let touches = m
+                .arms
+                .iter()
+                .any(|a| !accessed_subfields(&a.body, self.union_field, self.subfields).is_empty());
             if touches {
                 if let Some(tag) = field_member(&m.expr) {
                     self.record(&tag, m);
@@ -334,7 +335,10 @@ mod tests {
             variants: extra,
         };
         let merged = base.clone().merge(&ann).unwrap();
-        assert_eq!(merged.variants.get("json_type::json_type_null"), Some(&None));
+        assert_eq!(
+            merged.variants.get("json_type::json_type_null"),
+            Some(&None)
+        );
         // A conflicting source is rejected.
         let mut bad = BTreeMap::new();
         bad.insert(

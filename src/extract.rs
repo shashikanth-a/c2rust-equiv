@@ -517,9 +517,9 @@ fn extract_in(
 /// Whether any item is a union with more than one field -- the only case where
 /// the discriminant catalog is needed.
 fn has_multi_field_union(items: &[syn::Item]) -> bool {
-    items.iter().any(|it| {
-        matches!(it, syn::Item::Union(u) if u.fields.named.len() > 1)
-    })
+    items
+        .iter()
+        .any(|it| matches!(it, syn::Item::Union(u) if u.fields.named.len() > 1))
 }
 
 /// Resolve a function into a self-contained unit and check it is in scope for
@@ -744,7 +744,10 @@ impl Resolver<'_> {
             return false;
         };
         let mut m = m.clone();
-        PtrAliasInliner { aliases: self.aliases }.visit_item_foreign_mod_mut(&mut m);
+        PtrAliasInliner {
+            aliases: self.aliases,
+        }
+        .visit_item_foreign_mod_mut(&mut m);
         crate::strmodel::is_trace_modellable(&Some(syn::Item::ForeignMod(m)))
     }
 
@@ -786,12 +789,10 @@ impl Resolver<'_> {
             // file) resolves to the crate definition of the same name when that
             // definition is a modellable global, so the data-global and
             // scalar-`static mut` cases above apply to cross-file accesses too.
-            Kind::ForeignStatic if self.heap => {
-                match self.static_def(&entry.name) {
-                    Some(def) => self.entry(def, shown),
-                    None => Res::Skip(Skip::new("global", format!("accesses `{shown}`"))),
-                }
-            }
+            Kind::ForeignStatic if self.heap => match self.static_def(&entry.name) {
+                Some(def) => self.entry(def, shown),
+                None => Res::Skip(Skip::new("global", format!("accesses `{shown}`"))),
+            },
             Kind::Static | Kind::ForeignStatic => {
                 Res::Skip(Skip::new("global", format!("accesses `{shown}`")))
             }
@@ -917,7 +918,11 @@ fn written_data_globals(
         fn visit_macro(&mut self, m: &'ast syn::Macro) {
             // `addr_of_mut!(X)` (bare or `core::ptr::addr_of_mut!`) takes a
             // writable address of its argument -- treat it as a write.
-            if m.path.segments.last().is_some_and(|s| s.ident == "addr_of_mut") {
+            if m.path
+                .segments
+                .last()
+                .is_some_and(|s| s.ident == "addr_of_mut")
+            {
                 if let Ok(e) = m.parse_body::<syn::Expr>() {
                     self.mark(&e);
                 }
@@ -969,9 +974,7 @@ fn anon_qualified(name: &str, module: usize) -> String {
 fn same_item(a: &Option<syn::Item>, b: &Option<syn::Item>) -> bool {
     use quote::ToTokens;
     match (a, b) {
-        (Some(x), Some(y)) => {
-            x.to_token_stream().to_string() == y.to_token_stream().to_string()
-        }
+        (Some(x), Some(y)) => x.to_token_stream().to_string() == y.to_token_stream().to_string(),
         (None, None) => true,
         _ => false,
     }
@@ -1138,7 +1141,7 @@ impl<'ast> Visit<'ast> for Analyzer<'_> {
                     "indirect call",
                     format!(
                         "calls through a function pointer: {}",
-                        quote::ToTokens::to_token_stream(&*c.func).to_string()
+                        quote::ToTokens::to_token_stream(&*c.func)
                     ),
                 ));
             }
@@ -1236,15 +1239,17 @@ impl<'ast> Visit<'ast> for Analyzer<'_> {
             && m.items.iter().all(|it| match it {
                 syn::ForeignItem::Fn(f) => {
                     crate::unit::is_modelled_c_fn(&f.sig.ident.to_string())
-                        || self.resolver.is_trace_modellable_item(&Some(syn::Item::ForeignMod(
-                            syn::ItemForeignMod {
-                                attrs: vec![],
-                                unsafety: None,
-                                abi: m.abi.clone(),
-                                brace_token: m.brace_token,
-                                items: vec![syn::ForeignItem::Fn(f.clone())],
-                            },
-                        )))
+                        || self
+                            .resolver
+                            .is_trace_modellable_item(&Some(syn::Item::ForeignMod(
+                                syn::ItemForeignMod {
+                                    attrs: vec![],
+                                    unsafety: None,
+                                    abi: m.abi.clone(),
+                                    brace_token: m.brace_token,
+                                    items: vec![syn::ForeignItem::Fn(f.clone())],
+                                },
+                            )))
                 }
                 syn::ForeignItem::Static(s) => {
                     crate::allocmodel::is_alloc_global(&s.ident.to_string())
@@ -1451,7 +1456,11 @@ mod tests {
         let e = idx.find_functions("helper")[0];
         let unit = extract_heap_composed(&idx, e, &cat).unwrap();
         // `helper` is the entry; its body stays, and no shim is appended.
-        assert!(unit.function.to_token_stream().to_string().contains("* p = v"));
+        assert!(unit
+            .function
+            .to_token_stream()
+            .to_string()
+            .contains("* p = v"));
         assert!(!callees_src(&unit).contains("TRACE"));
     }
 
@@ -1464,7 +1473,10 @@ mod tests {
         let idx = index(src);
         let e = idx.find_functions("f")[0];
         let unit = extract_heap(&idx, e).unwrap();
-        assert!(callees_src(&unit).contains("static mut TBL"), "table pulled in");
+        assert!(
+            callees_src(&unit).contains("static mut TBL"),
+            "table pulled in"
+        );
     }
 
     // A data global the unit *writes* is not read-only: no final comparison is
@@ -1515,9 +1527,15 @@ mod tests {
         let e = idx.find_functions("f")[0];
         let unit = extract_heap(&idx, e).unwrap();
         let callees = callees_src(&unit);
-        assert!(callees.contains("static mut TBL"), "typedef'd ptr global kept: {callees}");
+        assert!(
+            callees.contains("static mut TBL"),
+            "typedef'd ptr global kept: {callees}"
+        );
         // The alias is inlined to a concrete pointer in the unit.
-        assert!(callees.contains("* mut i32"), "alias inlined to pointer: {callees}");
+        assert!(
+            callees.contains("* mut i32"),
+            "alias inlined to pointer: {callees}"
+        );
     }
 
     // c2rust duplicates the same `type` alias in every file; identical copies
@@ -1525,12 +1543,18 @@ mod tests {
     #[test]
     fn duplicate_identical_typedef_still_resolves() {
         let mut idx = CrateIndex::default();
-        idx.add_source("a.rs", "pub type Handle = *mut i32;\n\
-                                static mut TBL: Handle = core::ptr::null_mut();")
-            .unwrap();
-        idx.add_source("b.rs", "pub type Handle = *mut i32;\n\
-                                pub unsafe fn g(p: *mut i32) { *p = (!TBL.is_null()) as i32; }")
-            .unwrap();
+        idx.add_source(
+            "a.rs",
+            "pub type Handle = *mut i32;\n\
+                                static mut TBL: Handle = core::ptr::null_mut();",
+        )
+        .unwrap();
+        idx.add_source(
+            "b.rs",
+            "pub type Handle = *mut i32;\n\
+                                pub unsafe fn g(p: *mut i32) { *p = (!TBL.is_null()) as i32; }",
+        )
+        .unwrap();
         let e = idx.find_functions("g")[0];
         let unit = extract_heap(&idx, e).unwrap();
         assert!(callees_src(&unit).contains("static mut TBL"));

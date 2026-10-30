@@ -15,12 +15,21 @@ fn infers_json_object_tag_map_from_real_source() {
         return;
     }
     let mut index = CrateIndex::default();
-    index.add_source(JSONC, &std::fs::read_to_string(JSONC).unwrap()).unwrap();
+    index
+        .add_source(JSONC, &std::fs::read_to_string(JSONC).unwrap())
+        .unwrap();
 
-    let subfields: Vec<String> = ["c_boolean", "c_double", "c_int64", "c_object", "c_array", "c_string"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let subfields: Vec<String> = [
+        "c_boolean",
+        "c_double",
+        "c_int64",
+        "c_object",
+        "c_array",
+        "c_string",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
     let m = mine_accessors(&index, "o", &subfields).expect("should infer a map");
 
     assert_eq!(m.tag_field, "o_type");
@@ -41,27 +50,37 @@ fn infers_json_object_tag_map_from_real_source() {
 }
 
 #[test]
-fn json_object_still_blocked_after_union_support() {
-    // Even with the tag map inferred and typedefs resolved, json_object does
-    // not yet build. The blocker is now the `string` variant's field, a
-    // by-value nested aggregate (`C2Rust_Unnamed`: a struct wrapping a
-    // ptr-or-inline-buffer union and a length) -- the generator only handles
-    // aggregates behind a pointer. Behind that lie the object/array variants'
-    // `lh_table`/`array_list` (whose fields need `void**` support) and
-    // json_object's own function-pointer (`_delete`) and `c_void`
-    // (`_userdata`) fields.
+fn json_object_builds_with_union_and_opaque_field_support() {
+    // json_object now generates end to end: the tag map is inferred, the
+    // `string` variant's by-value nested aggregate (`C2Rust_Unnamed`) builds,
+    // the object/array variants' `lh_table`/`array_list` are pulled in, and
+    // json_object's own function-pointer (`_delete`/`_to_json_string`) and
+    // `c_void` (`_userdata`) fields are carried as opaque identity words. (It
+    // was blocked on all of these before the heap path grew those features.)
     if !Path::new(JSONC).exists() {
         eprintln!("skipping: {JSONC} not present");
         return;
     }
     let mut index = CrateIndex::default();
-    index.add_source(JSONC, &std::fs::read_to_string(JSONC).unwrap()).unwrap();
-    let err = c2rust_equiv::heapgen::generate(&index, "json_object", &Default::default(), "old", "new")
-        .expect_err("json_object should still be unsupported");
-    eprintln!("json_object blocked by: field `{}`: {}", err.field, err.detail);
-    // The tag map is inferred, so the failure is a non-buildable field, not the
-    // discriminant.
-    assert!(!err.detail.contains("infer"), "unexpected: {}", err.detail);
+    index
+        .add_source(JSONC, &std::fs::read_to_string(JSONC).unwrap())
+        .unwrap();
+    let gen =
+        c2rust_equiv::heapgen::generate(&index, "json_object", &Default::default(), "old", "new")
+            .expect("json_object now builds");
+    // A tag-dispatched builder and comparer, with the referenced aggregates
+    // pulled into the closure.
+    assert!(
+        gen.builder.contains("fn gen_json_object"),
+        "{}",
+        gen.builder
+    );
+    assert!(
+        gen.comparer.contains("fn same_json_object"),
+        "{}",
+        gen.comparer
+    );
+    assert!(gen.referenced.contains("lh_table"));
 }
 
 // The crate-wide catalog (wall 4): a function's own closure may not contain the

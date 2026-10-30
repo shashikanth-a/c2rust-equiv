@@ -14,7 +14,9 @@ use c2rust_equiv::check::heap_diagnose;
 use c2rust_equiv::{all_blockers, extract_heap_composed, CrateIndex};
 
 fn main() {
-    let root = std::env::args().nth(1).expect("usage: dag <crate-dir> [i/n]");
+    let root = std::env::args()
+        .nth(1)
+        .expect("usage: dag <crate-dir> [i/n]");
     let (si, sn) = match std::env::args().nth(2) {
         Some(s) => {
             let (i, n) = s.split_once('/').unwrap();
@@ -58,9 +60,13 @@ fn main() {
             *touch.entry(c.clone()).or_default() += 1;
         }
         if cats.len() == 1 {
-            *single.entry(cats.iter().next().unwrap().clone()).or_default() += 1;
+            *single
+                .entry(cats.iter().next().unwrap().clone())
+                .or_default() += 1;
         }
-        *sets.entry(cats.into_iter().collect::<Vec<_>>().join("+")).or_default() += 1;
+        *sets
+            .entry(cats.into_iter().collect::<Vec<_>>().join("+"))
+            .or_default() += 1;
     }
 
     println!("ELIG\t{elig}\t{total}");

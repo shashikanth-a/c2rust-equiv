@@ -61,7 +61,10 @@ pub fn is_alloc_hook_call(call: &syn::ExprCall) -> bool {
         return false;
     }
     match &*mc.receiver {
-        syn::Expr::Path(p) => p.path.get_ident().is_some_and(|id| is_alloc_global(&id.to_string())),
+        syn::Expr::Path(p) => p
+            .path
+            .get_ident()
+            .is_some_and(|id| is_alloc_global(&id.to_string())),
         _ => false,
     }
 }
@@ -144,7 +147,11 @@ pub fn inject(items: &mut Vec<syn::Item>) {
     for item in items.iter() {
         used.visit_item(item);
     }
-    let names: Vec<&str> = GLOBALS.iter().copied().filter(|g| used.0.contains(*g)).collect();
+    let names: Vec<&str> = GLOBALS
+        .iter()
+        .copied()
+        .filter(|g| used.0.contains(*g))
+        .collect();
     if names.is_empty() {
         return;
     }
@@ -197,7 +204,10 @@ mod tests {
              }",
         );
         inject(&mut it);
-        let src = it.iter().map(|i| i.to_token_stream().to_string()).collect::<String>();
+        let src = it
+            .iter()
+            .map(|i| i.to_token_stream().to_string())
+            .collect::<String>();
         assert!(src.contains("static mut xmlMalloc"));
         assert!(src.contains("fn __equiv_malloc"));
         assert!(src.contains("link_name = \"malloc\""));
@@ -213,7 +223,10 @@ mod tests {
              }",
         );
         inject(&mut it);
-        let src = it.iter().map(|i| i.to_token_stream().to_string()).collect::<String>();
+        let src = it
+            .iter()
+            .map(|i| i.to_token_stream().to_string())
+            .collect::<String>();
         assert!(src.contains("static mut xmlMemStrdup"));
         assert!(src.contains("fn __equiv_strdup"));
         assert!(!src.contains("static mut xmlMalloc :"));
@@ -236,7 +249,10 @@ mod tests {
              }",
         );
         inject(&mut it);
-        let src = it.iter().map(|i| i.to_token_stream().to_string()).collect::<String>();
+        let src = it
+            .iter()
+            .map(|i| i.to_token_stream().to_string())
+            .collect::<String>();
         assert!(src.contains("static mut xmlFree"));
         assert!(src.contains("static mut xmlRealloc"));
         assert!(!src.contains("static mut xmlMalloc :"));

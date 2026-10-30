@@ -157,7 +157,10 @@ mod tests {
         .unwrap()
         .items;
         rewrite(&mut items);
-        let src = items.iter().map(|i| i.to_token_stream().to_string()).collect::<String>();
+        let src = items
+            .iter()
+            .map(|i| i.to_token_stream().to_string())
+            .collect::<String>();
         assert!(!src.contains("xmlMutexLock"));
         assert!(!src.contains("xmlMutexUnlock"));
         // The real work in between is untouched.

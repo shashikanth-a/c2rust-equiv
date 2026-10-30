@@ -357,14 +357,15 @@ fn heap_lib_source(
     let struct_globals: Vec<(String, String, Option<String>)> = gitems
         .iter()
         .filter_map(|it| match it {
-            syn::Item::Static(s) => crate::unit::modelled_struct_mut_static(s, &gstructs, &galiases)
-                .map(|t| {
+            syn::Item::Static(s) => {
+                crate::unit::modelled_struct_mut_static(s, &gstructs, &galiases).map(|t| {
                     (
                         s.ident.to_string(),
                         t,
                         crate::unit::mut_static_array_len(s, &galiases),
                     )
-                }),
+                })
+            }
             _ => None,
         })
         .collect();
@@ -438,9 +439,13 @@ fn heap_lib_source(
     let finish = "        (*__tr).finish();\n";
     let harness = |name: &str, first_new: bool| {
         let calls = if first_new {
-            format!("{rec}        let n = {new_call};\n{replay}        let o = {old_call};\n{finish}")
+            format!(
+                "{rec}        let n = {new_call};\n{replay}        let o = {old_call};\n{finish}"
+            )
         } else {
-            format!("{rec}        let o = {old_call};\n{replay}        let n = {new_call};\n{finish}")
+            format!(
+                "{rec}        let o = {old_call};\n{replay}        let n = {new_call};\n{finish}"
+            )
         };
         format!(
             "    #[kani::proof]\n\

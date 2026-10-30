@@ -194,7 +194,8 @@ fn run(cli: &Cli) -> Result<u8, Box<dyn std::error::Error>> {
         for (i, id) in selected.iter().enumerate() {
             // Keep a function once it has been proved; only retry the rest with
             // the (possibly grown) catalog.
-            if matches!(results_map.get(id), Some((o, _)) if matches!(o.status, c2rust_equiv::Status::Proved { .. })) {
+            if matches!(results_map.get(id), Some((o, _)) if matches!(o.status, c2rust_equiv::Status::Proved { .. }))
+            {
                 continue;
             }
             let (outcome, cached) = check_one(&old, &new, id, &opts, &catalog, cache.as_mut());
@@ -205,7 +206,11 @@ fn run(cli: &Cli) -> Result<u8, Box<dyn std::error::Error>> {
                 i + 1,
                 selected.len(),
                 outcome.status.label(),
-                if cached { " (cached)".to_owned() } else { format!(" ({} ms)", outcome.total_ms) }
+                if cached {
+                    " (cached)".to_owned()
+                } else {
+                    format!(" ({} ms)", outcome.total_ms)
+                }
             );
             results_map.insert(id.clone(), (outcome, cached));
             if is_proved {
@@ -226,8 +231,15 @@ fn run(cli: &Cli) -> Result<u8, Box<dyn std::error::Error>> {
     let results: Vec<FunctionReport> = selected
         .iter()
         .map(|id| {
-            let (outcome, cached) = results_map.remove(id).expect("every selected id was checked");
-            FunctionReport { id: id.clone(), label: outcome.status.label(), cached, outcome }
+            let (outcome, cached) = results_map
+                .remove(id)
+                .expect("every selected id was checked");
+            FunctionReport {
+                id: id.clone(),
+                label: outcome.status.label(),
+                cached,
+                outcome,
+            }
         })
         .collect();
     if let Some(cache) = &cache {
