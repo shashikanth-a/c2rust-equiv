@@ -241,11 +241,36 @@ fn extract_in(
     // Drop closure entries c2rust duplicated identically across files, keeping
     // one per name; a true collision (same name, different definition) is still
     // an error. The function being extracted is always kept.
+    // c2rust emits a per-file `extern "C"` redeclaration of each function or
+    // data global that is actually defined elsewhere in the crate. When the
+    // closure pulls in both the real definition and such a foreign declaration,
+    // they share a name but differ -- not a true collision (the declaration
+    // merely forward-references the definition), so drop the redundant
+    // declaration and keep the definition.
+    let real_defs: HashSet<String> = closure
+        .iter()
+        .filter(|&&e| matches!(index.entries[e].kind, Kind::Fn | Kind::Static | Kind::Const))
+        .map(|&e| index.entries[e].name.clone())
+        .collect();
     let mut names: HashMap<(bool, String), usize> = HashMap::new();
     let mut keep: Vec<usize> = Vec::new();
     for &e in &closure {
         let entry = &index.entries[e];
-        let key = (entry.kind == Kind::TypeAlias, entry.name.clone());
+        if matches!(entry.kind, Kind::ForeignFn | Kind::ForeignStatic)
+            && real_defs.contains(&entry.name)
+        {
+            continue;
+        }
+        // Qualify an anonymous c2rust type's dedup key by its defining module,
+        // so two files' distinct `C2Rust_Unnamed` types are kept side by side
+        // (the rewrite renames each to its module-qualified form) rather than
+        // reported as a collision.
+        let name = if is_anon_c2rust(&entry.name) {
+            anon_qualified(&entry.name, index.entries[e].module)
+        } else {
+            entry.name.clone()
+        };
+        let key = (entry.kind == Kind::TypeAlias, name);
         if let Some(&other) = names.get(&key) {
             if same_item(&index.entries[other].item, &entry.item) {
                 continue;
@@ -358,6 +383,29 @@ fn extract_in(
             return Err(Skip::new(
                 "global",
                 format!("writes data global `{g}` (not read-only)"),
+            ));
+        }
+    }
+
+    // Write-guard for fn-ptr `static mut` globals: modelled as a shared symbolic
+    // word injected read-only, with no final comparison, so a unit that writes
+    // one (e.g. json-c's `json_global_set_string_hash` setting `char_hash_fn`)
+    // would store a divergent concrete address undetected -- reject it instead.
+    let fnptr_statics: BTreeSet<String> = callees
+        .iter()
+        .filter_map(|c| match c {
+            syn::Item::Static(s) if crate::unit::is_fnptr_mut_static(s, &aliases) => {
+                Some(s.ident.to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    if !fnptr_statics.is_empty() {
+        let written = written_data_globals(&function, &callees, &fnptr_statics);
+        if let Some(g) = written.iter().next() {
+            return Err(Skip::new(
+                "global",
+                format!("writes fn-ptr global `{g}` (not read-only)"),
             ));
         }
     }
@@ -591,7 +639,9 @@ impl Resolver<'_> {
             let en = &self.index.entries[i];
             en.kind == Kind::Static
                 && en.name == name
-                && (is_scalar_mut_static(&en.item) || self.is_data_static_item(&en.item))
+                && (is_scalar_mut_static(&en.item)
+                    || self.is_data_static_item(&en.item)
+                    || self.is_fnptr_mut_static_item(&en.item))
         })
     }
 
@@ -614,6 +664,11 @@ impl Resolver<'_> {
             self.structs,
             self.aliases,
         )
+    }
+
+    fn is_fnptr_mut_static_item(&self, item: &Option<syn::Item>) -> bool {
+        matches!(item, Some(syn::Item::Static(s))
+            if crate::unit::is_fnptr_mut_static(s, self.aliases))
     }
 
     /// Whether a foreign function can be modelled as an observable trace call,
@@ -656,6 +711,11 @@ impl Resolver<'_> {
             Kind::Static if self.heap && self.is_modelled_struct_mut_static_item(&entry.item) => {
                 Res::Item(e)
             }
+            // A `static mut` holding a nullable function pointer: pulled in and
+            // modelled as a shared symbolic word injected into both versions
+            // (see `unit::is_fnptr_mut_static`). The write-guard rejects the
+            // unit if any function writes it.
+            Kind::Static if self.heap && self.is_fnptr_mut_static_item(&entry.item) => Res::Item(e),
             // A reference through an `extern` declaration (c2rust emits one per
             // file) resolves to the crate definition of the same name when that
             // definition is a modellable global, so the data-global and
@@ -827,6 +887,19 @@ fn base_name(e: &syn::Expr) -> Option<String> {
 
 /// Whether two stored items are the same definition, by token text. Used to
 /// treat c2rust's identical per-file duplicate definitions as one.
+/// c2rust names every anonymous C aggregate `C2Rust_Unnamed` (with a per-file
+/// `_N` suffix), so two different files' anonymous types share a name. Each is
+/// only ever referenced within its own file, so qualifying it by its defining
+/// module -- the definition's ident and every reference alike -- is a sound
+/// alpha-rename that lets one closure hold several of them without collision.
+fn is_anon_c2rust(name: &str) -> bool {
+    name.starts_with("C2Rust_Unnamed") || name.starts_with("C2RustUnnamed")
+}
+
+fn anon_qualified(name: &str, module: usize) -> String {
+    format!("{name}_m{module}")
+}
+
 fn same_item(a: &Option<syn::Item>, b: &Option<syn::Item>) -> bool {
     use quote::ToTokens;
     match (a, b) {
@@ -1055,7 +1128,10 @@ impl<'ast> Visit<'ast> for Analyzer<'_> {
             && (is_scalar_mut_static(&Some(syn::Item::Static(s.clone())))
                 || self
                     .resolver
-                    .is_data_static_item(&Some(syn::Item::Static(s.clone()))))
+                    .is_data_static_item(&Some(syn::Item::Static(s.clone())))
+                || self
+                    .resolver
+                    .is_fnptr_mut_static_item(&Some(syn::Item::Static(s.clone()))))
         {
             syn::visit::visit_item_static(self, s);
             return;
@@ -1132,6 +1208,15 @@ impl Rewriter<'_> {
                 let tail = path.segments.last().filter(|s| {
                     matches!(entry.kind, Kind::Type | Kind::TypeAlias) && s.ident != name.as_str()
                 });
+                // An anonymous c2rust type is renamed to its module-qualified
+                // form, matching the rename of its definition's ident below.
+                let qualified;
+                let name: &str = if is_anon_c2rust(name) {
+                    qualified = anon_qualified(name, entry.module);
+                    &qualified
+                } else {
+                    name
+                };
                 let mut new_path = syn::Path::from(ident(name));
                 if let Some(tail) = tail {
                     new_path.segments.push(tail.clone());
@@ -1161,6 +1246,30 @@ impl VisitMut for Rewriter<'_> {
             Some(q) => self.visit_type_mut(&mut q.ty),
             None => self.path(&mut t.path, Ns::Type),
         }
+    }
+
+    // Rename an anonymous c2rust type's *definition* ident to its
+    // module-qualified form, so it matches the references rewritten in `path`
+    // (its fields' types are rewritten by the descent).
+    fn visit_item_struct_mut(&mut self, s: &mut syn::ItemStruct) {
+        if is_anon_c2rust(&s.ident.to_string()) {
+            s.ident = ident(&anon_qualified(&s.ident.to_string(), self.module));
+        }
+        syn::visit_mut::visit_item_struct_mut(self, s);
+    }
+
+    fn visit_item_union_mut(&mut self, u: &mut syn::ItemUnion) {
+        if is_anon_c2rust(&u.ident.to_string()) {
+            u.ident = ident(&anon_qualified(&u.ident.to_string(), self.module));
+        }
+        syn::visit_mut::visit_item_union_mut(self, u);
+    }
+
+    fn visit_item_enum_mut(&mut self, en: &mut syn::ItemEnum) {
+        if is_anon_c2rust(&en.ident.to_string()) {
+            en.ident = ident(&anon_qualified(&en.ident.to_string(), self.module));
+        }
+        syn::visit_mut::visit_item_enum_mut(self, en);
     }
 
     fn visit_macro_mut(&mut self, mac: &mut syn::Macro) {

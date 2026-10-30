@@ -101,6 +101,20 @@ pub fn write_heap(
 fn module_source(unit: &FnUnit, inject_str_models: bool) -> String {
     let mut items = unit.items();
     items.iter_mut().for_each(make_standalone);
+    // A fn-ptr `static mut` global is modelled by a symbolic word the harness
+    // injects into both versions, so its concrete default is irrelevant;
+    // neutralise the initializer to `None` to avoid pulling the named default
+    // function (and its transitive dependencies) into the unit.
+    if inject_str_models {
+        let aliases = crate::heapgen::alias_table_from_items(&items);
+        for it in &mut items {
+            if let syn::Item::Static(s) = it {
+                if crate::unit::is_fnptr_mut_static(s, &aliases) {
+                    s.expr = syn::parse_quote!(None);
+                }
+            }
+        }
+    }
     // On the heap path, give the modelled C string functions Rust bodies so
     // Kani resolves calls to them instead of refusing a foreign symbol.
     if inject_str_models {
@@ -353,6 +367,29 @@ fn heap_lib_source(
             "        {{ let og = core::ptr::addr_of!(old::{g}); \
              let ng = core::ptr::addr_of!(new::{g}); \
              assert!(sameval_{ty}(og, ng, &mut corr), \"global {g} differs\"); }}\n"
+        );
+    }
+    // Each fn-ptr `static mut` global: inject one symbolic word, shared by both
+    // versions, before the call. Its concrete default is a function address
+    // that differs between the two compiled crates, so carrying that by value
+    // would falsely diverge; a single symbolic word generalises over every
+    // value and is read identically by both runs. Read-only (write-guarded), so
+    // no final comparison -- the stored word is compared wherever it flows (a
+    // heap field, under `corr`).
+    for (gi, g) in gitems
+        .iter()
+        .filter_map(|it| match it {
+            syn::Item::Static(s) if crate::unit::is_fnptr_mut_static(s, &galiases) => {
+                Some(s.ident.to_string())
+            }
+            _ => None,
+        })
+        .enumerate()
+    {
+        build += &format!(
+            "        let __g{gi}: usize = kani::any(); \
+             old::{g} = core::mem::transmute(__g{gi}); \
+             new::{g} = core::mem::transmute(__g{gi});\n"
         );
     }
     // `corr` is used only by struct-pointer comparisons; a C-string-only

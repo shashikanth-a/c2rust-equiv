@@ -337,6 +337,29 @@ pub(crate) fn is_scalar_mut_static(s: &syn::ItemStatic) -> bool {
     false
 }
 
+/// Whether a static is a `static mut` holding a nullable function pointer
+/// (`Option<F>`, `F` a bare fn through aliases). The heap path models it as a
+/// shared symbolic opaque word injected into both versions before the call,
+/// never its concrete default: that default is a function address, which
+/// differs between the two separately compiled crates, so carrying it by value
+/// (as a scalar `static mut` is) would compare unequal and falsely diverge. A
+/// single symbolic word shared by both runs generalises over every value the
+/// global could hold (including the real default) and still catches a rewrite
+/// that stores a *different* function -- that stored word then flows into a
+/// heap field compared under `corr`, or the global's own final value, and a
+/// genuine mismatch fails to prove. Sound only for a unit that never writes it
+/// (the extractor's write-guard enforces that), so the harness emits no
+/// final-value comparison and the pulled-in initializer is neutralised to
+/// `None` (the symbolic injection replaces it, and dropping it avoids pulling
+/// the default function and its transitive dependencies into the unit).
+pub(crate) fn is_fnptr_mut_static(
+    s: &syn::ItemStatic,
+    aliases: &BTreeMap<String, syn::Type>,
+) -> bool {
+    matches!(s.mutability, syn::StaticMutability::Mut(_))
+        && crate::heapgen::is_option_fn(&s.ty, aliases)
+}
+
 /// Whether a static is a read-only "data" global the heap path can pull into a
 /// unit as an identical per-version copy: an array of scalars, a raw-pointer
 /// table, or an immutable scalar (a lookup table or string constant). Unlike a
@@ -531,8 +554,13 @@ impl<'ast> Visit<'ast> for BodyChecker {
         // A read-only data global (lookup table / string constant) is also
         // kept: the extractor only pulls one in after checking the unit never
         // writes it, so each version's identical copy is read identically.
+        // A fn-ptr `static mut` is modelled too (a shared symbolic word injected
+        // into both versions; the extractor's write-guard rejects a unit that
+        // writes it), so it is kept in scope.
         if self.allow_pointers
-            && (is_scalar_mut_static(s) || is_data_static(s, &self.structs, &self.aliases))
+            && (is_scalar_mut_static(s)
+                || is_data_static(s, &self.structs, &self.aliases)
+                || is_fnptr_mut_static(s, &self.aliases))
         {
             return;
         }

@@ -2937,3 +2937,67 @@ fn aliased_chain_indirect_call_catches_different_argument() {
         outcome.status
     );
 }
+
+// A `static mut` holding a nullable function pointer (json-c's `char_hash_fn`
+// default hash installed into a new hash table). The heap path models the
+// global as a shared symbolic word injected into both versions: its concrete
+// default is a function address that differs between the two compiled crates,
+// so carrying it by value would falsely diverge. `install` reads the global and
+// stores it into the struct's fn-ptr field; the field's post-state is compared
+// (an opaque word by identity), so a rewrite that stores a *different* function
+// is caught, while one that stores the same global is proved.
+const FPG_DEFS: &[&str] = &[
+    "pub type HashFn = unsafe extern \"C\" fn(usize) -> u64;",
+    "#[repr(C)] pub struct Table { pub hash_fn: Option<HashFn>, pub n: i64 }",
+    "pub unsafe extern \"C\" fn default_hash(k: usize) -> u64 { k as u64 }",
+    "pub unsafe extern \"C\" fn other_hash(k: usize) -> u64 { (k as u64).wrapping_add(1) }",
+    "pub static mut HASH: Option<HashFn> = Some(default_hash as unsafe extern \"C\" fn(usize) -> u64);",
+];
+
+const FPG_OLD: &str = r#"
+pub unsafe fn install(t: *mut Table) {
+    if t.is_null() { return; }
+    (*t).hash_fn = HASH;
+}
+"#;
+
+const FPG_OK: &str = r#"
+pub unsafe fn install(t: *mut Table) {
+    if t.is_null() { return; }
+    let h = HASH;
+    (*t).hash_fn = h;
+}
+"#;
+
+const FPG_BAD: &str = r#"
+pub unsafe fn install(t: *mut Table) {
+    if t.is_null() { return; }
+    (*t).hash_fn = Some(other_hash as unsafe extern "C" fn(usize) -> u64);
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn fnptr_global_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(FPG_OLD, FPG_DEFS).unwrap();
+    let new = FnUnit::parse(FPG_OK, FPG_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn fnptr_global_catches_a_different_stored_function() {
+    let old = FnUnit::parse(FPG_OLD, FPG_DEFS).unwrap();
+    let new = FnUnit::parse(FPG_BAD, FPG_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a rewrite storing a different function was proved equivalent: {:?}",
+        outcome.status
+    );
+}

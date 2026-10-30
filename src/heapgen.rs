@@ -486,7 +486,7 @@ fn opaque_word_type(ty: &syn::Type, aliases: &BTreeMap<String, syn::Type>) -> St
     ty.to_token_stream().to_string()
 }
 
-fn is_option_fn(ty: &syn::Type, aliases: &BTreeMap<String, syn::Type>) -> bool {
+pub(crate) fn is_option_fn(ty: &syn::Type, aliases: &BTreeMap<String, syn::Type>) -> bool {
     let syn::Type::Path(p) = ty else { return false };
     let Some(seg) = p.path.segments.last() else {
         return false;
