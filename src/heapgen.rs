@@ -492,7 +492,11 @@ fn opaque_word_type(ty: &syn::Type, aliases: &BTreeMap<String, syn::Type>) -> St
 }
 
 pub(crate) fn is_option_fn(ty: &syn::Type, aliases: &BTreeMap<String, syn::Type>) -> bool {
-    let syn::Type::Path(p) = ty else { return false };
+    // Resolve a type alias on the outer type too: c2rust types a callback
+    // global as a named alias (`xmlExternalEntityLoader = Option<fn ..>`), not a
+    // bare `Option<..>`, so the `Option` is visible only after following it.
+    let resolved = resolve_alias(ty, aliases);
+    let syn::Type::Path(p) = &resolved else { return false };
     let Some(seg) = p.path.segments.last() else {
         return false;
     };

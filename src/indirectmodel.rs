@@ -57,6 +57,10 @@ pub(crate) struct TypeEnv {
     /// Crate type aliases, so a callback field typed `Option<MyCallback>` (a
     /// typedef'd bare fn, as c2rust emits) is seen through to the bare fn.
     aliases: BTreeMap<String, syn::Type>,
+    /// Global `static` types, so an indirect call through a function-pointer
+    /// global (`xmlCurrentExternalEntityLoader.expect(..)(..)`) can be typed and
+    /// modelled, not just one through a local or a struct field.
+    globals: BTreeMap<String, syn::Type>,
 }
 
 impl TypeEnv {
@@ -98,6 +102,9 @@ impl TypeEnv {
             syn::Item::Type(t) => {
                 self.aliases.insert(t.ident.to_string(), (*t.ty).clone());
             }
+            syn::Item::Static(s) => {
+                self.globals.insert(s.ident.to_string(), (*s.ty).clone());
+            }
             _ => {}
         }
     }
@@ -135,7 +142,9 @@ impl TypeEnv {
             syn::Expr::Group(g) => self.type_of(&g.expr),
             syn::Expr::Path(p) => {
                 let name = p.path.get_ident()?.to_string();
-                self.vars.get(&name).cloned()
+                // A local binding/parameter, else a global `static` (a callback
+                // held in a function-pointer global).
+                self.vars.get(&name).or_else(|| self.globals.get(&name)).cloned()
             }
             syn::Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => {
                 // Resolve type aliases first: c2rust types context pointers as

@@ -1036,6 +1036,72 @@ fn goto_dispatch_local_enum_catches_divergence() {
     );
 }
 
+// An indirect call through a function-pointer *global* (libxml2's
+// `xmlCurrentExternalEntityLoader.expect(..)(..)`), typed via a crate alias.
+// The global is injected as one shared symbolic word (so both versions call
+// the same callback), and the call is modelled as an observable trace keyed by
+// that word -- the same model as an indirect call through a struct field, but
+// the receiver is a global. Proves an equivalent rewrite, catches a divergent
+// one; a null callback maps to key 0 and never panics.
+const LG_DEFS: &[&str] = &[
+    "pub type Loader = Option<unsafe extern \"C\" fn(*const i32) -> i32>;",
+    "static mut CUR: Loader = None;",
+];
+
+const LG_OLD: &str = r#"
+pub unsafe fn f(p: *const i32) -> i32 {
+    CUR.expect("non-null function pointer")(p)
+}
+"#;
+
+const LG_OK: &str = r#"
+pub unsafe fn f(p: *const i32) -> i32 {
+    return CUR.expect("non-null function pointer")(p);
+}
+"#;
+
+const LG_BAD: &str = r#"
+pub unsafe fn f(p: *const i32) -> i32 {
+    CUR.expect("non-null function pointer")(p).wrapping_add(1)
+}
+"#;
+
+#[test]
+fn fnptr_global_indirect_call_is_in_heap_scope() {
+    let old = FnUnit::parse(LG_OLD, LG_DEFS).unwrap();
+    assert!(
+        old.heap_body_in_scope().is_ok(),
+        "indirect call through a fn-ptr global rejected: {:?}",
+        old.heap_body_in_scope()
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn fnptr_global_indirect_call_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(LG_OLD, LG_DEFS).unwrap();
+    let new = FnUnit::parse(LG_OK, LG_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn fnptr_global_indirect_call_catches_divergence() {
+    let old = FnUnit::parse(LG_OLD, LG_DEFS).unwrap();
+    let new = FnUnit::parse(LG_BAD, LG_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent fn-ptr-global call proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 // Lock/unlock wrapper calls around real work: without the mutex model the call
 // to `xmlMutexLock` (and its global argument) would put the function out of
 // scope; with it, the calls are dropped as sequential no-ops and the actual
