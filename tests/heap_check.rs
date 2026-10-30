@@ -2195,6 +2195,75 @@ fn ctx_printer_catches_divergent_message() {
 }
 
 // ---------------------------------------------------------------------------
+// A c2rust newtype enum: a tuple struct `ET(c_uint)` whose variants are
+// associated consts in an `impl` block, used both as `ET::VARIANT` and as the
+// constructor `ET(n)`. The type and its impl come along in the unit, so the
+// consts resolve; the newtype is built/compared by its inner scalar.
+const ENUM_DEFS: &[&str] = &[
+    "#[repr(C)] #[derive(Copy, Clone)] pub struct ET(pub core::ffi::c_uint);",
+    "impl ET { pub const A: ET = ET(7); pub const B: ET = ET(9); }",
+];
+
+const ENUM_OLD: &str = r#"
+pub unsafe fn code(p: *const i32) -> u32 {
+    if p.is_null() { return 0; }
+    if *p == 0 { ET::A.0 } else { ET(3 as core::ffi::c_uint).0 }
+}
+"#;
+
+const ENUM_OK: &str = r#"
+pub unsafe fn code(p: *const i32) -> u32 {
+    if p.is_null() { return 0; }
+    let a = ET::A;
+    if *p == 0 { a.0 } else { ET(3 as core::ffi::c_uint).0 }
+}
+"#;
+
+// Divergent: a different variant (9 vs 7) when the input is zero.
+const ENUM_BAD: &str = r#"
+pub unsafe fn code(p: *const i32) -> u32 {
+    if p.is_null() { return 0; }
+    if *p == 0 { ET::B.0 } else { ET(3 as core::ffi::c_uint).0 }
+}
+"#;
+
+#[test]
+fn newtype_enum_const_is_in_heap_scope() {
+    let old = FnUnit::parse(ENUM_OLD, ENUM_DEFS).unwrap();
+    assert!(
+        c2rust_equiv::heap_diagnose(&old).is_ok(),
+        "a newtype-enum const was rejected: {:?}",
+        c2rust_equiv::heap_diagnose(&old)
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn newtype_enum_const_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(ENUM_OLD, ENUM_DEFS).unwrap();
+    let new = FnUnit::parse(ENUM_OK, ENUM_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn newtype_enum_const_catches_divergence() {
+    let old = FnUnit::parse(ENUM_OLD, ENUM_DEFS).unwrap();
+    let new = FnUnit::parse(ENUM_BAD, ENUM_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent enum variant was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
+// ---------------------------------------------------------------------------
 // A function-local `static` (c2rust's lowering of a C function-static), lazily
 // initialised -- genann's cached sigmoid `lookup` table shape. The static lives
 // in the body and is emitted verbatim; a reference to it resolves locally. Both

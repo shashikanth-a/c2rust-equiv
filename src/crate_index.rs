@@ -58,6 +58,12 @@ pub struct CrateIndex {
     pub entries: Vec<Entry>,
     /// Files that failed to parse, with the error.
     pub parse_errors: Vec<(String, String)>,
+    /// Inherent `impl` blocks keyed by their self-type's name. c2rust emits a
+    /// newtype enum's variants as associated consts in an `impl` block
+    /// (`impl xmlParserErrors { pub const XML_ERR_..: xmlParserErrors = ..; }`),
+    /// which isn't a named top-level item; this lets a unit pull a pulled
+    /// type's impl blocks so `Type::VARIANT` references resolve.
+    pub impls: std::collections::HashMap<String, Vec<syn::Item>>,
     /// The crate-wide union discriminant catalog, mined once on first use
     /// (expensive: it scans every function), then reused for every extraction.
     union_catalog: OnceLock<BTreeMap<String, crate::taggedunion::TagMap>>,
@@ -216,6 +222,21 @@ impl CrateIndex {
                     };
                     let uses = &mut self.modules[module].uses;
                     collect_uses(&u.tree, &mut prefix, uses);
+                }
+                syn::Item::Impl(im) => {
+                    // Index an inherent `impl Type { .. }` by its self-type name
+                    // (skip trait impls); a pulled type carries these in so its
+                    // associated consts (c2rust's enum variants) resolve.
+                    if im.trait_.is_none() {
+                        if let syn::Type::Path(p) = &*im.self_ty {
+                            if let Some(seg) = p.path.segments.last() {
+                                self.impls
+                                    .entry(seg.ident.to_string())
+                                    .or_default()
+                                    .push(item.clone());
+                            }
+                        }
+                    }
                 }
                 syn::Item::Mod(m) => {
                     if let Some((_, items)) = &m.content {

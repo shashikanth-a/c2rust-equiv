@@ -283,6 +283,29 @@ fn extract_in(
     }
     let mut function = function.expect("the function is in its own closure");
 
+    // Pull in the inherent `impl` blocks of every kept crate type, so a newtype
+    // enum's associated-const variants (c2rust's `Type::VARIANT` error codes and
+    // node-type tags, held in `impl Type { pub const .. }`) resolve in the unit.
+    // Deduped by token text, since c2rust repeats each `impl` per file. Sound:
+    // the consts are compile-time scalars, so this is pure scope resolution.
+    if heap {
+        let mut seen: HashSet<String> = HashSet::new();
+        let kept_types: Vec<String> = keep
+            .iter()
+            .filter(|&&e| index.entries[e].kind == Kind::Type)
+            .map(|&e| index.entries[e].name.clone())
+            .collect();
+        for name in kept_types {
+            if let Some(impls) = index.impls.get(&name) {
+                for im in impls {
+                    if seen.insert(im.to_token_stream().to_string()) {
+                        callees.push(im.clone());
+                    }
+                }
+            }
+        }
+    }
+
     // Expose pointers hidden behind crate typedefs as concrete `*mut`/`*const`
     // in the assembled unit, so the body scope check, the write-guard, and the
     // trace-shim generator all classify them correctly without alias lookup.
@@ -534,21 +557,24 @@ impl Resolver<'_> {
         }
         match candidates.as_slice() {
             [] => {
-                if !prefix.is_empty() {
-                    let ty = prefix.last().unwrap();
-                    let type_entry = index
-                        .entries
-                        .iter()
-                        .position(|e| e.name == *ty && matches!(e.kind, Kind::Type | Kind::TypeAlias));
-                    if let Some(te) = type_entry {
-                        // `EnumType::VARIANT` (an associated const): on the heap
-                        // path, pull the type in and keep the `Type::const` path;
-                        // the scalar path rejects it.
-                        if self.heap {
-                            return Res::Item(te);
-                        }
-                        return Res::Skip(Skip::new("crate type", format!("uses `{shown}`")));
+                // A reference naming a crate type in value position, with no
+                // top-level item of that name: either `EnumType::VARIANT` (an
+                // associated const, `ty` = the prefix) or a bare tuple-struct /
+                // newtype used as its constructor or a value, `xmlParserErrors(..)`
+                // (`ty` = the name itself). On the heap path pull the type in and
+                // keep the path; its inherent `impl` blocks (carrying the enum's
+                // associated consts) come along in the unit assembly. The scalar
+                // path rejects it.
+                let ty = prefix.last().map(String::as_str).unwrap_or(name.as_str());
+                let type_entry = index
+                    .entries
+                    .iter()
+                    .position(|e| e.name == *ty && matches!(e.kind, Kind::Type | Kind::TypeAlias));
+                if let Some(te) = type_entry {
+                    if self.heap {
+                        return Res::Item(te);
                     }
+                    return Res::Skip(Skip::new("crate type", format!("uses `{shown}`")));
                 }
                 Res::Skip(Skip::new("unresolved", format!("path `{shown}`")))
             }
