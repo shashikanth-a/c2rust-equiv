@@ -1168,6 +1168,72 @@ fn callback_table_indirect_call_catches_divergence() {
     );
 }
 
+// An indirect call through a callback field of a global reached via its
+// thread-local accessor -- libxml2's `(*__xmlDefaultSAXHandler()).error
+// .expect(..)(..)`. The accessor `__acc() -> *mut H` is rewritten to `&raw mut
+// G` by the global model, and `*__acc()` is typed as the global `G`, so the
+// field and the function pointer beyond it resolve and the call is modelled.
+const AC_DEFS: &[&str] = &[
+    "#[repr(C)] pub struct H { pub cb: Option<unsafe extern \"C\" fn(i32) -> i32>, pub n: i32 }",
+    "static mut G: H = H { cb: None, n: 0 };",
+    "pub unsafe fn __acc() -> *mut H { return &raw mut G; }",
+];
+
+const AC_OLD: &str = r#"
+pub unsafe fn f(x: i32) -> i32 {
+    (*__acc()).cb.expect("non-null function pointer")(x)
+}
+"#;
+
+const AC_OK: &str = r#"
+pub unsafe fn f(x: i32) -> i32 {
+    let v = x;
+    (*__acc()).cb.expect("non-null function pointer")(v)
+}
+"#;
+
+const AC_BAD: &str = r#"
+pub unsafe fn f(x: i32) -> i32 {
+    (*__acc()).cb.expect("non-null function pointer")(x).wrapping_add(1)
+}
+"#;
+
+#[test]
+fn accessor_callback_indirect_call_is_in_heap_scope() {
+    let old = FnUnit::parse(AC_OLD, AC_DEFS).unwrap();
+    assert!(
+        old.heap_body_in_scope().is_ok(),
+        "accessor-callback indirect call rejected: {:?}",
+        old.heap_body_in_scope()
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn accessor_callback_indirect_call_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(AC_OLD, AC_DEFS).unwrap();
+    let new = FnUnit::parse(AC_OK, AC_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn accessor_callback_indirect_call_catches_divergence() {
+    let old = FnUnit::parse(AC_OLD, AC_DEFS).unwrap();
+    let new = FnUnit::parse(AC_BAD, AC_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent accessor-callback call proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 // Lock/unlock wrapper calls around real work: without the mutex model the call
 // to `xmlMutexLock` (and its global argument) would put the function out of
 // scope; with it, the calls are dropped as sequential no-ops and the actual

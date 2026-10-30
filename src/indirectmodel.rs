@@ -61,6 +61,12 @@ pub(crate) struct TypeEnv {
     /// global (`xmlCurrentExternalEntityLoader.expect(..)(..)`) can be typed and
     /// modelled, not just one through a local or a struct field.
     globals: BTreeMap<String, syn::Type>,
+    /// Thread-local accessor functions (`__X() -> *mut T`, which the global
+    /// model rewrites to `&raw mut X`), mapped to the global `X` they return.
+    /// So `(*__xmlDefaultSAXHandler()).error.expect(..)(..)` -- a dispatch
+    /// through a callback field of a global reached via its accessor -- types
+    /// `*__X()` as the global's own type.
+    accessors: BTreeMap<String, String>,
 }
 
 impl TypeEnv {
@@ -105,6 +111,11 @@ impl TypeEnv {
             syn::Item::Static(s) => {
                 self.globals.insert(s.ident.to_string(), (*s.ty).clone());
             }
+            syn::Item::Fn(f) => {
+                if let Some(g) = crate::globalaccessmodel::accessor_global_fn(f) {
+                    self.accessors.insert(f.sig.ident.to_string(), g.to_string());
+                }
+            }
             _ => {}
         }
     }
@@ -147,6 +158,18 @@ impl TypeEnv {
                 self.vars.get(&name).or_else(|| self.globals.get(&name)).cloned()
             }
             syn::Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => {
+                // `*__X()` -- dereferencing a thread-local accessor call -- is
+                // the global `X` the accessor returns (the global model rewrites
+                // the accessor to `&raw mut X`).
+                if let syn::Expr::Call(c) = &*u.expr {
+                    if let syn::Expr::Path(p) = &*c.func {
+                        if let Some(seg) = p.path.segments.last() {
+                            if let Some(g) = self.accessors.get(&seg.ident.to_string()) {
+                                return self.globals.get(g).cloned();
+                            }
+                        }
+                    }
+                }
                 // Resolve type aliases first: c2rust types context pointers as
                 // `xmlParserCtxtPtr` etc., not a bare `*mut _`, so the pointer is
                 // only visible after following the alias.
