@@ -308,17 +308,39 @@ fn extract_in(
     }
     let mut function = function.expect("the function is in its own closure");
 
-    // Pull in the inherent `impl` blocks of every kept crate type, so a newtype
-    // enum's associated-const variants (c2rust's `Type::VARIANT` error codes and
-    // node-type tags, held in `impl Type { pub const .. }`) resolve in the unit.
+    // Pull in the inherent `impl` blocks of a kept crate type *only when* one of
+    // its associated consts is actually referenced, so a newtype enum's variants
+    // (c2rust's `Type::VARIANT` error codes / node-type tags, held in
+    // `impl Type { pub const .. }`) resolve in the unit. A referenced variant is
+    // a 2+-segment path `Type::VARIANT` in the already-rewritten unit, so collect
+    // those base idents and pull impls for just those types -- pulling every kept
+    // type's (often large) impl block bloats units and slows extraction badly.
     // Deduped by token text, since c2rust repeats each `impl` per file. Sound:
     // the consts are compile-time scalars, so this is pure scope resolution.
     if heap {
+        let mut const_bases: HashSet<String> = HashSet::new();
+        struct ConstBases<'a>(&'a mut HashSet<String>);
+        impl<'ast> Visit<'ast> for ConstBases<'_> {
+            fn visit_path(&mut self, p: &'ast syn::Path) {
+                if p.segments.len() >= 2 {
+                    self.0.insert(p.segments[0].ident.to_string());
+                }
+                syn::visit::visit_path(self, p);
+            }
+        }
+        {
+            let mut v = ConstBases(&mut const_bases);
+            v.visit_item_fn(&function);
+            for c in &callees {
+                v.visit_item(c);
+            }
+        }
         let mut seen: HashSet<String> = HashSet::new();
         let kept_types: Vec<String> = keep
             .iter()
             .filter(|&&e| index.entries[e].kind == Kind::Type)
             .map(|&e| index.entries[e].name.clone())
+            .filter(|n| const_bases.contains(n))
             .collect();
         for name in kept_types {
             if let Some(impls) = index.impls.get(&name) {
