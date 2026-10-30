@@ -65,7 +65,10 @@ pub fn is_trace_modellable(item: &Option<syn::Item>) -> bool {
 }
 
 fn is_trace_sig(sig: &syn::Signature) -> bool {
-    if sig.variadic.is_some() || sig.inputs.len() > 3 {
+    // Each argument is recorded as its own trace event (see `trace_body`), so
+    // an arity above three is modellable rather than rejected; the cap only
+    // bounds trace usage. Variadic externals are handled separately (varmodel).
+    if sig.variadic.is_some() || sig.inputs.len() > 16 {
         return false;
     }
     // A diverging function (`-> !`) isn't modelled as a returning trace call.
@@ -112,18 +115,38 @@ fn scalar_or_float(ty: &str) -> bool {
 /// The body of a trace shim: record `(id, args)` as an observable call and
 /// return the shared symbolic result, rebuilt to the return type.
 fn trace_body(name: &str, args: &[(String, String)], ret: &str) -> String {
-    let mut slots = [String::from("0u128"), String::from("0u128"), String::from("0u128")];
-    let mut kinds = [3u8, 3, 3];
-    for (i, (n, t)) in args.iter().enumerate() {
-        let (bits, kind) = arg_kind_bits(n, t);
-        slots[i] = bits;
-        kinds[i] = kind;
-    }
     let id = oracle_id(name);
-    let v = format!(
-        "(*core::ptr::addr_of_mut!(crate::support::TRACE)).step({id}u64, [{}, {}, {}], [{}u8, {}u8, {}u8])",
-        slots[0], slots[1], slots[2], kinds[0], kinds[1], kinds[2]
-    );
+    // The statements preceding the result, and the `step` whose shared symbolic
+    // value becomes the call's result.
+    let (prefix, v) = if args.len() <= 3 {
+        let mut slots = [String::from("0u128"), String::from("0u128"), String::from("0u128")];
+        let mut kinds = [3u8, 3, 3];
+        for (i, (n, t)) in args.iter().enumerate() {
+            let (bits, kind) = arg_kind_bits(n, t);
+            slots[i] = bits;
+            kinds[i] = kind;
+        }
+        let v = format!(
+            "(*core::ptr::addr_of_mut!(crate::support::TRACE)).step({id}u64, [{}, {}, {}], [{}u8, {}u8, {}u8])",
+            slots[0], slots[1], slots[2], kinds[0], kinds[1], kinds[2]
+        );
+        (String::new(), v)
+    } else {
+        // More than three arguments: the three-slot event can't hold them, so
+        // record each as its own ordered event keyed by the function id (as the
+        // indirect-call model does), then a final event with a distinct id for
+        // the shared symbolic result. Both versions emit the identical
+        // sequence, so a divergent argument is caught, not collapsed.
+        let mut prefix =
+            String::from("let __t = core::ptr::addr_of_mut!(crate::support::TRACE);");
+        for (n, t) in args {
+            let (bits, kind) = arg_kind_bits(n, t);
+            prefix += &format!("(*__t).step({id}u64, [{bits}, 0u128, 0u128], [{kind}u8, 3u8, 3u8]);");
+        }
+        let ret_id = oracle_id(&format!("{name}#ret"));
+        let v = format!("(*__t).step({ret_id}u64, [0u128, 0u128, 0u128], [3u8, 3u8, 3u8])");
+        (prefix, v)
+    };
     let result = match float_width(ret) {
         Some(32) => format!("f32::from_bits({v} as u32) as {ret}"),
         Some(_) => format!("f64::from_bits({v} as u64) as {ret}"),
@@ -132,7 +155,7 @@ fn trace_body(name: &str, args: &[(String, String)], ret: &str) -> String {
         None if ret.trim_start().starts_with('*') => format!("{v} as usize as {ret}"),
         None => format!("{v} as {ret}"),
     };
-    format!("{{ {result} }}")
+    format!("{{ {prefix} {result} }}")
 }
 
 /// A 64-bit id for an oracle function, stable across the two versions (both
@@ -371,5 +394,27 @@ mod tests {
         assert!(!is_str_model("strcpy"));
         assert!(!is_str_model("strcat"));
         assert!(!is_str_model("getprogname"));
+    }
+
+    #[test]
+    fn many_arg_foreign_fn_is_trace_modellable_and_shim_parses() {
+        // Four-plus arguments (scalars and pointers, as `fread`/`fwrite`) exceed
+        // the old three-slot limit; the call is now trace-modellable and its
+        // shim -- one `step` per argument plus a result event -- parses.
+        let src = "fn fread(p: *mut u8, sz: u64, n: u64, s: *mut u8) -> u64;";
+        let f: syn::ForeignItemFn = syn::parse_str(src).unwrap();
+        assert!(is_trace_sig(&f.sig), "4-arg scalar/ptr sig should be trace-modellable");
+        let def = define("fread", &f.sig).expect("shim defined");
+        let text = def.to_token_stream().to_string();
+        syn::parse_str::<syn::ItemFn>(&text).unwrap();
+        assert_eq!(text.matches(". step (").count(), 5, "4 arg events + 1 result event");
+    }
+
+    #[test]
+    fn seventeen_arg_foreign_fn_is_not_modelled() {
+        let args = (0..17).map(|i| format!("a{i}: i32")).collect::<Vec<_>>().join(", ");
+        let f: syn::ForeignItemFn =
+            syn::parse_str(&format!("fn big({args}) -> i32;")).unwrap();
+        assert!(!is_trace_sig(&f.sig));
     }
 }

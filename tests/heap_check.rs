@@ -453,6 +453,62 @@ fn external_trace_catches_reordered_side_effects() {
     );
 }
 
+// A foreign call with more than three arguments (five, mixing scalars and a
+// pointer), modelled as an observable trace with one event per argument so the
+// arity is unbounded -- the shape of `fread`/`fwrite`/`send`. Proves equivalent
+// when both versions pass the same arguments; catches a changed argument past
+// the old three-slot limit.
+const REC5_DECL: &str =
+    "extern \"C\" { fn rec5(_: i32, _: i32, _: i64, _: u32, _: *const i32) -> i32; }";
+
+const REC5_OLD: &str = r#"
+pub unsafe fn f(p: *const i32) -> i32 {
+    if p.is_null() { return 0; }
+    rec5(*p, *p + 1, (*p) as i64, (*p) as u32, p)
+}
+"#;
+
+const REC5_OK: &str = r#"
+pub unsafe fn f(p: *const i32) -> i32 {
+    if p.is_null() { return 0; }
+    let v = *p;
+    rec5(v, v + 1, v as i64, v as u32, p)
+}
+"#;
+
+const REC5_BAD: &str = r#"
+pub unsafe fn f(p: *const i32) -> i32 {
+    if p.is_null() { return 0; }
+    rec5(*p, *p + 2, (*p) as i64, (*p) as u32, p)
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn many_arg_foreign_call_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(REC5_OLD, &[REC5_DECL]).unwrap();
+    let new = FnUnit::parse(REC5_OK, &[REC5_DECL]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn many_arg_foreign_call_catches_different_argument() {
+    let old = FnUnit::parse(REC5_OLD, &[REC5_DECL]).unwrap();
+    let new = FnUnit::parse(REC5_BAD, &[REC5_DECL]).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a different argument past the three-slot limit proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 // A pure external function (`fmod`) modelled as an argument-keyed oracle: both
 // versions calling it with equal arguments get equal results.
 const FMOD_DECL: &str = "extern \"C\" { fn fmod(_: f64, _: f64) -> f64; }";

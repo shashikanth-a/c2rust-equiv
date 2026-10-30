@@ -722,15 +722,30 @@ mod tests {
     }
 
     #[test]
-    fn heap_body_rejects_other_foreign_calls() {
-        // An external with more arguments than the trace records isn't modelled.
+    fn heap_body_allows_many_arg_foreign_calls() {
+        // An external with more than three scalar/pointer arguments is modelled
+        // as an observable trace (one event per argument), so it is in scope.
         let u = unit(
             "pub unsafe fn f() { big(1, 2, 3, 4); }",
             &["extern \"C\" { fn big(_: i32, _: i32, _: i32, _: i32); }"],
         );
+        assert!(u.heap_body_in_scope().is_ok());
+    }
+
+    #[test]
+    fn heap_body_rejects_by_value_struct_foreign_calls() {
+        // An external taking a struct by value still can't be recorded in the
+        // trace (not a scalar or pointer), so it is out of scope.
+        let u = unit(
+            "pub unsafe fn f() { weird(Blob { x: 1, y: 2 }); }",
+            &[
+                "pub struct Blob { pub x: i32, pub y: i32 }",
+                "extern \"C\" { fn weird(_: Blob); }",
+            ],
+        );
         let skip = u.heap_body_in_scope().unwrap_err();
         assert_eq!(skip.category, "foreign call");
-        assert!(skip.detail.contains("big"));
+        assert!(skip.detail.contains("weird"));
     }
 
     #[test]
