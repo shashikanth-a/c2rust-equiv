@@ -3001,3 +3001,86 @@ fn fnptr_global_catches_a_different_stored_function() {
         outcome.status
     );
 }
+
+// libxml2's mutex pattern: a function lazily creates a global mutex
+// (`g = xmlNewRMutex()`), null-checks it, locks, does real work, unlocks. The
+// mutex model makes the constructor a non-null sentinel and drops lock/unlock/
+// free, and the mutex-pointer global is exempt from the read-only write-guard
+// and never compared -- a mutex is a sequential no-op. Both versions get the
+// identical no-op treatment, so the real work is what's compared: an equivalent
+// rewrite proves, a divergent one is caught.
+const MTX_DEFS: &[&str] = &[
+    "pub struct xmlRMutex { pub held: i32 }",
+    "pub type xmlRMutexPtr = *mut xmlRMutex;",
+    "#[no_mangle] pub unsafe extern \"C\" fn xmlNewRMutex() -> xmlRMutexPtr { core::ptr::null_mut() }",
+    "#[no_mangle] pub unsafe extern \"C\" fn xmlRMutexLock(_t: xmlRMutexPtr) {}",
+    "#[no_mangle] pub unsafe extern \"C\" fn xmlRMutexUnlock(_t: xmlRMutexPtr) {}",
+    "#[no_mangle] pub unsafe extern \"C\" fn xmlFreeRMutex(_t: xmlRMutexPtr) {}",
+    "pub static mut MUTEX: xmlRMutexPtr = core::ptr::null_mut();",
+    "#[repr(C)] pub struct Cell { pub v: i64 }",
+];
+
+const MTX_OLD: &str = r#"
+pub unsafe fn bump(c: *mut Cell) -> i64 {
+    if c.is_null() { return 0; }
+    if MUTEX.is_null() { MUTEX = xmlNewRMutex(); }
+    if MUTEX.is_null() { return -1; }
+    xmlRMutexLock(MUTEX);
+    (*c).v += 1;
+    let r = (*c).v;
+    xmlRMutexUnlock(MUTEX);
+    r
+}
+"#;
+
+const MTX_OK: &str = r#"
+pub unsafe fn bump(c: *mut Cell) -> i64 {
+    if c.is_null() { return 0; }
+    if MUTEX.is_null() { MUTEX = xmlNewRMutex(); }
+    if MUTEX.is_null() { return -1; }
+    xmlRMutexLock(MUTEX);
+    let new = (*c).v + 1;
+    (*c).v = new;
+    xmlRMutexUnlock(MUTEX);
+    new
+}
+"#;
+
+const MTX_BAD: &str = r#"
+pub unsafe fn bump(c: *mut Cell) -> i64 {
+    if c.is_null() { return 0; }
+    if MUTEX.is_null() { MUTEX = xmlNewRMutex(); }
+    if MUTEX.is_null() { return -1; }
+    xmlRMutexLock(MUTEX);
+    (*c).v += 2;
+    let r = (*c).v;
+    xmlRMutexUnlock(MUTEX);
+    r
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn mutex_global_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(MTX_OLD, MTX_DEFS).unwrap();
+    let new = FnUnit::parse(MTX_OK, MTX_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn mutex_global_catches_divergent_work() {
+    let old = FnUnit::parse(MTX_OLD, MTX_DEFS).unwrap();
+    let new = FnUnit::parse(MTX_BAD, MTX_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent rewrite was proved equivalent: {:?}",
+        outcome.status
+    );
+}

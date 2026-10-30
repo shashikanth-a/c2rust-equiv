@@ -421,7 +421,10 @@ fn extract_in(
             syn::Item::Static(s)
                 if crate::unit::is_data_static(s, &structs, &aliases)
                     && crate::unit::modelled_struct_mut_static(s, &structs, &aliases)
-                        .is_none() =>
+                        .is_none()
+                    // A mutex-pointer global is written only by the init path,
+                    // which the mutex model treats as a no-op; exempt it.
+                    && !crate::unit::is_mutex_ptr_static(s, &aliases) =>
             {
                 Some(s.ident.to_string())
             }

@@ -23,13 +23,26 @@
 
 use syn::visit_mut::VisitMut;
 
-/// The lock/unlock wrappers modelled as no-ops.
+/// The lock/unlock/free wrappers modelled as no-ops (dropped to `()`). Freeing
+/// a mutex is a no-op for the same reason as unlocking: the mutex object's bytes
+/// are never read by any modelled function (every access goes through these
+/// wrappers), so destroying it has no observable sequential effect.
 const WRAPPERS: &[&str] = &[
     "xmlMutexLock",
     "xmlMutexUnlock",
     "xmlRMutexLock",
     "xmlRMutexUnlock",
+    "xmlFreeMutex",
+    "xmlFreeRMutex",
 ];
+
+/// The mutex constructors, modelled as returning a non-null sentinel pointer.
+/// libxml2 allocates a mutex once, stores the handle in a global, null-checks
+/// it, then only ever locks/unlocks/frees it -- all no-ops here -- so the handle
+/// is never dereferenced. A fixed non-null sentinel (identical in both versions)
+/// passes the null-check and drives both down the same path, without resolving
+/// the constructor's body (which allocates and calls `pthread_mutex_init`).
+const CTORS: &[&str] = &["xmlNewMutex", "xmlNewRMutex"];
 
 /// Whether `call` is a call to a modelled lock/unlock wrapper whose arguments
 /// are side-effect-free, so dropping the whole call (arguments included) is
@@ -37,15 +50,29 @@ const WRAPPERS: &[&str] = &[
 /// itself calls a function or assigns is *not* treated as a no-op, so a real
 /// side effect is never silently dropped.
 pub fn is_mutex_call(call: &syn::ExprCall) -> bool {
-    let syn::Expr::Path(p) = &*call.func else {
+    is_mutex_noop_call(call) || is_mutex_ctor_call(call)
+}
+
+/// A lock/unlock/free wrapper call with side-effect-free arguments, so dropping
+/// the whole call (arguments included) to `()` is sound.
+fn is_mutex_noop_call(call: &syn::ExprCall) -> bool {
+    let Some(name) = call_name(call) else {
         return false;
     };
-    let is_wrapper = p
-        .path
-        .segments
-        .last()
-        .is_some_and(|seg| WRAPPERS.contains(&seg.ident.to_string().as_str()));
-    is_wrapper && call.args.iter().all(is_pure)
+    WRAPPERS.contains(&name.as_str()) && call.args.iter().all(is_pure)
+}
+
+/// A mutex constructor call (`xmlNewMutex()` / `xmlNewRMutex()`), rewritten to a
+/// non-null sentinel pointer.
+fn is_mutex_ctor_call(call: &syn::ExprCall) -> bool {
+    call_name(call).is_some_and(|n| CTORS.contains(&n.as_str()))
+}
+
+fn call_name(call: &syn::ExprCall) -> Option<String> {
+    let syn::Expr::Path(p) = &*call.func else {
+        return None;
+    };
+    p.path.segments.last().map(|seg| seg.ident.to_string())
 }
 
 /// A conservatively side-effect-free expression: a path, a field/index access,
@@ -84,7 +111,12 @@ impl VisitMut for Rewriter {
         // Recurse first, so a lock call nested in a larger expression is handled.
         syn::visit_mut::visit_expr_mut(self, e);
         if let syn::Expr::Call(c) = e {
-            if is_mutex_call(c) {
+            if is_mutex_ctor_call(c) {
+                // A non-null sentinel pointer, cast to the assignment's pointer
+                // type by inference. Never dereferenced (every mutex access is a
+                // no-op wrapper), so a bogus address is sound.
+                *e = syn::parse_quote!((1usize as *mut u8).cast());
+            } else if is_mutex_noop_call(c) {
                 *e = syn::parse_quote!(());
             }
         }

@@ -360,6 +360,28 @@ pub(crate) fn is_fnptr_mut_static(
         && crate::heapgen::is_option_fn(&s.ty, aliases)
 }
 
+/// Whether a static holds a libxml2 mutex pointer (`*mut xmlMutex` / `*mut
+/// xmlRMutex`, through aliases like `xmlMutexPtr`). Such a global (xmlDictMutex,
+/// xmlCatalogMutex, ...) is written by the init path (`g = xmlNewRMutex()`),
+/// but a mutex is a sequential no-op in this tool (see `crate::mutexmodel`): the
+/// constructor becomes a non-null sentinel, lock/unlock/free are dropped, and
+/// the handle is never dereferenced. So the write is not an observable effect --
+/// the global is exempt from the read-only write-guard and never compared.
+pub(crate) fn is_mutex_ptr_static(
+    s: &syn::ItemStatic,
+    aliases: &BTreeMap<String, syn::Type>,
+) -> bool {
+    if let syn::Type::Ptr(p) = &crate::heapgen::resolve_alias(&s.ty, aliases) {
+        if let syn::Type::Path(tp) = &*p.elem {
+            if let Some(seg) = tp.path.segments.last() {
+                let n = seg.ident.to_string();
+                return n == "xmlMutex" || n == "xmlRMutex";
+            }
+        }
+    }
+    false
+}
+
 /// Whether a static is a read-only "data" global the heap path can pull into a
 /// unit as an identical per-version copy: an array of scalars, a raw-pointer
 /// table, or an immutable scalar (a lookup table or string constant). Unlike a
