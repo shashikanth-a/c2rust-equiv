@@ -92,53 +92,58 @@ pub fn rewritten(item: &syn::Item) -> Option<syn::Item> {
     Some(it)
 }
 
-/// Whether these items both call a modelled error reporter and reference the
-/// `xmlLastError` global. The error model (`crate::errormodel`) treats the
-/// reporter as stateless -- it does not model the reporter's write to
-/// `xmlLastError` -- so a read of that error state afterwards would observe the
-/// stale initial value, which could hide a real divergence. A unit that does
-/// both is therefore left out of heap scope (sound over-approximation).
-pub fn reporter_and_lasterror(function: &syn::ItemFn, callees: &[syn::Item]) -> bool {
-    // Cheap gate: `xmlLastError` can only be read when its accessor or the
-    // global itself is in scope as a callee. Most units have neither, so skip
-    // the full scan for them (sound: no accessor/global in scope => no read).
-    let touches = callees.iter().any(|c| {
-        matches!(c, syn::Item::Static(s) if s.ident == "xmlLastError")
-            || matches!(c, syn::Item::Fn(f) if f.sig.ident == "__xmlLastError")
-    });
-    if !touches {
-        return false;
+/// The pointer fields of `xmlError` (`xmlLastError`). The error model populates
+/// these with null rather than the real formatted message (which it doesn't
+/// model), so a unit that observably reads one would see null where real code
+/// sees a string -- unsound if that value reaches the compared output. Such a
+/// unit is kept out of heap scope; a unit that reads only the scalar fields
+/// (code/domain/level/line/int1/int2), which the model populates faithfully per
+/// report, is in scope.
+const LASTERROR_PTR_FIELDS: &[&str] =
+    &["message", "file", "str1", "str2", "str3", "ctxt", "node"];
+
+/// Whether these items access a pointer field *of `xmlLastError`* -- a field
+/// access `<e>.<ptr-field>` whose base `<e>` is the global `xmlLastError` or a
+/// dereference of the `__xmlLastError()` accessor (`(*__xmlLastError()).file`).
+/// Precise: a `.node`/`.file`/... on some other struct does not count (those
+/// field names are ubiquitous in libxml2), only on the error global itself.
+pub fn reads_lasterror_pointer_field(function: &syn::ItemFn, callees: &[syn::Item]) -> bool {
+    struct PtrField(bool);
+    impl PtrField {
+        /// Whether `e` denotes `xmlLastError` or `*__xmlLastError()` (through
+        /// parens/groups and a single deref).
+        fn is_lasterror_base(e: &syn::Expr) -> bool {
+            match e {
+                syn::Expr::Paren(p) => Self::is_lasterror_base(&p.expr),
+                syn::Expr::Group(g) => Self::is_lasterror_base(&g.expr),
+                syn::Expr::Path(p) => p.path.is_ident("xmlLastError"),
+                syn::Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => {
+                    // `*__xmlLastError()` or `*<call producing the accessor>`.
+                    matches!(&*u.expr, syn::Expr::Call(c)
+                        if matches!(&*c.func, syn::Expr::Path(p)
+                            if p.path.segments.last().is_some_and(|s| s.ident == "__xmlLastError")))
+                }
+                _ => false,
+            }
+        }
     }
-    let mut v = ReporterAndLastErr {
-        reporter: false,
-        lasterror: false,
-    };
+    impl<'ast> Visit<'ast> for PtrField {
+        fn visit_expr_field(&mut self, f: &'ast syn::ExprField) {
+            if let syn::Member::Named(id) = &f.member {
+                if LASTERROR_PTR_FIELDS.contains(&id.to_string().as_str())
+                    && Self::is_lasterror_base(&f.base)
+                {
+                    self.0 = true;
+                }
+            }
+            syn::visit::visit_expr_field(self, f);
+        }
+    }
+    let mut v = PtrField(false);
     v.visit_item_fn(function);
     for c in callees {
         v.visit_item(c);
     }
-    v.reporter && v.lasterror
+    v.0
 }
 
-struct ReporterAndLastErr {
-    reporter: bool,
-    lasterror: bool,
-}
-
-impl<'ast> Visit<'ast> for ReporterAndLastErr {
-    fn visit_expr_call(&mut self, c: &'ast syn::ExprCall) {
-        if let syn::Expr::Path(p) = &*c.func {
-            if let Some(name) = p.path.segments.last().map(|s| s.ident.to_string()) {
-                if crate::errormodel::is_error_fn(&name) {
-                    self.reporter = true;
-                }
-            }
-        }
-        syn::visit::visit_expr_call(self, c);
-    }
-    fn visit_ident(&mut self, id: &'ast syn::Ident) {
-        if id == "xmlLastError" {
-            self.lasterror = true;
-        }
-    }
-}

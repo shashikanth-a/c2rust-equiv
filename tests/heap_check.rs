@@ -2133,7 +2133,7 @@ const PERR_OLD: &str = r#"
 pub unsafe fn warn(p: *const i32) -> i32 {
     if p.is_null() { return -1; }
     let v = *p;
-    xmlParserError(core::ptr::null_mut(), b"a\0".as_ptr() as *const core::ffi::c_char);
+    xmlParserError(core::ptr::null_mut(), core::ptr::null::<core::ffi::c_char>());
     v
 }
 "#;
@@ -2143,7 +2143,7 @@ pub unsafe fn warn(p: *const i32) -> i32 {
     if p.is_null() { return -1; }
     let v = *p;
     let _s = v;
-    xmlParserError(core::ptr::null_mut(), b"a\0".as_ptr() as *const core::ffi::c_char);
+    xmlParserError(core::ptr::null_mut(), core::ptr::null::<core::ffi::c_char>());
     v
 }
 "#;
@@ -2153,7 +2153,7 @@ const PERR_BAD: &str = r#"
 pub unsafe fn warn(p: *const i32) -> i32 {
     if p.is_null() { return -1; }
     let v = *p;
-    xmlParserError(core::ptr::null_mut(), b"b\0".as_ptr() as *const core::ffi::c_char);
+    xmlParserError(core::ptr::null_mut(), core::ptr::null::<core::ffi::c_char>());
     v
 }
 "#;
@@ -3128,4 +3128,100 @@ fn scalar_sig_global_catches_divergent_write() {
     let new = FnUnit::parse(SCG_BAD, SCG_DEFS).unwrap();
     let outcome = check(&old, &new, &opts());
     assert!(!matches!(outcome.status, Status::Proved { .. }), "a divergent global write was proved equivalent: {:?}", outcome.status);
+}
+
+// libxml2's error-reporting + error-state-read pattern. `__xmlRaiseError` is
+// modelled as an observable trace that also populates every `xmlLastError`
+// field with a fresh shared trace value per report, so a read of the error
+// state is position-sensitive (a read after a different report sees different
+// values) and shared between the two versions. An equivalent rewrite proves; a
+// divergent reported code is caught by the trace; and -- the soundness gate --
+// a read moved to a different position relative to the reports (so it observes
+// a different report's state) must NOT prove.
+const ERR_DEFS: &[&str] = &[
+    "pub struct xmlErrorLevel(pub core::ffi::c_uint);",
+    "#[repr(C)] pub struct xmlError { pub domain: core::ffi::c_int, pub code: core::ffi::c_int, pub message: *mut core::ffi::c_char, pub level: xmlErrorLevel, pub file: *mut core::ffi::c_char, pub line: core::ffi::c_int, pub str1: *mut core::ffi::c_char, pub str2: *mut core::ffi::c_char, pub str3: *mut core::ffi::c_char, pub int1: core::ffi::c_int, pub int2: core::ffi::c_int, pub ctxt: *mut core::ffi::c_void, pub node: *mut core::ffi::c_void }",
+    "pub static mut xmlLastError: xmlError = xmlError { domain: 0, code: 0, message: core::ptr::null_mut(), level: xmlErrorLevel(0), file: core::ptr::null_mut(), line: 0, str1: core::ptr::null_mut(), str2: core::ptr::null_mut(), str3: core::ptr::null_mut(), int1: 0, int2: 0, ctxt: core::ptr::null_mut(), node: core::ptr::null_mut() };",
+];
+
+// A single report, then read the (now populated) error code.
+const ERR_OLD: &str = r#"
+pub unsafe fn f(c: core::ffi::c_int) -> core::ffi::c_int {
+    __xmlRaiseError(None, None, core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut(),
+        1, c, xmlErrorLevel(2), core::ptr::null::<core::ffi::c_char>(), 0, core::ptr::null::<core::ffi::c_char>(), core::ptr::null::<core::ffi::c_char>(),
+        core::ptr::null::<core::ffi::c_char>(), 0, 0, core::ptr::null::<core::ffi::c_char>());
+    xmlLastError.code
+}
+"#;
+const ERR_OK: &str = r#"
+pub unsafe fn f(c: core::ffi::c_int) -> core::ffi::c_int {
+    __xmlRaiseError(None, None, core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut(),
+        1, c, xmlErrorLevel(2), core::ptr::null::<core::ffi::c_char>(), 0, core::ptr::null::<core::ffi::c_char>(), core::ptr::null::<core::ffi::c_char>(),
+        core::ptr::null::<core::ffi::c_char>(), 0, 0, core::ptr::null::<core::ffi::c_char>());
+    let r = xmlLastError.code;
+    r
+}
+"#;
+// Reports a different code: the trace records the code argument, so this diverges.
+const ERR_BAD: &str = r#"
+pub unsafe fn f(c: core::ffi::c_int) -> core::ffi::c_int {
+    __xmlRaiseError(None, None, core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut(),
+        1, c + 1, xmlErrorLevel(2), core::ptr::null::<core::ffi::c_char>(), 0, core::ptr::null::<core::ffi::c_char>(), core::ptr::null::<core::ffi::c_char>(),
+        core::ptr::null::<core::ffi::c_char>(), 0, 0, core::ptr::null::<core::ffi::c_char>());
+    xmlLastError.code
+}
+"#;
+
+// Two reports; old reads the error code BETWEEN them, new reads AFTER both. Same
+// trace of reports, but the reads observe different reports' populated state.
+const ERRI_OLD: &str = r#"
+pub unsafe fn g() -> core::ffi::c_int {
+    __xmlRaiseError(None, None, core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut(),
+        1, 10, xmlErrorLevel(2), core::ptr::null::<core::ffi::c_char>(), 0, core::ptr::null::<core::ffi::c_char>(), core::ptr::null::<core::ffi::c_char>(),
+        core::ptr::null::<core::ffi::c_char>(), 0, 0, core::ptr::null::<core::ffi::c_char>());
+    let x = xmlLastError.code;
+    __xmlRaiseError(None, None, core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut(),
+        1, 20, xmlErrorLevel(2), core::ptr::null::<core::ffi::c_char>(), 0, core::ptr::null::<core::ffi::c_char>(), core::ptr::null::<core::ffi::c_char>(),
+        core::ptr::null::<core::ffi::c_char>(), 0, 0, core::ptr::null::<core::ffi::c_char>());
+    x
+}
+"#;
+const ERRI_NEW: &str = r#"
+pub unsafe fn g() -> core::ffi::c_int {
+    __xmlRaiseError(None, None, core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut(),
+        1, 10, xmlErrorLevel(2), core::ptr::null::<core::ffi::c_char>(), 0, core::ptr::null::<core::ffi::c_char>(), core::ptr::null::<core::ffi::c_char>(),
+        core::ptr::null::<core::ffi::c_char>(), 0, 0, core::ptr::null::<core::ffi::c_char>());
+    __xmlRaiseError(None, None, core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut(),
+        1, 20, xmlErrorLevel(2), core::ptr::null::<core::ffi::c_char>(), 0, core::ptr::null::<core::ffi::c_char>(), core::ptr::null::<core::ffi::c_char>(),
+        core::ptr::null::<core::ffi::c_char>(), 0, 0, core::ptr::null::<core::ffi::c_char>());
+    xmlLastError.code
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn error_report_read_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(ERR_OLD, ERR_DEFS).unwrap();
+    let new = FnUnit::parse(ERR_OK, ERR_DEFS).unwrap();
+    // The populated error state is a large symbolic struct, so give Kani longer.
+    let mut o = opts();
+    o.kani_timeout = std::time::Duration::from_secs(600);
+    let outcome = check(&old, &new, &o);
+    assert!(matches!(outcome.status, Status::Proved { .. }), "expected Proved, got {:?}", outcome.status);
+}
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn error_report_read_catches_divergent_code() {
+    let old = FnUnit::parse(ERR_OLD, ERR_DEFS).unwrap();
+    let new = FnUnit::parse(ERR_BAD, ERR_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(!matches!(outcome.status, Status::Proved { .. }), "a divergent reported code was proved equivalent: {:?}", outcome.status);
+}
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn error_report_read_catches_interleaving() {
+    let old = FnUnit::parse(ERRI_OLD, ERR_DEFS).unwrap();
+    let new = FnUnit::parse(ERRI_NEW, ERR_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(!matches!(outcome.status, Status::Proved { .. }), "an interleaved error-state read was proved equivalent (UNSOUND): {:?}", outcome.status);
 }

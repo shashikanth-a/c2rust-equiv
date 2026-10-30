@@ -399,12 +399,18 @@ fn extract_in(
             });
         }
         crate::globalaccessmodel::rewrite(&mut callees);
-        // A unit that both reports an error (stateless in the trace model) and
-        // reads `xmlLastError` would observe stale error state -- out of scope.
-        if crate::globalaccessmodel::reporter_and_lasterror(&function, &callees) {
+        // Reading `xmlLastError` after a report is now in scope: the modelled
+        // `__xmlRaiseError` populates its scalar fields with a fresh shared trace
+        // value per report (see `crate::errormodel`), so a scalar-field read is
+        // position-sensitive and agrees between versions exactly when it follows
+        // the same reports. The pointer fields hold the formatted message, which
+        // the model doesn't reconstruct (it sets them null), so a unit that
+        // observably reads one stays out of scope.
+        if crate::globalaccessmodel::reads_lasterror_pointer_field(&function, &callees) {
             return Err(Skip::new(
                 "global",
-                "reads `xmlLastError` after a modelled error report".to_owned(),
+                "reads a pointer field of `xmlLastError` (formatted message not modelled)"
+                    .to_owned(),
             ));
         }
     }

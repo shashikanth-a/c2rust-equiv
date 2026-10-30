@@ -192,12 +192,26 @@ fn id(name: &str) -> u64 {
 
 /// Rewrite every call to a modelled error external in these items.
 pub fn rewrite(items: &mut [syn::Item]) {
+    // If the unit carries the `xmlLastError` global, it reads it, so the
+    // modelled `__xmlRaiseError` must leave observable error state behind rather
+    // than being purely stateless: it populates every `xmlLastError` field with
+    // a fresh shared trace value per report (see `block`). That makes a read of
+    // the error state position-sensitive (a read after a different report sees
+    // different values) and shared between the two versions (the trace records
+    // the first run's value and replays it), so an interleaved or reordered
+    // read is caught and consistent reads agree. Without it, a read would see
+    // stale initial state identically in both versions and could falsely prove.
+    let populate = items
+        .iter()
+        .any(|it| matches!(it, syn::Item::Static(s) if s.ident == "xmlLastError"));
     for item in items {
-        Rewrite.visit_item_mut(item);
+        Rewrite { populate }.visit_item_mut(item);
     }
 }
 
-struct Rewrite;
+struct Rewrite {
+    populate: bool,
+}
 
 impl VisitMut for Rewrite {
     fn visit_expr_mut(&mut self, e: &mut syn::Expr) {
@@ -211,7 +225,7 @@ impl VisitMut for Rewrite {
                     if p.path.segments.len() == 1 {
                         let name = p.path.segments[0].ident.to_string();
                         if let Some(sp) = spec(&name) {
-                            *e = syn::parse_str(&block(&name, &sp, &call.args))
+                            *e = syn::parse_str(&block(&name, &sp, &call.args, self.populate))
                                 .expect("error trace block parses");
                             return;
                         }
@@ -219,7 +233,7 @@ impl VisitMut for Rewrite {
                 }
                 if let Some(accessor) = handler_dispatch_name(call) {
                     let (key, sp) = handler(&accessor).expect("handler accessor");
-                    *e = syn::parse_str(&block(key, &sp, &call.args))
+                    *e = syn::parse_str(&block(key, &sp, &call.args, self.populate))
                         .expect("handler trace block parses");
                 }
             }
@@ -248,6 +262,7 @@ fn block(
     name: &str,
     sp: &Spec,
     args: &syn::punctuated::Punctuated<syn::Expr, syn::token::Comma>,
+    populate: bool,
 ) -> String {
     let call_id = id(name);
     let mut binds = String::new();
@@ -297,9 +312,62 @@ fn block(
         }
     }
     let ret_id = call_id.wrapping_add(1);
+    // When the unit reads `xmlLastError`, `__xmlRaiseError` must leave error
+    // state behind. Populate every field with a fresh shared trace value (the
+    // `step` return is `kani::any()` on the first run, replayed on the second),
+    // each a distinct trace position, so a read of the error state is
+    // position-sensitive and agrees between the two versions exactly when it
+    // happens after the same reports. Scalars take the word directly; pointer
+    // fields take it as a sentinel address -- never soundly dereferenceable, so
+    // a function that reads the message *content* fails to prove (Kani flags the
+    // bogus pointer) rather than being proved unsoundly, while one that only
+    // compares the pointer is handled precisely.
+    let mut populate_err = String::new();
+    if populate && name == "__xmlRaiseError" {
+        let scalars = [
+            ("domain", "core::ffi::c_int"),
+            ("code", "core::ffi::c_int"),
+            ("line", "core::ffi::c_int"),
+            ("int1", "core::ffi::c_int"),
+            ("int2", "core::ffi::c_int"),
+        ];
+        let char_ptrs = ["message", "file", "str1", "str2", "str3"];
+        let void_ptrs = ["ctxt", "node"];
+        let mut k = 2u64;
+        let mut field = |expr: String| {
+            let s = format!(
+                "(*__le).{expr} = (*__t).step({}u64, [0, 0, 0], [3u8, 3u8, 3u8])",
+                call_id.wrapping_add(k)
+            );
+            k += 1;
+            s
+        };
+        let mut body = String::from("let __le = core::ptr::addr_of_mut!(xmlLastError); ");
+        for (f, ty) in scalars {
+            body += &format!("{} as {ty}; ", field(format!("{f}")));
+        }
+        // The `level` field is a C-enum newtype `xmlErrorLevel(c_uint)`; write
+        // its inner scalar directly so its constructor need not be named.
+        body += &format!(
+            "{} as core::ffi::c_uint; ",
+            field("level.0".to_owned())
+        );
+        // The pointer fields (the formatted message and friends) are set to null,
+        // not a trace value: the formatted content isn't modelled, so a function
+        // that observably uses one is kept out of scope by the extractor's
+        // pointer-field guard. Null (rather than a bogus address) keeps the final
+        // `xmlError` comparison decidable, so a scalar-field reader still proves.
+        for f in char_ptrs {
+            body += &format!("(*__le).{f} = core::ptr::null_mut::<core::ffi::c_char>(); ");
+        }
+        for f in void_ptrs {
+            body += &format!("(*__le).{f} = core::ptr::null_mut::<core::ffi::c_void>(); ");
+        }
+        populate_err = body;
+    }
     format!(
         "{{ let __t = core::ptr::addr_of_mut!(crate::support::TRACE); {binds} {steps} \
-         let _ = (*__t).step({ret_id}u64, [0, 0, 0], [3u8, 3u8, 3u8]); }}"
+         let _ = (*__t).step({ret_id}u64, [0, 0, 0], [3u8, 3u8, 3u8]); {populate_err} }}"
     )
 }
 
