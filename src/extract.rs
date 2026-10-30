@@ -252,6 +252,32 @@ fn extract_in(
         .filter(|&&e| matches!(index.entries[e].kind, Kind::Fn | Kind::Static | Kind::Const))
         .map(|&e| index.entries[e].name.clone())
         .collect();
+    // c2rust emits a per-file `const` for each C macro / enum value, so two
+    // files can define the same-named const with *different* values (e.g.
+    // `MAX_HASH_LEN` = 8 in dict.rs, 100 in hash.rs). When both land in one
+    // closure they are a real clash; module-qualify each (definition and every
+    // reference, like the anonymous types) rather than rejecting -- a sound
+    // alpha-rename, since c2rust consts are file-local. Only names with 2+
+    // distinct definitions in the closure need it.
+    let qualify_consts: HashSet<String> = {
+        let mut by_name: HashMap<String, HashSet<String>> = HashMap::new();
+        for &e in &closure {
+            let entry = &index.entries[e];
+            if entry.kind == Kind::Const {
+                if let Some(item) = &entry.item {
+                    by_name
+                        .entry(entry.name.clone())
+                        .or_default()
+                        .insert(item.to_token_stream().to_string());
+                }
+            }
+        }
+        by_name
+            .into_iter()
+            .filter(|(_, defs)| defs.len() > 1)
+            .map(|(name, _)| name)
+            .collect()
+    };
     let mut names: HashMap<(bool, String), usize> = HashMap::new();
     let mut keep: Vec<usize> = Vec::new();
     for &e in &closure {
@@ -261,11 +287,13 @@ fn extract_in(
         {
             continue;
         }
-        // Qualify an anonymous c2rust type's dedup key by its defining module,
-        // so two files' distinct `C2Rust_Unnamed` types are kept side by side
-        // (the rewrite renames each to its module-qualified form) rather than
-        // reported as a collision.
-        let name = if is_anon_c2rust(&entry.name) {
+        // Qualify an anonymous c2rust type (or a clashing per-file const) by its
+        // defining module in the dedup key, so two files' distinct definitions
+        // are kept side by side (the rewrite renames each to its
+        // module-qualified form) rather than reported as a collision.
+        let name = if is_anon_c2rust(&entry.name)
+            || (entry.kind == Kind::Const && qualify_consts.contains(&entry.name))
+        {
             anon_qualified(&entry.name, index.entries[e].module)
         } else {
             entry.name.clone()
@@ -299,6 +327,7 @@ fn extract_in(
             resolver: &resolver,
             module: index.entries[e].module,
             locals: locals(&item, &resolver, index.entries[e].module),
+            qualify_consts: &qualify_consts,
         };
         rewriter.visit_item_mut(&mut item);
         match item {
@@ -1213,6 +1242,10 @@ struct Rewriter<'a> {
     resolver: &'a Resolver<'a>,
     module: usize,
     locals: HashSet<String>,
+    /// Per-file consts that clash across the closure (same name, different
+    /// value); each is renamed to its module-qualified form, definition and
+    /// references alike.
+    qualify_consts: &'a HashSet<String>,
 }
 
 impl Rewriter<'_> {
@@ -1230,10 +1263,13 @@ impl Rewriter<'_> {
                 let tail = path.segments.last().filter(|s| {
                     matches!(entry.kind, Kind::Type | Kind::TypeAlias) && s.ident != name.as_str()
                 });
-                // An anonymous c2rust type is renamed to its module-qualified
-                // form, matching the rename of its definition's ident below.
+                // An anonymous c2rust type -- or a clashing per-file const -- is
+                // renamed to its module-qualified form, matching the rename of
+                // its definition's ident below.
                 let qualified;
-                let name: &str = if is_anon_c2rust(name) {
+                let name: &str = if is_anon_c2rust(name)
+                    || (entry.kind == Kind::Const && self.qualify_consts.contains(name))
+                {
                     qualified = anon_qualified(name, entry.module);
                     &qualified
                 } else {
@@ -1292,6 +1328,15 @@ impl VisitMut for Rewriter<'_> {
             en.ident = ident(&anon_qualified(&en.ident.to_string(), self.module));
         }
         syn::visit_mut::visit_item_enum_mut(self, en);
+    }
+
+    // Rename a clashing per-file const's *definition* ident to its
+    // module-qualified form, matching the references rewritten in `path`.
+    fn visit_item_const_mut(&mut self, c: &mut syn::ItemConst) {
+        if self.qualify_consts.contains(&c.ident.to_string()) {
+            c.ident = ident(&anon_qualified(&c.ident.to_string(), self.module));
+        }
+        syn::visit_mut::visit_item_const_mut(self, c);
     }
 
     fn visit_macro_mut(&mut self, mac: &mut syn::Macro) {
