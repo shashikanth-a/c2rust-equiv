@@ -1102,6 +1102,72 @@ fn fnptr_global_indirect_call_catches_divergence() {
     );
 }
 
+// An indirect call through a callback-table element -- libxml2's
+// `xmlInputCallbackTable[i].opencallback.expect(..)(..)`. The receiver indexes
+// a global array of callback structs and takes a function-pointer field; the
+// element type is reached through the index, and the call is modelled as an
+// observable trace keyed by the callback value. Proves an equivalent rewrite,
+// catches a divergent one; a null entry maps to key 0 and never panics.
+const CT_DEFS: &[&str] = &[
+    "#[repr(C)] pub struct Cb { pub f: Option<unsafe extern \"C\" fn(i32) -> i32>, pub n: i32 }",
+    "static mut TBL: [Cb; 4] = [Cb { f: None, n: 0 }, Cb { f: None, n: 0 }, Cb { f: None, n: 0 }, Cb { f: None, n: 0 }];",
+];
+
+const CT_OLD: &str = r#"
+pub unsafe fn g(x: i32) -> i32 {
+    TBL[0].f.expect("non-null function pointer")(x)
+}
+"#;
+
+const CT_OK: &str = r#"
+pub unsafe fn g(x: i32) -> i32 {
+    let v = x;
+    TBL[0].f.expect("non-null function pointer")(v)
+}
+"#;
+
+const CT_BAD: &str = r#"
+pub unsafe fn g(x: i32) -> i32 {
+    TBL[0].f.expect("non-null function pointer")(x).wrapping_add(1)
+}
+"#;
+
+#[test]
+fn callback_table_indirect_call_is_in_heap_scope() {
+    let old = FnUnit::parse(CT_OLD, CT_DEFS).unwrap();
+    assert!(
+        old.heap_body_in_scope().is_ok(),
+        "callback-table indirect call rejected: {:?}",
+        old.heap_body_in_scope()
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn callback_table_indirect_call_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(CT_OLD, CT_DEFS).unwrap();
+    let new = FnUnit::parse(CT_OK, CT_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn callback_table_indirect_call_catches_divergence() {
+    let old = FnUnit::parse(CT_OLD, CT_DEFS).unwrap();
+    let new = FnUnit::parse(CT_BAD, CT_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent callback-table call proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 // Lock/unlock wrapper calls around real work: without the mutex model the call
 // to `xmlMutexLock` (and its global argument) would put the function out of
 // scope; with it, the calls are dropped as sequential no-ops and the actual

@@ -168,6 +168,18 @@ impl TypeEnv {
                 };
                 self.fields.get(&sname)?.get(&member).cloned()
             }
+            syn::Expr::Index(idx) => {
+                // `arr[i]` -- an element of an array or a pointer-indexed table.
+                // libxml2 dispatches through a callback table element,
+                // `xmlInputCallbackTable[i].opencallback.expect(..)(..)`, so the
+                // element type must be seen through the index.
+                let base = crate::heapgen::resolve_alias(&self.type_of(&idx.expr)?, &self.aliases);
+                match base {
+                    syn::Type::Array(a) => Some((*a.elem).clone()),
+                    syn::Type::Ptr(p) => Some((*p.elem).clone()),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
