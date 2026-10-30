@@ -354,20 +354,41 @@ fn heap_lib_source(
     let gitems = old.items();
     let gstructs = crate::heapgen::data_struct_fields_from_items(&gitems);
     let galiases = crate::heapgen::alias_table_from_items(&gitems);
-    let struct_globals: Vec<(String, String)> = gitems
+    let struct_globals: Vec<(String, String, Option<String>)> = gitems
         .iter()
         .filter_map(|it| match it {
             syn::Item::Static(s) => crate::unit::modelled_struct_mut_static(s, &gstructs, &galiases)
-                .map(|t| (s.ident.to_string(), t)),
+                .map(|t| {
+                    (
+                        s.ident.to_string(),
+                        t,
+                        crate::unit::mut_static_array_len(s, &galiases),
+                    )
+                }),
             _ => None,
         })
         .collect();
-    for (g, ty) in &struct_globals {
-        arg_cmp += &format!(
-            "        {{ let og = core::ptr::addr_of!(old::{g}); \
-             let ng = core::ptr::addr_of!(new::{g}); \
-             assert!(sameval_{ty}(og, ng, &mut corr), \"global {g} differs\"); }}\n"
-        );
+    for (g, ty, arr) in &struct_globals {
+        match arr {
+            // A `static mut [T; N]` global: compare the two versions' final
+            // state element by element, each a struct comparison under `corr`.
+            Some(len) => {
+                arg_cmp += &format!(
+                    "        {{ let mut __i = 0usize; while __i < ({len}) as usize {{ \
+                     let og = core::ptr::addr_of!(old::{g}[__i]); \
+                     let ng = core::ptr::addr_of!(new::{g}[__i]); \
+                     assert!(sameval_{ty}(og, ng, &mut corr), \"global {g} differs\"); \
+                     __i += 1; }} }}\n"
+                );
+            }
+            None => {
+                arg_cmp += &format!(
+                    "        {{ let og = core::ptr::addr_of!(old::{g}); \
+                     let ng = core::ptr::addr_of!(new::{g}); \
+                     assert!(sameval_{ty}(og, ng, &mut corr), \"global {g} differs\"); }}\n"
+                );
+            }
+        }
     }
     // Each fn-ptr `static mut` global: inject one symbolic word, shared by both
     // versions, before the call. Its concrete default is a function address

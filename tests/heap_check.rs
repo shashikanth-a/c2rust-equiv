@@ -670,6 +670,153 @@ fn data_global_struct_of_scalars_catches_divergence() {
     );
 }
 
+// A written `static mut [T; N]` array global, the shape of libxml2's callback
+// registration tables (`xmlInputCallbackTable: [xmlInputCallback; 15]`): a
+// struct with a function-pointer field (compared by identity) and a scalar.
+// The harness compares both versions' final state element by element, so a
+// write is observable output and a divergent write is caught.
+const SLOT_DEF: &str =
+    "#[repr(C)] pub struct Slot { pub cb: Option<unsafe extern \"C\" fn(i32) -> i32>, pub n: i32 }";
+const ATBL_DEF: &str =
+    "static mut TABLE: [Slot; 2] = [Slot { cb: None, n: 0 }, Slot { cb: None, n: 0 }];";
+
+const ARRG_OLD: &str = r#"
+pub unsafe fn reg(v: i32) {
+    TABLE[0].n = v;
+    TABLE[1].n = v.wrapping_add(1);
+}
+"#;
+
+// Equivalent: the value is bound to a local first, same writes.
+const ARRG_OK: &str = r#"
+pub unsafe fn reg(v: i32) {
+    let w = v;
+    TABLE[0].n = w;
+    TABLE[1].n = w.wrapping_add(1);
+}
+"#;
+
+// Wrong: the second element gets a different value, so the final array state
+// diverges at element 1.
+const ARRG_BAD: &str = r#"
+pub unsafe fn reg(v: i32) {
+    TABLE[0].n = v;
+    TABLE[1].n = v.wrapping_add(2);
+}
+"#;
+
+#[test]
+fn array_struct_global_is_in_heap_scope() {
+    let items = [SLOT_DEF, ATBL_DEF];
+    let unit = FnUnit::parse(ARRG_OLD, &items).unwrap();
+    assert!(
+        unit.heap_body_in_scope().is_ok(),
+        "array-of-struct mut global rejected: {:?}",
+        unit.heap_body_in_scope()
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn array_struct_global_proves_equivalent_rewrite() {
+    let items = [SLOT_DEF, ATBL_DEF];
+    let old = FnUnit::parse(ARRG_OLD, &items).unwrap();
+    let new = FnUnit::parse(ARRG_OK, &items).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn array_struct_global_catches_divergent_write() {
+    let items = [SLOT_DEF, ATBL_DEF];
+    let old = FnUnit::parse(ARRG_OLD, &items).unwrap();
+    let new = FnUnit::parse(ARRG_BAD, &items).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent array-global write was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
+// An opaque foreign type (`extern "C" { pub type Opaque; }`, c2rust's shape for
+// a C incomplete type like `__sFILEX` inside `FILE`), carried behind a pointer
+// in a struct field and never dereferenced. It now resolves to a zero-sized
+// opaque struct, so a function carrying `*mut Opaque` is in heap scope; the
+// pointer is compared by identity. Proves an equivalent rewrite, catches a
+// divergent one.
+// The opaque type as the index synthesizes it (a zero-sized opaque struct) --
+// the extern decl itself is resolved away, never pulled into the unit (that
+// synthesis is covered by crate_index's own tests). Here we check the unit that
+// carries `*mut Opaque` proves/diverges correctly.
+const OPAQUE_DEFS: &[&str] = &[
+    "#[repr(C)] pub struct Opaque { pub _private: [u8; 0] }",
+    "#[repr(C)] pub struct Wrap { pub h: *mut Opaque, pub n: i32 }",
+];
+
+const OPAQUE_OLD: &str = r#"
+pub unsafe fn f(w: *mut Wrap) -> i32 {
+    if w.is_null() { return 0; }
+    (*w).n
+}
+"#;
+
+const OPAQUE_OK: &str = r#"
+pub unsafe fn f(w: *mut Wrap) -> i32 {
+    if w.is_null() { return 0; }
+    let v = (*w).n;
+    v
+}
+"#;
+
+const OPAQUE_BAD: &str = r#"
+pub unsafe fn f(w: *mut Wrap) -> i32 {
+    if w.is_null() { return 0; }
+    (*w).n.wrapping_add(1)
+}
+"#;
+
+#[test]
+fn opaque_foreign_type_behind_pointer_is_in_heap_scope() {
+    let old = FnUnit::parse(OPAQUE_OLD, OPAQUE_DEFS).unwrap();
+    assert!(
+        old.heap_body_in_scope().is_ok(),
+        "opaque-type-carrying function rejected: {:?}",
+        old.heap_body_in_scope()
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn opaque_foreign_type_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(OPAQUE_OLD, OPAQUE_DEFS).unwrap();
+    let new = FnUnit::parse(OPAQUE_OK, OPAQUE_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn opaque_foreign_type_catches_divergence() {
+    let old = FnUnit::parse(OPAQUE_OLD, OPAQUE_DEFS).unwrap();
+    let new = FnUnit::parse(OPAQUE_BAD, OPAQUE_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent opaque-type rewrite was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 // Lock/unlock wrapper calls around real work: without the mutex model the call
 // to `xmlMutexLock` (and its global argument) would put the function out of
 // scope; with it, the calls are dropped as sequential no-ops and the actual

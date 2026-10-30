@@ -418,7 +418,14 @@ pub(crate) fn modelled_struct_mut_static(
         return None;
     }
     let resolved = crate::heapgen::resolve_alias(&s.ty, aliases);
-    if let syn::Type::Path(p) = &resolved {
+    // A `static mut [T; N]` (libxml2's `xmlInputCallbackTable: [xmlInputCallback;
+    // 15]`): the element struct `T` is the root to build and compare; the
+    // harness compares the global element by element (see `scratch`).
+    let base = match &resolved {
+        syn::Type::Array(a) => crate::heapgen::resolve_alias(&a.elem, aliases),
+        other => other.clone(),
+    };
+    if let syn::Type::Path(p) = &base {
         if let Some(seg) = p.path.segments.last() {
             let n = seg.ident.to_string();
             if structs.contains_key(&n) {
@@ -427,6 +434,23 @@ pub(crate) fn modelled_struct_mut_static(
         }
     }
     None
+}
+
+/// If `s` is a modelled `static mut [T; N]` array global, the element count `N`
+/// as source text (so the harness can compare it element by element); `None`
+/// for a plain (non-array) struct global or a non-static.
+pub(crate) fn mut_static_array_len(
+    s: &syn::ItemStatic,
+    aliases: &BTreeMap<String, syn::Type>,
+) -> Option<String> {
+    use quote::ToTokens;
+    if !matches!(s.mutability, syn::StaticMutability::Mut(_)) {
+        return None;
+    }
+    match crate::heapgen::resolve_alias(&s.ty, aliases) {
+        syn::Type::Array(a) => Some(a.len.to_token_stream().to_string()),
+        _ => None,
+    }
 }
 
 /// Whether `ty` is a read-only "data" type the heap path can carry as an
@@ -579,9 +603,13 @@ impl<'ast> Visit<'ast> for BodyChecker {
         // A fn-ptr `static mut` is modelled too (a shared symbolic word injected
         // into both versions; the extractor's write-guard rejects a unit that
         // writes it), so it is kept in scope.
+        // A modelled struct (or array-of-struct) `static mut` -- e.g.
+        // `xmlLastError` or a callback table `[xmlInputCallback; 15]` -- is
+        // compared by final state, so writing it is in scope.
         if self.allow_pointers
             && (is_scalar_mut_static(s)
                 || is_data_static(s, &self.structs, &self.aliases)
+                || modelled_struct_mut_static(s, &self.structs, &self.aliases).is_some()
                 || is_fnptr_mut_static(s, &self.aliases))
         {
             return;

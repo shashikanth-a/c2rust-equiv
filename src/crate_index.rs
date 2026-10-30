@@ -67,6 +67,13 @@ pub struct CrateIndex {
     /// The crate-wide union discriminant catalog, mined once on first use
     /// (expensive: it scans every function), then reused for every extraction.
     union_catalog: OnceLock<BTreeMap<String, crate::taggedunion::TagMap>>,
+    /// `(module, name)` of each opaque foreign type declaration (`extern "C" {
+    /// pub type X; }`). Resolved into synthetic opaque structs by
+    /// [`Self::synthesize_opaque_types`] only for names with no real definition
+    /// (a system type like `__sFILEX`), so a type that is opaque in one file but
+    /// a real `struct` in its own file (`_xmlDict`, `_xmlBuf`) keeps the real
+    /// definition rather than being shadowed by an empty one.
+    opaque_type_decls: Vec<(usize, String)>,
 }
 
 impl CrateIndex {
@@ -107,6 +114,7 @@ impl CrateIndex {
                 Err(e) => index.parse_errors.push((rel, e.to_string())),
             }
         }
+        index.synthesize_opaque_types();
         Ok(index)
     }
 
@@ -114,7 +122,38 @@ impl CrateIndex {
     pub fn add_source(&mut self, rel: &str, source: &str) -> syn::Result<()> {
         let parsed = syn::parse_file(source)?;
         self.add_file(rel, parsed.items);
+        self.synthesize_opaque_types();
         Ok(())
+    }
+
+    /// For each recorded opaque foreign type (`extern "C" { pub type X; }`),
+    /// add a concrete zero-sized opaque struct (the canonical Rust FFI opaque
+    /// pattern) in its module -- but only when the crate has no real definition
+    /// of that name. A C system type like `__sFILEX` (used only as `*mut
+    /// __sFILEX`, never dereferenced) thereby resolves to an opaque pointer
+    /// identically in both versions, while a type such as `_xmlDict`, which is
+    /// opaque in callers but a real `struct` in its own file, keeps the real
+    /// definition. Idempotent: an already-synthesized name is skipped.
+    fn synthesize_opaque_types(&mut self) {
+        let defined: std::collections::BTreeSet<String> = self
+            .entries
+            .iter()
+            .filter(|e| matches!(e.kind, Kind::Type | Kind::TypeAlias))
+            .map(|e| e.name.clone())
+            .collect();
+        let decls = std::mem::take(&mut self.opaque_type_decls);
+        let mut done: std::collections::BTreeSet<(usize, String)> =
+            std::collections::BTreeSet::new();
+        for (module, name) in decls {
+            if defined.contains(&name) || !done.insert((module, name.clone())) {
+                continue;
+            }
+            let def: syn::Item = syn::parse_str(&format!(
+                "#[repr(C)] pub struct {name} {{ pub _private: [u8; 0] }}"
+            ))
+            .expect("opaque type def parses");
+            self.push(module, name, Kind::Type, Some(def), None);
+        }
     }
 
     fn add_file(&mut self, rel: &str, items: Vec<syn::Item>) {
@@ -210,6 +249,16 @@ impl CrateIndex {
                                     Some(item),
                                     None,
                                 );
+                            }
+                            // An opaque foreign type (`extern "C" { pub type
+                            // __sFILEX; }`), which c2rust emits for a C
+                            // incomplete type. Record it; a synthetic opaque
+                            // struct is added later (`synthesize_opaque_types`)
+                            // only if no real definition of the name exists in
+                            // the crate, so a type that is opaque in one file but
+                            // a real `struct` elsewhere keeps the real one.
+                            syn::ForeignItem::Type(t) => {
+                                self.opaque_type_decls.push((module, t.ident.to_string()));
                             }
                             _ => {}
                         }
@@ -395,5 +444,55 @@ fn lit_str(expr: &syn::Expr) -> Option<String> {
             ..
         }) => Some(s.value()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod opaque_type_tests {
+    use super::*;
+
+    fn count_type_defs(index: &CrateIndex, name: &str) -> usize {
+        index
+            .entries
+            .iter()
+            .filter(|e| e.kind == Kind::Type && e.name == name)
+            .count()
+    }
+
+    fn field_count(index: &CrateIndex, name: &str) -> Option<usize> {
+        index.entries.iter().find_map(|e| match (&e.kind, &e.item) {
+            (Kind::Type, Some(syn::Item::Struct(s))) if e.name == name => Some(s.fields.len()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn opaque_extern_type_without_a_real_def_is_synthesized() {
+        let mut index = CrateIndex::default();
+        index
+            .add_source("a.rs", "extern \"C\" { pub type __sFILEX; }")
+            .unwrap();
+        // A concrete opaque struct now stands in for the never-defined type.
+        assert_eq!(count_type_defs(&index, "__sFILEX"), 1);
+        assert_eq!(field_count(&index, "__sFILEX"), Some(1)); // the `_private` ZST
+    }
+
+    #[test]
+    fn opaque_extern_type_with_a_real_def_is_not_shadowed() {
+        // `_xmlDict` is opaque in callers but a real struct in its own file.
+        // The real definition must survive; no empty struct may shadow it.
+        let mut index = CrateIndex::default();
+        index
+            .add_source(
+                "dict.rs",
+                "pub struct _xmlDict { pub size: i32, pub nb: i32 }",
+            )
+            .unwrap();
+        index
+            .add_source("user.rs", "extern \"C\" { pub type _xmlDict; }")
+            .unwrap();
+        // Only the real two-field definition exists -- no synthesized empty one.
+        assert_eq!(count_type_defs(&index, "_xmlDict"), 1);
+        assert_eq!(field_count(&index, "_xmlDict"), Some(2));
     }
 }

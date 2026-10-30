@@ -1191,6 +1191,9 @@ impl<'ast> Visit<'ast> for Analyzer<'_> {
                     .is_data_static_item(&Some(syn::Item::Static(s.clone())))
                 || self
                     .resolver
+                    .is_modelled_struct_mut_static_item(&Some(syn::Item::Static(s.clone())))
+                || self
+                    .resolver
                     .is_fnptr_mut_static_item(&Some(syn::Item::Static(s.clone()))))
         {
             syn::visit::visit_item_static(self, s);
