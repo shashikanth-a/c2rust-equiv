@@ -185,15 +185,16 @@ testing) is separate. Measured per crate:
 |---|---|---|---|
 | lil | 162 | 159 | 98.1% |
 | genann | 25 | 24 | 96.0% |
-| libxml2 | 4,867 | 3,851 | 79.1% |
-| json-c | 265 | 201 | 75.8% |
-| tmux | 1,389 | 199 | 14.3% |
+| libxml2 | 4,867 | 3,890 | 79.9% |
+| json-c | 265 | 203 | 76.6% |
+| tmux | 1,389 | 651 | 46.9% |
 
 Small, algorithmic crates approach their ceiling. The large systems crates sit
 lower because their remaining functions are tightly co-blocked (a foreign call,
 a global and an indirect dispatch at once) or depend on effects that can't be
 soundly modelled (filesystem syscalls, FILE-buffer internals); tmux is lowest
-because most of it is built on libevent's opaque event-loop machinery.
+because most of it is built on libevent's opaque event-loop machinery and its
+observable behaviour is largely the external interaction itself.
 
 **LLM rewrites.** The next two experiments check that the verdicts are sound —
 that `proved` means equivalent and a real change is caught. They were run on
