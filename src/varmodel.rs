@@ -64,6 +64,13 @@ fn variadic_ret(name: &str) -> Option<&'static str> {
         "ioctl" | "execl" | "execlp" | "execle" | "evbuffer_add_printf" => "::core::ffi::c_int",
         "tparm" => "*mut ::core::ffi::c_char",
         "environ_set" => "()",
+        // json-c's variadic internals. `sprintbuf(pb, fmt, ..)` formats onto a
+        // printbuf (arg 0, recorded by identity, not filled). `json_pointer_getf
+        // (obj, &res, fmt, ..)`/`setf` build a JSON-pointer from a format and
+        // look up/set a node; the object and out-pointer are recorded by
+        // identity and the out-location is left symbolic (both versions see the
+        // identical unmodelled result -- conservative, never a false proof).
+        "sprintbuf" | "json_pointer_getf" | "json_pointer_setf" => "::core::ffi::c_int",
         _ => return None,
     })
 }
