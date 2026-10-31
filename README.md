@@ -186,7 +186,7 @@ testing) is separate. Measured per crate:
 | lil | 162 | 159 | 98.1% |
 | genann | 25 | 24 | 96.0% |
 | libxml2 | 4,867 | 3,890 | 79.9% |
-| json-c | 265 | 208 | 78.5% |
+| json-c | 265 | 217 | 81.9% |
 | tmux | 1,389 | 651 | 46.9% |
 
 Small, algorithmic crates approach their ceiling. The large systems crates sit
