@@ -289,7 +289,10 @@ fn arg_kind(ty: &syn::Type, aliases: &BTreeMap<String, syn::Type>) -> Option<u8>
     if let syn::Type::Ptr(ptr) = &resolved {
         let pointee = last_segment(&crate::heapgen::resolve_alias(&ptr.elem, aliases));
         return Some(match pointee.as_deref() {
-            Some("c_char") | Some("c_uchar") => 1,
+            // `c_char`/`c_uchar` are `i8`/`u8`; c2rust writes string pointers
+            // both ways, so a pointer to any of them is a C string (compared by
+            // content), not an opaque pointer (compared by identity).
+            Some("c_char") | Some("c_uchar") | Some("i8") | Some("u8") => 1,
             _ => 2,
         });
     }
@@ -337,6 +340,30 @@ fn tail_kind(arg: &syn::Expr, env: &TypeEnv) -> Option<u8> {
         return None;
     }
     arg_kind(&resolved, &env.aliases)
+}
+
+/// Classify a variadic-call argument from its call-site expression, for the
+/// variadic-external model (`crate::varmodel`): `Some((kind, is_float))` with
+/// kind 0 scalar/float, 1 C string, 2 pointer; `None` if it can't be typed.
+/// Unlike [`tail_kind`], a float is reported (as a scalar kind with the float
+/// flag set) so the caller can record it bit-exactly; the caller handles a
+/// `None` by falling back to its runtime `TraceArg` classification.
+pub(crate) fn variadic_arg_class(env: &TypeEnv, e: &syn::Expr) -> Option<(u8, bool)> {
+    let ty = match e {
+        syn::Expr::Paren(p) => return variadic_arg_class(env, &p.expr),
+        syn::Expr::Group(g) => return variadic_arg_class(env, &g.expr),
+        syn::Expr::Cast(c) => (*c.ty).clone(),
+        _ => env.type_of(e)?,
+    };
+    let resolved = crate::heapgen::resolve_alias(&ty, &env.aliases);
+    if last_segment(&resolved)
+        .as_deref()
+        .and_then(float_width)
+        .is_some()
+    {
+        return Some((0, true));
+    }
+    arg_kind(&resolved, &env.aliases).map(|k| (k, false))
 }
 
 /// The bits expression for one argument, given its kind tag (as
