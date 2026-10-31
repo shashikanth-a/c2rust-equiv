@@ -298,9 +298,15 @@ fn extract_in(
         } else {
             entry.name.clone()
         };
-        let key = (entry.kind == Kind::TypeAlias, name);
+        // Key by Rust namespace, not exact kind: a type and a value may share a
+        // name without clashing (c2rust's `RB_HEAD` emits a `struct sessions`
+        // and tmux also has a `static sessions`, in separate namespaces). Only a
+        // same-namespace same-name pair with different definitions is a real
+        // collision.
+        let type_ns = matches!(entry.kind, Kind::Type | Kind::TypeAlias);
+        let key = (type_ns, name);
         if let Some(&other) = names.get(&key) {
-            if same_item(&index.entries[other].item, &entry.item) {
+            if same_item_mod_anon(&index.entries[other].item, &entry.item) {
                 continue;
             }
             return Err(Skip::new(
@@ -980,6 +986,37 @@ fn same_item(a: &Option<syn::Item>, b: &Option<syn::Item>) -> bool {
     }
 }
 
+/// Like [`same_item`], but ignoring c2rust's per-file numbering of anonymous
+/// aggregates. The same C type transpiled in two files gets the same fields but
+/// differently-numbered anonymous members (`message_log: C2Rust_Unnamed_24` in
+/// one file, `C2Rust_Unnamed_29` in another), so a struct that is really one
+/// type reads as two colliding definitions. Both are this crate's transpilation
+/// of the same C type, so normalising every anonymous name to a single token
+/// before comparing recognises them as one -- a genuinely different field (name
+/// or non-anonymous type) still differs.
+fn same_item_mod_anon(a: &Option<syn::Item>, b: &Option<syn::Item>) -> bool {
+    use syn::visit_mut::VisitMut;
+    struct NormAnon;
+    impl VisitMut for NormAnon {
+        fn visit_ident_mut(&mut self, id: &mut syn::Ident) {
+            if is_anon_c2rust(&id.to_string()) {
+                *id = ident("C2Rust_Unnamed");
+            }
+        }
+    }
+    let normed = |item: &Option<syn::Item>| -> Option<String> {
+        use quote::ToTokens;
+        let mut it = item.clone()?;
+        NormAnon.visit_item_mut(&mut it);
+        Some(it.to_token_stream().to_string())
+    };
+    match (a, b) {
+        (Some(_), Some(_)) => normed(a) == normed(b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 fn libc(segs: &[String], ns: Ns) -> Res {
     let shown = segs.join("::");
     let name = segs.last().unwrap();
@@ -1396,6 +1433,27 @@ mod tests {
     use super::*;
     use crate::compose::summary_catalog;
     use crate::crate_index::CrateIndex;
+
+    #[test]
+    fn same_item_mod_anon_ignores_anon_suffix() {
+        let a: syn::Item = syn::parse_str(
+            "pub struct client { pub n: i32, pub log: C2Rust_Unnamed_24, pub p: C2Rust_Unnamed_23 }",
+        ).unwrap();
+        let b: syn::Item = syn::parse_str(
+            "pub struct client { pub n: i32, pub log: C2Rust_Unnamed_29, pub p: C2Rust_Unnamed_28 }",
+        ).unwrap();
+        assert!(
+            same_item_mod_anon(&Some(a.clone()), &Some(b.clone())),
+            "should match mod anon"
+        );
+        let c: syn::Item = syn::parse_str(
+            "pub struct client { pub n: i64, pub log: C2Rust_Unnamed_24, pub p: C2Rust_Unnamed_23 }",
+        ).unwrap();
+        assert!(
+            !same_item_mod_anon(&Some(a), &Some(c)),
+            "a real field-type diff must still differ"
+        );
+    }
 
     fn index(src: &str) -> CrateIndex {
         let mut i = CrateIndex::default();
