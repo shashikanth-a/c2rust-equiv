@@ -50,6 +50,20 @@ fn variadic_ret(name: &str) -> Option<&'static str> {
         // format string (`cmdq_error(item, fmt, ..)`); the context pointer is
         // recorded by identity. Modelled like the loggers.
         "cmdq_error" | "status_message_set" | "format_add" => "()",
+        // tmux's `xasprintf(&dst, fmt, ..)` allocates and stores a formatted
+        // string in `*dst`; modelled as a trace (the out-pointer recorded by
+        // identity, not filled), returning a symbolic length. The screen
+        // writers format onto the terminal (an observable side effect captured
+        // by the trace).
+        "xasprintf" | "xvasprintf" => "::core::ffi::c_int",
+        "screen_write_puts" | "screen_write_nputs" | "screen_write_vnputs" => "()",
+        // Variadic syscalls/library calls, each an observable trace of its
+        // arguments (any context pointer by identity), returning the symbolic
+        // result. `tparm` returns a (symbolic) pointer; a dereference of it is a
+        // safe Kani skip.
+        "ioctl" | "execl" | "execlp" | "execle" | "evbuffer_add_printf" => "::core::ffi::c_int",
+        "tparm" => "*mut ::core::ffi::c_char",
+        "environ_set" => "()",
         _ => return None,
     })
 }
@@ -62,6 +76,8 @@ fn variadic_dst(name: &str) -> Option<usize> {
         "sprintf" | "vsprintf" | "snprintf" | "vsnprintf" => Some(0),
         // libxml2's `xmlStrPrintf(buf, len, msg, ...)` formats into `buf`.
         "xmlStrPrintf" => Some(0),
+        // tmux's `xsnprintf(buf, len, fmt, ...)` formats into `buf`.
+        "xsnprintf" | "xvsnprintf" => Some(0),
         _ => None,
     }
 }

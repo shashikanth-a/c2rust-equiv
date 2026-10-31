@@ -45,6 +45,10 @@ pub fn libc_typedef(name: &str) -> Option<&'static str> {
         "uint16_t" => "u16",
         "uint32_t" => "u32",
         "uint64_t" => "u64",
+        // Wide characters (`wchar_t`/`wint_t` -> `::libc::wchar_t`, an external
+        // typedef the crate doesn't alias to a primitive): 32-bit on the
+        // platforms c2rust targets here.
+        "wchar_t" | "wint_t" => "i32",
         _ => return None,
     })
 }

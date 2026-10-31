@@ -698,12 +698,19 @@ fn tagged_union(
         let classified = match sub {
             None => None,
             Some(s) => {
-                let ty = udef
-                    .fields
-                    .iter()
-                    .find(|(n, _)| n == s)
-                    .map(|(_, t)| t)
-                    .expect("mined sub-field is a union field");
+                let ty = match udef.fields.iter().find(|(n, _)| n == s).map(|(_, t)| t) {
+                    Some(t) => t,
+                    // The mined tag map names a sub-field that isn't a field of
+                    // this union (e.g. the discriminant maps into a different
+                    // union, or the mining was approximate): skip gracefully
+                    // rather than panicking.
+                    None => {
+                        return Err(unsupported(
+                            s,
+                            "tagged-union variant names a field absent from the union".to_owned(),
+                        ))
+                    }
+                };
                 let field = classify(ty, table, aliases).map_err(|d| unsupported(s, d))?;
                 if let Field::Pointer(t) = &field {
                     referenced.insert(t.clone());

@@ -872,6 +872,17 @@ struct PtrAliasInliner<'a> {
 
 impl VisitMut for PtrAliasInliner<'_> {
     fn visit_type_mut(&mut self, ty: &mut syn::Type) {
+        // Resolve a bare type-alias chain first, so a scalar behind a C typedef
+        // (`uid_t` -> `__darwin_uid_t` -> `__uint32_t` -> `u32`, `pid_t`,
+        // `off_t`, ...) is recognised as the scalar it is; then inline pointer
+        // aliases. Without this a foreign function taking such a typedef was
+        // wrongly rejected as non-scalar.
+        if matches!(ty, syn::Type::Path(_)) {
+            let resolved = crate::heapgen::resolve_alias(ty, self.aliases);
+            if &resolved != ty {
+                *ty = resolved;
+            }
+        }
         let inlined = inline_ptr_aliases(ty, self.aliases);
         if &inlined != ty {
             *ty = inlined;
