@@ -3929,3 +3929,75 @@ fn stdio_global_catches_divergence() {
         outcome.status
     );
 }
+
+// A function-pointer argument (callback) passed to an external. c2rust types a
+// C callback parameter as `Option<unsafe extern "C" fn(..)>`. The external is
+// modelled as an observable-call trace; the callback is recorded by value (its
+// address bits), so passing the same callback to both versions matches, while
+// dropping it (passing `None`) is a different observable call and is caught --
+// proving the callback is recorded, not ignored.
+const XSORT_DEFS: &[&str] = &["extern \"C\" { fn ext_sort(base: *mut i32, n: usize, \
+     cmp: Option<unsafe extern \"C\" fn(*const i32, *const i32) -> i32>); }"];
+
+const XSORT_OLD: &str = r#"
+pub unsafe fn run(
+    base: *mut i32,
+    n: usize,
+    cmp: Option<unsafe extern "C" fn(*const i32, *const i32) -> i32>,
+) -> i32 {
+    ext_sort(base, n, cmp);
+    n as i32
+}
+"#;
+
+// Equivalent rewrite: same observable call, different local shape.
+const XSORT_OK: &str = r#"
+pub unsafe fn run(
+    base: *mut i32,
+    n: usize,
+    cmp: Option<unsafe extern "C" fn(*const i32, *const i32) -> i32>,
+) -> i32 {
+    let count = n;
+    ext_sort(base, count, cmp);
+    count as i32
+}
+"#;
+
+// Wrong rewrite: drops the comparator (passes `None`). The recorded callback
+// bits differ, so the observable trace diverges -- must not be proved.
+const XSORT_BAD: &str = r#"
+pub unsafe fn run(
+    base: *mut i32,
+    n: usize,
+    cmp: Option<unsafe extern "C" fn(*const i32, *const i32) -> i32>,
+) -> i32 {
+    ext_sort(base, n, None);
+    n as i32
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn fn_ptr_passed_to_external_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(XSORT_OLD, XSORT_DEFS).unwrap();
+    let new = FnUnit::parse(XSORT_OK, XSORT_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn fn_ptr_passed_to_external_catches_a_dropped_callback() {
+    let old = FnUnit::parse(XSORT_OLD, XSORT_DEFS).unwrap();
+    let new = FnUnit::parse(XSORT_BAD, XSORT_DEFS).unwrap();
+    let outcome = check(&old, &new, &opts());
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a dropped callback was proved equivalent: {:?}",
+        outcome.status
+    );
+}

@@ -79,17 +79,48 @@ fn is_trace_sig(sig: &syn::Signature) -> bool {
     // (compared by content for strings, by heap bijection otherwise).
     sig.inputs.iter().all(|a| match a {
         syn::FnArg::Typed(pt) => {
-            matches!(&*pt.ty, syn::Type::Ptr(_))
+            is_fn_ptr_type(&pt.ty)
+                || matches!(&*pt.ty, syn::Type::Ptr(_))
                 || scalar_or_float(&pt.ty.to_token_stream().to_string())
         }
         syn::FnArg::Receiver(_) => false,
     })
 }
 
+/// A function-pointer argument: a bare `fn(..)` or a nullable `Option<fn(..)>`
+/// (the shape c2rust emits for a C callback parameter, e.g. `qsort`'s
+/// comparator). Recorded by value so that an identical callback passed to both
+/// versions matches; see `arg_kind_bits`.
+fn is_fn_ptr_type(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::BareFn(_) => true,
+        syn::Type::Path(p) => p.path.segments.last().is_some_and(|seg| {
+            seg.ident == "Option"
+                && matches!(&seg.arguments, syn::PathArguments::AngleBracketed(a)
+                    if matches!(a.args.first(), Some(syn::GenericArgument::Type(syn::Type::BareFn(_)))))
+        }),
+        _ => false,
+    }
+}
+
 /// How a trace argument is recorded: its bit expression and kind tag
 /// (0 scalar/float, 1 NUL-terminated string, 2 pointer by bijection).
 pub(crate) fn arg_kind_bits(name: &str, ty: &str) -> (String, u8) {
     let t = ty.trim();
+    // A function-pointer argument (callback) is recorded by its address bits,
+    // by value (kind 0). The harness feeds both versions the same callback
+    // value, so equal input callbacks record equal bits; two distinct function
+    // addresses (e.g. a literal `old::f` vs `new::f`) record unequal bits and
+    // so fail to prove equivalent (conservative) -- never collapsed to equal,
+    // which an identity/bijection kind would wrongly do.
+    if t.contains("fn (") || t.contains("fn(") {
+        let bits = if t.starts_with("Option") {
+            format!("({name}.map_or(0usize, |f| f as usize) as u128)")
+        } else {
+            format!("({name} as usize as u128)")
+        };
+        return (bits, 0);
+    }
     if t.starts_with('*') {
         // A pointer: a `c_char`/`c_uchar` pointee is a string (compared by
         // content), anything else is compared through the heap bijection.
