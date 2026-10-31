@@ -374,8 +374,13 @@ pub(crate) fn is_mutex_ptr_static(
     if let syn::Type::Ptr(p) = &crate::heapgen::resolve_alias(&s.ty, aliases) {
         if let syn::Type::Path(tp) = &*p.elem {
             if let Some(seg) = tp.path.segments.last() {
+                // The pointee may be the public typedef (`xmlMutex`,
+                // `xmlRMutex`) or, when a type alias was inlined all the way to
+                // the underlying c2rust struct, its `_`-prefixed name
+                // (`_xmlMutex`, `_xmlRMutex`); both name the same mutex type.
                 let n = seg.ident.to_string();
-                return n == "xmlMutex" || n == "xmlRMutex";
+                let base = n.strip_prefix('_').unwrap_or(&n);
+                return base == "xmlMutex" || base == "xmlRMutex";
             }
         }
     }
@@ -710,6 +715,24 @@ mod tests {
 
     fn unit(function: &str, callees: &[&str]) -> FnUnit {
         FnUnit::parse(function, callees).unwrap()
+    }
+
+    #[test]
+    fn mutex_ptr_static_recognises_inlined_pointee() {
+        // A mutex-pointer global is exempt from the read-only-data-global
+        // write-guard. c2rust may type it via the public typedef or, once a
+        // pointer alias is inlined to the underlying struct, as the `_`-prefixed
+        // name -- both must be recognised, else the init write is rejected.
+        let aliases = BTreeMap::new();
+        for ty in ["*mut xmlRMutex", "*mut _xmlRMutex", "*mut _xmlMutex"] {
+            let s: syn::ItemStatic =
+                syn::parse_str(&format!("static mut M: {ty} = 0 as {ty};")).unwrap();
+            assert!(is_mutex_ptr_static(&s, &aliases), "should accept {ty}");
+        }
+        // A non-mutex pointer global is not exempt.
+        let other: syn::ItemStatic =
+            syn::parse_str("static mut G: *mut xmlDict = 0 as *mut xmlDict;").unwrap();
+        assert!(!is_mutex_ptr_static(&other, &aliases));
     }
 
     #[test]
