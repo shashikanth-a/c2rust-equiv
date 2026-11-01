@@ -40,22 +40,14 @@ jobs:
       # catches-divergence pair for each distinct model, so a regression in any
       # model is caught. Keep this list in sync when adding a model.
       #
-      # NOTE on the allocator models. The alloc-hook path now *proves* (the
-      # shim lives once in the shared `support` module, so both versions' hook
-      # globals hold the identical function pointer and the call sequences line
-      # up). Three prove-direction cases are still known-blocked and so run only
-      # their catch-direction (soundness) partner here — they never return a
-      # wrong answer, only "not proved":
-      #   - allocator_global_model / strdup_hook: a modelled external that
-      #     *returns a pointer* which is then dereferenced. The trace hands back
-      #     a symbolic word, not a valid allocation, so the pointee comparison
-      #     can't be discharged. Proving these needs the returned pointer to be
-      #     a fresh per-version allocation registered in the heap bijection
-      #     (sharing one allocation across the two runs would be unsound).
-      #   - variadic_sax_callback: times out under the default bound (perf, not
-      #     soundness).
-      # The catch-direction partners below confirm no wrong rewrite is ever
-      # proved for these paths.
+      # NOTE on the allocator models. All allocator paths now prove as well as
+      # catch. The alloc-hook shim lives once in the shared `support` module, so
+      # both versions' hook globals hold the identical function pointer and the
+      # call sequences line up; a hook that *returns a pointer* (xmlMalloc,
+      # xmlMemStrdup) hands back a fresh valid per-version buffer, so the pointee
+      # comparison is discharged. The variadic-SAX *prove* case is omitted here
+      # only for runtime (~2 min); it proves in the full `--include-ignored`
+      # suite, and its catch-direction partner runs below.
       - name: Representative heap/algebraic Kani proofs
         run: |
           cargo test --test heap_check -- --include-ignored --exact \
@@ -81,7 +73,9 @@ jobs:
             mutex_noop_catches_divergence \
             alloc_hook_proves_equivalent_rewrite \
             alloc_hook_catches_divergence \
+            allocator_global_model_proves_equivalent_rewrite \
             allocator_global_model_catches_a_difference \
+            strdup_hook_proves_equivalent_rewrite \
             strdup_hook_catches_divergent_result \
             variadic_sax_callback_catches_different_tail_argument \
             raise_error_proves_equivalent_rewrite \

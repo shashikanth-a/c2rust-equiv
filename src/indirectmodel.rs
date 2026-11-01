@@ -463,20 +463,53 @@ fn replacement(plan: &CallPlan) -> syn::Expr {
         let kind = plan.arg_kinds[i];
         body += &format!("(*__t).step(__id, [{bits}, 0, 0], [{kind}u8, 3u8, 3u8]);");
     }
-    // A final event carries the call's symbolic result (distinct id so it is
-    // never confused with an argument event).
     let ret_salt = oracle_id("<indirect-ret>");
-    let step = format!("(*__t).step(__id ^ {ret_salt}u64, [0, 0, 0], [3u8, 3u8, 3u8])");
     let ret = plan.ret.trim();
-    let tail = match float_width(ret) {
-        Some(32) => format!("f32::from_bits({step} as u32) as {ret}"),
-        Some(_) => format!("f64::from_bits({step} as u64) as {ret}"),
-        None if ret == "()" => format!("let _ = {step};"),
-        None if ret.starts_with('*') => format!("{step} as usize as {ret}"),
-        None => format!("{step} as {ret}"),
+    // Allocator hooks return a *pointer* that the caller may dereference, store
+    // or return, so a symbolic result word (fine for a scalar) is not enough --
+    // it must be a valid allocation. Model the known hooks specially: both
+    // versions get a fresh, valid buffer with shared symbolic contents, so the
+    // heap comparison can dereference the result and a divergent write is still
+    // caught. The size/string argument is still recorded as an event above, so
+    // a rewrite that allocates differently diverges.
+    let tail = match alloc_hook_name(&plan.callee).as_deref() {
+        Some("xmlMalloc" | "xmlMallocAtomic") if !plan.args.is_empty() => {
+            let n = plan.args[0].to_token_stream();
+            format!("(*__t).alloc_bytes(__id ^ {ret_salt}u64, ({n}) as usize) as {ret}")
+        }
+        // `xmlMemStrdup` is a deterministic allocate-and-copy of its argument,
+        // which is itself a shared symbolic string; a fresh copy in each version
+        // compares equal by content. No trace event (the copy is deterministic).
+        Some("xmlMemStrdup") if !plan.args.is_empty() => {
+            let s = plan.args[0].to_token_stream();
+            format!("crate::support::clone_cstr(({s}) as *const core::ffi::c_char) as {ret}")
+        }
+        _ => {
+            // A final event carries the call's symbolic result (distinct id so
+            // it is never confused with an argument event).
+            let step = format!("(*__t).step(__id ^ {ret_salt}u64, [0, 0, 0], [3u8, 3u8, 3u8])");
+            match float_width(ret) {
+                Some(32) => format!("f32::from_bits({step} as u32) as {ret}"),
+                Some(_) => format!("f64::from_bits({step} as u64) as {ret}"),
+                None if ret == "()" => format!("let _ = {step};"),
+                None if ret.starts_with('*') => format!("{step} as usize as {ret}"),
+                None => format!("{step} as {ret}"),
+            }
+        }
     };
     syn::parse_str(&format!("unsafe {{ {body} {tail} }}"))
         .expect("generated indirect-call expr parses")
+}
+
+/// If the callback receiver is a bare allocator-hook global (`xmlMalloc`,
+/// `xmlMemStrdup`, ..), its name -- so [`replacement`] can model the pointer it
+/// returns as a valid allocation rather than a symbolic word.
+fn alloc_hook_name(callee: &syn::Expr) -> Option<String> {
+    let syn::Expr::Path(p) = callee else {
+        return None;
+    };
+    let name = p.path.get_ident()?.to_string();
+    crate::allocmodel::is_alloc_global(&name).then_some(name)
 }
 
 /// Whether every indirect call in `f`'s body is modellable by this rewrite.

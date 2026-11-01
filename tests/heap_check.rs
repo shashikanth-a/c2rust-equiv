@@ -1874,15 +1874,12 @@ pub unsafe fn mk(v: i32) -> *mut i32 {
 }
 "#;
 
-// KNOWN-BLOCKED (aspirational): `mk` returns the allocated pointer, so the
-// harness compares pointees with `same_cell`. The modelled `xmlMalloc` hands
-// back a symbolic word rather than a valid allocation, so that dereference
-// can't be discharged and the tool soundly *skips* instead of proving. Flip to
-// asserting `Proved` (and add to the CI subset) once a pointer-returning
-// external yields a fresh per-version allocation registered in the heap
-// bijection. The catch-direction partner below already runs in CI.
+// `mk` returns the allocated pointer, so the harness compares pointees with
+// `same_cell`. The modelled `xmlMalloc` returns a valid fresh buffer per
+// version (`Trace::alloc_bytes`), so the dereference is in bounds and a
+// divergent write is caught.
 #[test]
-#[ignore = "known-blocked: pointer-returning external not yet a valid allocation; see comment"]
+#[ignore = "requires `cargo kani` on PATH; slow"]
 fn allocator_global_model_proves_equivalent_rewrite() {
     let old = FnUnit::parse(ALLOC_OLD, &[]).unwrap();
     let new = FnUnit::parse(ALLOC_OK, &[]).unwrap();
@@ -2304,16 +2301,20 @@ pub unsafe fn run(c: *mut Ctxt, msg: *const core::ffi::c_char) {
 }
 "#;
 
-// KNOWN-BLOCKED (perf, not soundness): this proof times out under the default
-// bound rather than failing. Left out of the CI subset for runtime; the
-// catch-direction partner (which finishes) runs there instead. Revisit if the
-// variadic-callback harness is made cheaper.
+// Proves, but slowly (~2 min): the variadic string argument is compared through
+// the trace, which is heavy. unwind=7 is sufficient (the string compare needs
+// more than the default bound) and a little cheaper than 8; the timeout is
+// raised so the proof has headroom rather than finishing just past the default.
+// Kept out of the fast CI subset for runtime; its catch-direction partner runs
+// there, and this proves in the full `--include-ignored` suite.
 #[test]
-#[ignore = "known-blocked: times out under default bound (perf); see comment"]
+#[ignore = "requires `cargo kani` on PATH; slow (~2 min)"]
 fn variadic_sax_callback_proves_equivalent_rewrite() {
     let old = FnUnit::parse(SV_OLD, SV_DEFS).unwrap();
     let new = FnUnit::parse(SV_OK, SV_DEFS).unwrap();
-    let outcome = check(&old, &new, &opts_unwind(8));
+    let mut o = opts_unwind(7);
+    o.kani_timeout = Duration::from_secs(300);
+    let outcome = check(&old, &new, &o);
     assert!(
         matches!(outcome.status, Status::Proved { .. }),
         "expected Proved, got {:?}",
@@ -3115,13 +3116,11 @@ fn strdup_hook_is_in_heap_scope() {
     );
 }
 
-// KNOWN-BLOCKED (aspirational): same cause as `allocator_global_model` — the
-// modelled `xmlMemStrdup` returns a pointer whose pointee is then compared, but
-// the result is a symbolic word, not a valid allocation (Kani: "pointer to
-// unallocated memory"). Flip to `Proved` once pointer-returning externals
-// allocate a real per-version buffer. The catch-direction partner runs in CI.
+// `xmlMemStrdup` is modelled as a deterministic allocate-and-copy of its
+// argument (`clone_cstr`): a valid buffer whose content equals the shared input
+// string, so the returned pointer compares equal by content across versions.
 #[test]
-#[ignore = "known-blocked: pointer-returning external not yet a valid allocation; see comment"]
+#[ignore = "requires `cargo kani` on PATH; slow"]
 fn strdup_hook_proves_equivalent_rewrite() {
     let old = FnUnit::parse(STRDUP_OLD, &[]).unwrap();
     let new = FnUnit::parse(STRDUP_OK, &[]).unwrap();

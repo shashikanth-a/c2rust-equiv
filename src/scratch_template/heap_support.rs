@@ -46,6 +46,14 @@ pub const HEAP_CAP: usize = 128;
 /// Kept small: a symbolic string length explodes Kani's search quickly.
 pub const CSTR_CAP: usize = 6;
 
+/// The largest modelled `malloc`-style allocation, in bytes (see
+/// [`Trace::alloc_bytes`]). Matches `CSTR_CAP`: the per-byte seeding loop then
+/// unwinds within the same bound a symbolic C string already needs, so no proof
+/// has to raise its unwind for an allocation. Large enough for a scalar or a
+/// small `#[repr(C)]` record; a request past it yields an undersized buffer, so
+/// any out-of-bound access fails verification rather than being proved.
+pub const ALLOC_CAP: usize = CSTR_CAP;
+
 /// A bounded, NUL-terminated symbolic C string on the heap. The last byte is
 /// always NUL, so any read that stops at a NUL stays in bounds whatever the
 /// interior bytes are; interior bytes are symbolic and may themselves be NUL.
@@ -290,6 +298,43 @@ impl Trace {
             i += 1;
         }
         *dst.add(CSTR_CAP - 1) = 0;
+    }
+
+    /// Model a `malloc`-style allocator returning `n` bytes, as an observable
+    /// result. A single recorded word decides null-ness, shared across the two
+    /// versions (so the caller's `is_null()` failure branch is explored, and
+    /// identically in both), then on success each version gets its *own* fresh
+    /// buffer -- never a shared one, which would be unsound because the second
+    /// run would see the first's writes.
+    ///
+    /// The buffer's bytes are independent symbolic values, not shared across the
+    /// versions. That is sound for a *proof*: distinct symbolic contents can
+    /// only make the two versions look more different, never falsely equal, so a
+    /// divergent write is still caught and a genuine equivalence is never
+    /// over-claimed. It is also what the usual case needs: a function that
+    /// writes its result before reading it overwrites the bytes, so the two
+    /// versions compare their own writes exactly. (A function that returns
+    /// *unwritten* bytes compares two independent symbols and so is left
+    /// unproved rather than wrongly proved.) The whole buffer is one symbolic
+    /// value (`kani::any()` over the fixed array), so there is no seeding loop
+    /// to unwind -- routing bytes through `step` would nest a loop inside
+    /// `step`'s own and need the unwind bound raised.
+    ///
+    /// Bounded by `ALLOC_CAP` bytes: a larger request gives a buffer that is too
+    /// small, so any access past the bound is out of bounds and Kani reports a
+    /// failure (the function is left unproved, never falsely proved).
+    pub unsafe fn alloc_bytes(&mut self, id: u64, _n: usize) -> *mut core::ffi::c_void {
+        // A distinct arg shape (`u128::MAX`) keeps the null-decision event out
+        // of the ordinary argument namespace.
+        let want_null = (self.step(id, [u128::MAX, 0, 0], [0, 3, 3]) & 1) == 0;
+        if want_null {
+            return core::ptr::null_mut();
+        }
+        // A fixed-size box (no `Vec`, which slows Kani); the pointer stays valid
+        // for the whole run (leaked -- freeing modelled objects is unnecessary
+        // and the count is bounded).
+        let arr: Box<[u8; ALLOC_CAP]> = Box::new(kani::any());
+        Box::into_raw(arr) as *mut core::ffi::c_void
     }
 
     pub fn step(&mut self, id: u64, args: [u128; 3], kinds: [u8; 3]) -> u128 {
