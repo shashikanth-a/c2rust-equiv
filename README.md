@@ -191,6 +191,18 @@ Everything else is `skipped`, with the reason. Still out of scope:
   (default 20s), because those proofs are often slow too. A function can be *in
   scope* (its harness builds) yet still fall back to testing or time out when
   proved — eligibility and provability are separate.
+- Floating-point division is the worst case: CBMC bit-blasts the IEEE-754
+  divider, so a single symbolic-`f64` divide can make an otherwise trivial proof
+  time out (even proving a function equal to an identical copy). On the heap
+  path the tool therefore models a float `/` as an *uninterpreted* operation,
+  keyed on its operands' bit patterns — the same device it already uses for
+  external calls like `exp`. This is sound for equivalence: a division is a
+  deterministic function of its operands, so identical operands give an
+  identical result in both versions (never a false equality), while a rewrite
+  that changes the operands or their order is still caught. The cost is
+  completeness — an equivalence that holds only by a floating-point algebraic
+  identity (reassociation, `x/x == 1.0`, …) is reported "not proved" rather than
+  "different". Integer `/` keeps its real divide-by-zero and `MIN / -1` panics.
 - Functions are checked one at a time. Each check builds a small crate, which
   takes a few seconds.
 - Cache keys include the tool's version but not its build, so clear the cache
@@ -267,21 +279,32 @@ the `#[test]` harnesses are excluded):
 
 | Verdict | Count |
 |---|---|
-| proved (algebraic or bounded) | 2 |
-| exceeded the unwinding bound (a loop needs more than 8 iterations) | 2 |
-| timed out at 120 s | 8 |
+| proved (algebraic or bounded) | 3 |
+| exceeded the unwinding bound (a loop needs more than 8 iterations) | 1 |
+| timed out at 120 s | 7 |
+| an undecidable construct, skipped | 1 |
 | counterexample | 0 |
 | **total** | **12** |
 
-Only the small scalar activation functions prove: `genann_act_linear` by the
-algebraic backend in 0.2 s, `genann_act_threshold` bounded in ~2 s. The loop-
-and float-heavy network functions (`genann_run`, `genann_train`, `genann_init`,
-`genann_read`, …) loop over a runtime-sized network, which bounded model
-checking cannot discharge: eight exhaust the 120-second solver budget and two
-hit the unwinding bound. A larger timeout and unwinding would prove a few more,
-as the SQLite loop above did at 300 s, but the genuinely unbounded loops would
-still not close. So on this crate the 12 functions the harness builds for reduce
-to 2 actually proved. Eligibility is the reach of the method, not a verification
+Three functions prove: `genann_act_linear` by the algebraic backend in 0.2 s,
+`genann_act_threshold` bounded in ~3 s, and `genann_act_sigmoid`
+(`1.0 / (1.0 + exp(-a))`) bounded in ~37 s. The sigmoid is straight-line with no
+loop, yet it proved only once floating-point division was modelled as an
+uninterpreted operation: CBMC bit-blasts IEEE-754 division, and a single
+symbolic-`f64` divide makes even proving the function equal to an identical copy
+time out past 120 s. Modelling the divide as a deterministic function of its
+operand bits (sound for equivalence; see the floating-point limitation above)
+brings it inside the budget while still catching a rewrite that changes the
+operands.
+The loop- and float-heavy network functions (`genann_run`, `genann_train`,
+`genann_init`, `genann_read`, …) loop over a runtime-sized network, which
+bounded model checking cannot discharge: seven exhaust the 120-second solver
+budget, one (`genann_act_sigmoid_cached`, a 4096-entry lookup table) exceeds the
+unwinding bound, and one (`genann_free`) hits a pointer-alignment construct Kani
+can't decide. A larger timeout and unwinding would prove a few more, as the
+SQLite loop above did at 300 s, but the genuinely unbounded loops would still not
+close. So on this crate the 12 functions the harness builds for reduce to 3
+actually proved. Eligibility is the reach of the method, not a verification
 count — read the next table accordingly.
 
 **How far the heap path reaches (experimental).** The table below counts, per

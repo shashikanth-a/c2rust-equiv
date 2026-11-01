@@ -134,6 +134,12 @@ fn module_source(unit: &FnUnit, inject_str_models: bool) -> String {
         crate::errormodel::rewrite(&mut items);
         crate::indirectmodel::rewrite(&mut items);
         crate::mutexmodel::rewrite(&mut items);
+        // Model floating-point division as an uninterpreted operation (keyed on
+        // operand bits, via the shared `FpDiv` trait): CBMC's IEEE-754 divider
+        // makes an otherwise-trivial float equivalence proof time out. Sound for
+        // equivalence; see `fpmodel`. Runs last so it also abstracts any `/`
+        // introduced by the models above.
+        crate::fpmodel::rewrite(&mut items);
     }
     let file = syn::File {
         shebang: None,

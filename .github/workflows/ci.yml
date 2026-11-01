@@ -75,6 +75,8 @@ jobs:
             indirect_call_catches_different_argument \
             mutex_noop_proves_equivalent_rewrite \
             mutex_noop_catches_divergence \
+            fp_division_proves_equivalent_rewrite \
+            fp_division_catches_swapped_operands \
             alloc_hook_proves_equivalent_rewrite \
             alloc_hook_catches_divergence \
             allocator_global_model_proves_equivalent_rewrite \

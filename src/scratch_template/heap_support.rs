@@ -131,6 +131,43 @@ pub static mut ORACLE: Oracle = Oracle {
     len: 0,
 };
 
+/// Division, dispatched by operand type (see the `fpmodel` module). Floating
+/// point routes through the oracle -- division is a deterministic function of
+/// its operand bits, so an uninterpreted model keyed on those bits is sound for
+/// equivalence and spares CBMC its very expensive IEEE-754 divider. Integer `/`
+/// stays a real divide, preserving its divide-by-zero and `MIN / -1` panics. A
+/// numeric type with no impl is a compile error, so the function is skipped
+/// rather than modelled unsoundly.
+pub trait FpDiv: Copy {
+    fn __fpdiv(self, rhs: Self) -> Self;
+}
+
+impl FpDiv for f64 {
+    fn __fpdiv(self, rhs: f64) -> f64 {
+        // id = oracle_id("<fp-div-f64>"); the angle brackets keep it out of the
+        // C-identifier namespace, so it never collides with a modelled call.
+        let key = ((self.to_bits() as u128) << 64) | (rhs.to_bits() as u128);
+        unsafe { f64::from_bits(ORACLE.get(667782100185489880u64, key) as u64) }
+    }
+}
+
+impl FpDiv for f32 {
+    fn __fpdiv(self, rhs: f32) -> f32 {
+        // id = oracle_id("<fp-div-f32>").
+        let key = ((self.to_bits() as u128) << 32) | (rhs.to_bits() as u128);
+        unsafe { f32::from_bits(ORACLE.get(3794352265830397169u64, key) as u32) }
+    }
+}
+
+macro_rules! int_fpdiv {
+    ($($t:ty),*) => {$(
+        impl FpDiv for $t {
+            fn __fpdiv(self, rhs: $t) -> $t { self / rhs }
+        }
+    )*};
+}
+int_fpdiv!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize);
+
 /// One argument of a variadic external call, recorded into the trace: its bits
 /// and kind (0 scalar/float by value, 1 NUL-terminated string by content).
 /// Implemented only for the types a format call actually passes, so an

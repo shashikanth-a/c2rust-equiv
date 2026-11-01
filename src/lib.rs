@@ -12,6 +12,7 @@ pub mod compose;
 pub mod crate_index;
 mod errormodel;
 pub mod extract;
+mod fpmodel;
 mod globalaccessmodel;
 pub mod heapgen;
 mod indirectmodel;

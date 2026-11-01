@@ -1317,6 +1317,85 @@ fn mutex_noop_catches_divergence() {
     );
 }
 
+// Floating-point division modelled as an uninterpreted operation (fpmodel).
+// A sigmoid activation `1.0 / (1.0 + exp(-a))` is straight-line with no loops,
+// yet CBMC's IEEE-754 divider over a symbolic `f64` makes even proving it equal
+// to an identical copy time out (>120s). Routing `/` through the `FpDiv` oracle
+// lets it prove in well under the cap, while a rewrite that changes the
+// division's operands still diverges and is caught. (`exp` is itself an
+// uninterpreted pure-math oracle, which also puts the function on the heap
+// path, where the models run.)
+// A genuine foreign declaration (no body), so `exp` is a modelled external
+// call and the function lands on the heap path. Given a body it would resolve
+// as a local function, keeping the unit on the scalar path where no model runs.
+const FPDIV_EXP: &str =
+    "extern \"C\" { fn exp(a: ::core::ffi::c_double) -> ::core::ffi::c_double; }";
+
+const FPDIV_OLD: &str = r#"
+pub unsafe fn sigmoid(a: ::core::ffi::c_double) -> ::core::ffi::c_double {
+    if a < -45.0f64 { return 0.0f64; }
+    if a > 45.0f64 { return 1.0f64; }
+    return 1.0f64 / (1.0f64 + exp(-a));
+}
+"#;
+
+// Equivalent: the denominator is bound to a local first; same operands reach
+// the division, so the oracle returns the same value.
+const FPDIV_OK: &str = r#"
+pub unsafe fn sigmoid(a: ::core::ffi::c_double) -> ::core::ffi::c_double {
+    if a < -45.0f64 { return 0.0f64; }
+    if a > 45.0f64 { return 1.0f64; }
+    let d = 1.0f64 + exp(-a);
+    return 1.0f64 / d;
+}
+"#;
+
+// Wrong: the division's operands are swapped (`d / 1.0` instead of `1.0 / d`),
+// a different computation. Under the oracle this is a different key, so the
+// results may differ and the divergence must be caught -- never proved equal.
+const FPDIV_BAD: &str = r#"
+pub unsafe fn sigmoid(a: ::core::ffi::c_double) -> ::core::ffi::c_double {
+    if a < -45.0f64 { return 0.0f64; }
+    if a > 45.0f64 { return 1.0f64; }
+    return (1.0f64 + exp(-a)) / 1.0f64;
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn fp_division_proves_equivalent_rewrite() {
+    let old = FnUnit::parse(FPDIV_OLD, &[FPDIV_EXP]).unwrap();
+    let new = FnUnit::parse(FPDIV_OK, &[FPDIV_EXP]).unwrap();
+    // A float function uses the float timeout; uninterpreting the divide makes
+    // this prove in well under a minute, but the 20s float default is too tight
+    // on a slow runner, so give it the same generous cap as `kani_timeout`.
+    let mut o = opts();
+    o.float_kani_timeout = o.kani_timeout;
+    let outcome = check(&old, &new, &o);
+    assert!(
+        matches!(outcome.status, Status::Proved { .. }),
+        "expected Proved, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn fp_division_catches_swapped_operands() {
+    let old = FnUnit::parse(FPDIV_OLD, &[FPDIV_EXP]).unwrap();
+    let new = FnUnit::parse(FPDIV_BAD, &[FPDIV_EXP]).unwrap();
+    let mut o = opts();
+    o.float_kani_timeout = o.kani_timeout;
+    let outcome = check(&old, &new, &o);
+    // Soundness: uninterpreting division must not turn a real difference into a
+    // proof. Swapped operands give a different oracle key, so the proof fails.
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a swapped-operand division was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
 // A flexible array member typed through an alias (`data: [Ch; 0]`, `Ch = u8`),
 // libxml2's `_xmlDictStrings.array: [xmlChar; 0]` shape. The element is resolved
 // through aliases before the scalar check, so the struct builds (an empty array
