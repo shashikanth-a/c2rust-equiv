@@ -40,11 +40,22 @@ jobs:
       # catches-divergence pair for each distinct model, so a regression in any
       # model is caught. Keep this list in sync when adding a model.
       #
-      # NOTE: a few prove-direction cases are deliberately omitted because the
-      # model soundly *skips* rather than proves them today (a modelled external
-      # that returns a pointer later passed to another external — alloc/free,
-      # strdup, the variadic SAX callback). They never return a wrong answer,
-      # only "not proved"; their catch-direction partners are kept here.
+      # NOTE on the allocator models. The alloc-hook path now *proves* (the
+      # shim lives once in the shared `support` module, so both versions' hook
+      # globals hold the identical function pointer and the call sequences line
+      # up). Three prove-direction cases are still known-blocked and so run only
+      # their catch-direction (soundness) partner here — they never return a
+      # wrong answer, only "not proved":
+      #   - allocator_global_model / strdup_hook: a modelled external that
+      #     *returns a pointer* which is then dereferenced. The trace hands back
+      #     a symbolic word, not a valid allocation, so the pointee comparison
+      #     can't be discharged. Proving these needs the returned pointer to be
+      #     a fresh per-version allocation registered in the heap bijection
+      #     (sharing one allocation across the two runs would be unsound).
+      #   - variadic_sax_callback: times out under the default bound (perf, not
+      #     soundness).
+      # The catch-direction partners below confirm no wrong rewrite is ever
+      # proved for these paths.
       - name: Representative heap/algebraic Kani proofs
         run: |
           cargo test --test heap_check -- --include-ignored --exact \
@@ -68,7 +79,11 @@ jobs:
             indirect_call_catches_different_argument \
             mutex_noop_proves_equivalent_rewrite \
             mutex_noop_catches_divergence \
+            alloc_hook_proves_equivalent_rewrite \
             alloc_hook_catches_divergence \
+            allocator_global_model_catches_a_difference \
+            strdup_hook_catches_divergent_result \
+            variadic_sax_callback_catches_different_tail_argument \
             raise_error_proves_equivalent_rewrite \
             raise_error_catches_divergent_error_report \
             accessor_global_proves_equivalent_rewrite \

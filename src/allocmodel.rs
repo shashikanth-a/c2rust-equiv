@@ -69,21 +69,28 @@ pub fn is_alloc_hook_call(call: &syn::ExprCall) -> bool {
     }
 }
 
-/// The shims and the modelled-allocator `extern` block, shared by the globals.
+/// The shims and the modelled-allocator `extern` block. Emitted *once* into the
+/// shared `support` module (see [`shims_source`]), never per-unit: both
+/// versions' allocator globals point at the one `crate::support::__equiv_*`, so
+/// the two sides see an identical function-pointer value. The indirect-call
+/// model keys each trace event on that value (`f as usize`) to catch a rewrite
+/// that swaps the callback; were the shim duplicated per unit, the two copies
+/// would have different addresses and every allocator call would look like a
+/// divergent call sequence. The `__equiv_*` entry points are therefore `pub`.
 const SHIMS: &str = r#"
-unsafe extern "C" fn __equiv_malloc(n: usize) -> *mut ::core::ffi::c_void {
+pub unsafe extern "C" fn __equiv_malloc(n: usize) -> *mut ::core::ffi::c_void {
     __equiv_malloc_sym(n)
 }
-unsafe extern "C" fn __equiv_realloc(
+pub unsafe extern "C" fn __equiv_realloc(
     p: *mut ::core::ffi::c_void,
     n: usize,
 ) -> *mut ::core::ffi::c_void {
     __equiv_realloc_sym(p, n)
 }
-unsafe extern "C" fn __equiv_free(p: *mut ::core::ffi::c_void) {
+pub unsafe extern "C" fn __equiv_free(p: *mut ::core::ffi::c_void) {
     __equiv_free_sym(p)
 }
-unsafe extern "C" fn __equiv_strdup(s: *const ::core::ffi::c_char) -> *mut ::core::ffi::c_char {
+pub unsafe extern "C" fn __equiv_strdup(s: *const ::core::ffi::c_char) -> *mut ::core::ffi::c_char {
     if s.is_null() {
         return ::core::ptr::null_mut();
     }
@@ -116,16 +123,16 @@ extern "C" {
 /// spelled out, so it doesn't depend on those aliases being in the unit.
 fn global_def(name: &str) -> &'static str {
     match name {
-        "xmlMalloc" => "static mut xmlMalloc: Option<unsafe extern \"C\" fn(usize) -> *mut ::core::ffi::c_void> = Some(__equiv_malloc);",
-        "xmlMallocAtomic" => "static mut xmlMallocAtomic: Option<unsafe extern \"C\" fn(usize) -> *mut ::core::ffi::c_void> = Some(__equiv_malloc);",
-        "xmlRealloc" => "static mut xmlRealloc: Option<unsafe extern \"C\" fn(*mut ::core::ffi::c_void, usize) -> *mut ::core::ffi::c_void> = Some(__equiv_realloc);",
-        "xmlFree" => "static mut xmlFree: Option<unsafe extern \"C\" fn(*mut ::core::ffi::c_void)> = Some(__equiv_free);",
+        "xmlMalloc" => "static mut xmlMalloc: Option<unsafe extern \"C\" fn(usize) -> *mut ::core::ffi::c_void> = Some(crate::support::__equiv_malloc);",
+        "xmlMallocAtomic" => "static mut xmlMallocAtomic: Option<unsafe extern \"C\" fn(usize) -> *mut ::core::ffi::c_void> = Some(crate::support::__equiv_malloc);",
+        "xmlRealloc" => "static mut xmlRealloc: Option<unsafe extern \"C\" fn(*mut ::core::ffi::c_void, usize) -> *mut ::core::ffi::c_void> = Some(crate::support::__equiv_realloc);",
+        "xmlFree" => "static mut xmlFree: Option<unsafe extern \"C\" fn(*mut ::core::ffi::c_void)> = Some(crate::support::__equiv_free);",
         // The string-duplication hook `xmlStrdupFunc`. Modelled by a native
         // allocate-and-copy shim over the NUL-terminated input (`gen_cstr`
         // guarantees termination), so both versions produce a fresh buffer with
         // identical content -- compared by correspondence + content like any
         // heap string. `xmlMemStrdup == xmlStrdup` is libxml2's default.
-        "xmlMemStrdup" => "static mut xmlMemStrdup: Option<unsafe extern \"C\" fn(*const ::core::ffi::c_char) -> *mut ::core::ffi::c_char> = Some(__equiv_strdup);",
+        "xmlMemStrdup" => "static mut xmlMemStrdup: Option<unsafe extern \"C\" fn(*const ::core::ffi::c_char) -> *mut ::core::ffi::c_char> = Some(crate::support::__equiv_strdup);",
         // A non-null sentinel stream identity, the same in both versions. Never
         // dereferenced (every I/O call on it is a modelled trace); a function
         // that checks `!is_null()` sees the same answer in both.
@@ -166,12 +173,42 @@ pub fn inject(items: &mut Vec<syn::Item>) {
         }
     }
     items.retain(|it| !matches!(it, syn::Item::ForeignMod(m) if m.items.is_empty()));
-    for item in syn::parse_file(SHIMS).expect("shims parse").items {
-        items.push(item);
-    }
+    // The `__equiv_*` shims live once in the shared `support` module (emitted by
+    // [`shims_source`]); the per-unit defs reference them, so both versions'
+    // globals hold the identical function-pointer value. Only the globals
+    // themselves are injected here.
     for name in names {
         items.push(syn::parse_str(global_def(name)).expect("global def parses"));
     }
+}
+
+/// The allocator globals whose definition points at a `__equiv_*` shim (as
+/// opposed to the `__std*p` sentinels, which are plain data statics needing no
+/// shim). When any of these is used, [`shims_source`] must be emitted into the
+/// shared `support` module.
+const SHIM_GLOBALS: &[&str] = &[
+    "xmlMalloc",
+    "xmlMallocAtomic",
+    "xmlRealloc",
+    "xmlFree",
+    "xmlMemStrdup",
+];
+
+/// Whether `items` reference any allocator global that routes to a shim, so the
+/// scratch crate must carry [`shims_source`] in its `support` module.
+pub fn needs_shims(items: &[syn::Item]) -> bool {
+    let mut used = Referenced::default();
+    for item in items {
+        used.visit_item(item);
+    }
+    SHIM_GLOBALS.iter().any(|g| used.0.contains(*g))
+}
+
+/// The `__equiv_*` allocator shims and their `extern` block, to append once to
+/// the shared `support` module. Both units' allocator globals point at these,
+/// so the function-pointer value is identical across the two versions.
+pub fn shims_source() -> &'static str {
+    SHIMS
 }
 
 /// Collects which allocator-global names appear as path identifiers.
@@ -197,22 +234,37 @@ mod tests {
     }
 
     #[test]
-    fn injects_only_referenced_globals_with_shims() {
+    fn injects_only_referenced_globals_pointing_at_shared_shims() {
         let mut it = items(
             "pub unsafe fn f() -> *mut u8 { \
                xmlMalloc.expect(\"\")(8) as *mut u8 \
              }",
         );
+        assert!(needs_shims(&it));
         inject(&mut it);
         let src = it
             .iter()
             .map(|i| i.to_token_stream().to_string())
             .collect::<String>();
         assert!(src.contains("static mut xmlMalloc"));
-        assert!(src.contains("fn __equiv_malloc"));
-        assert!(src.contains("link_name = \"malloc\""));
+        // The global points at the shared shim; the shim itself is NOT
+        // duplicated into the unit (that would give the two versions distinct
+        // addresses and so a spurious divergent call sequence).
+        assert!(src.contains("crate :: support :: __equiv_malloc"));
+        assert!(!src.contains("__equiv_malloc_sym"));
+        assert!(!src.contains("link_name"));
         // Unreferenced globals are not defined.
         assert!(!src.contains("static mut xmlFree"));
+    }
+
+    #[test]
+    fn shared_shims_source_has_the_entry_points() {
+        let s = shims_source();
+        assert!(s.contains("pub unsafe extern \"C\" fn __equiv_malloc"));
+        assert!(s.contains("pub unsafe extern \"C\" fn __equiv_free"));
+        assert!(s.contains("pub unsafe extern \"C\" fn __equiv_realloc"));
+        assert!(s.contains("pub unsafe extern \"C\" fn __equiv_strdup"));
+        assert!(s.contains("link_name = \"malloc\""));
     }
 
     #[test]
@@ -222,14 +274,22 @@ mod tests {
                xmlMemStrdup.expect(\"\")(s) \
              }",
         );
+        assert!(needs_shims(&it));
         inject(&mut it);
         let src = it
             .iter()
             .map(|i| i.to_token_stream().to_string())
             .collect::<String>();
         assert!(src.contains("static mut xmlMemStrdup"));
-        assert!(src.contains("fn __equiv_strdup"));
+        assert!(src.contains("crate :: support :: __equiv_strdup"));
         assert!(!src.contains("static mut xmlMalloc :"));
+    }
+
+    #[test]
+    fn sentinel_streams_need_no_shims() {
+        // `__stderrp` is a plain data sentinel, not a shim-backed hook.
+        let it = items("pub unsafe fn f() -> *mut ::core::ffi::c_void { __stderrp }");
+        assert!(!needs_shims(&it));
     }
 
     #[test]

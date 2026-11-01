@@ -89,7 +89,17 @@ pub fn write_heap(
     fs::write(dir.join("Cargo.toml"), cargo_toml(edition))?;
     fs::write(dir.join(OLD_FILE), module_source(old, true))?;
     fs::write(dir.join(NEW_FILE), module_source(new, true))?;
-    fs::write(dir.join("src/support.rs"), HEAP_SUPPORT)?;
+    // The allocator-hook shims live once in the shared `support` module so both
+    // versions' globals point at the same function (identical address), kept out
+    // of the per-unit modules where two copies would look like divergent call
+    // sequences. Emitted only when an allocator hook is actually used.
+    let mut support = HEAP_SUPPORT.to_owned();
+    if crate::allocmodel::needs_shims(&old.items()) || crate::allocmodel::needs_shims(&new.items())
+    {
+        support.push('\n');
+        support.push_str(crate::allocmodel::shims_source());
+    }
+    fs::write(dir.join("src/support.rs"), support)?;
     fs::write(
         dir.join("src/lib.rs"),
         heap_lib_source(old, new, shapes, generated, unwind),

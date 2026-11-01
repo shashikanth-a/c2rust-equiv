@@ -1874,8 +1874,15 @@ pub unsafe fn mk(v: i32) -> *mut i32 {
 }
 "#;
 
+// KNOWN-BLOCKED (aspirational): `mk` returns the allocated pointer, so the
+// harness compares pointees with `same_cell`. The modelled `xmlMalloc` hands
+// back a symbolic word rather than a valid allocation, so that dereference
+// can't be discharged and the tool soundly *skips* instead of proving. Flip to
+// asserting `Proved` (and add to the CI subset) once a pointer-returning
+// external yields a fresh per-version allocation registered in the heap
+// bijection. The catch-direction partner below already runs in CI.
 #[test]
-#[ignore = "requires `cargo kani` on PATH; slow"]
+#[ignore = "known-blocked: pointer-returning external not yet a valid allocation; see comment"]
 fn allocator_global_model_proves_equivalent_rewrite() {
     let old = FnUnit::parse(ALLOC_OLD, &[]).unwrap();
     let new = FnUnit::parse(ALLOC_OK, &[]).unwrap();
@@ -2297,8 +2304,12 @@ pub unsafe fn run(c: *mut Ctxt, msg: *const core::ffi::c_char) {
 }
 "#;
 
+// KNOWN-BLOCKED (perf, not soundness): this proof times out under the default
+// bound rather than failing. Left out of the CI subset for runtime; the
+// catch-direction partner (which finishes) runs there instead. Revisit if the
+// variadic-callback harness is made cheaper.
 #[test]
-#[ignore = "requires `cargo kani` on PATH; slow"]
+#[ignore = "known-blocked: times out under default bound (perf); see comment"]
 fn variadic_sax_callback_proves_equivalent_rewrite() {
     let old = FnUnit::parse(SV_OLD, SV_DEFS).unwrap();
     let new = FnUnit::parse(SV_OK, SV_DEFS).unwrap();
@@ -3104,8 +3115,13 @@ fn strdup_hook_is_in_heap_scope() {
     );
 }
 
+// KNOWN-BLOCKED (aspirational): same cause as `allocator_global_model` — the
+// modelled `xmlMemStrdup` returns a pointer whose pointee is then compared, but
+// the result is a symbolic word, not a valid allocation (Kani: "pointer to
+// unallocated memory"). Flip to `Proved` once pointer-returning externals
+// allocate a real per-version buffer. The catch-direction partner runs in CI.
 #[test]
-#[ignore = "requires `cargo kani` on PATH; slow"]
+#[ignore = "known-blocked: pointer-returning external not yet a valid allocation; see comment"]
 fn strdup_hook_proves_equivalent_rewrite() {
     let old = FnUnit::parse(STRDUP_OLD, &[]).unwrap();
     let new = FnUnit::parse(STRDUP_OK, &[]).unwrap();
