@@ -260,25 +260,28 @@ The SQLite crate was only transpiled for this evaluation, not built.
 **Heap-path proof rate (experimental, one crate).** Building the harness is not
 the same as proving the function. To measure the gap, the checker was run on
 genann against an identical copy of each eligible function — the simplest
-equivalent rewrite — with a 30-second Kani timeout and an unwinding bound of 8.
-Of the 12 `genann.rs` library functions (the `build.rs` script and the `#[test]`
-harnesses are excluded):
+equivalent rewrite — with a 120-second Kani timeout and an unwinding bound of 8,
+on an unloaded machine (parallel runs starve the solver and inflate the
+timeouts). Of the 12 `genann.rs` library functions (the `build.rs` script and
+the `#[test]` harnesses are excluded):
 
-| Verdict | Count | Median check time |
-|---|---|---|
-| proved (algebraic or bounded) | 2 | — |
-| timed out (unproved, would fall back to testing) | 9 | — |
-| skipped (sound, undecided) | 1 | — |
-| counterexample | 0 | — |
-| **all 12** | | **~20 s** (timeout-dominated) |
+| Verdict | Count |
+|---|---|
+| proved (algebraic or bounded) | 2 |
+| exceeded the unwinding bound (a loop needs more than 8 iterations) | 2 |
+| timed out at 120 s | 8 |
+| counterexample | 0 |
+| **total** | **12** |
 
-Only the small scalar activation functions (`genann_act_linear`,
-`genann_act_threshold`) prove, one of them by the algebraic backend in 0.2 s.
-The loop- and float-heavy network functions (`genann_run`, `genann_train`,
-`genann_init`, `genann_read`, …) all exhaust the 30-second bound; they would
-need a larger timeout and unwinding to prove, as the SQLite loop above did at
-300 s. So on this crate the 12 functions the harness builds for reduce to 2
-actually proved. Eligibility is the reach of the method, not a verification
+Only the small scalar activation functions prove: `genann_act_linear` by the
+algebraic backend in 0.2 s, `genann_act_threshold` bounded in ~2 s. The loop-
+and float-heavy network functions (`genann_run`, `genann_train`, `genann_init`,
+`genann_read`, …) loop over a runtime-sized network, which bounded model
+checking cannot discharge: eight exhaust the 120-second solver budget and two
+hit the unwinding bound. A larger timeout and unwinding would prove a few more,
+as the SQLite loop above did at 300 s, but the genuinely unbounded loops would
+still not close. So on this crate the 12 functions the harness builds for reduce
+to 2 actually proved. Eligibility is the reach of the method, not a verification
 count — read the next table accordingly.
 
 **How far the heap path reaches (experimental).** The table below counts, per
