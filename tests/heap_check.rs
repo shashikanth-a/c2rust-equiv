@@ -2783,12 +2783,13 @@ pub unsafe fn warn(p: *const i32) -> i32 {
 }
 "#;
 
-// Divergent: reports a different message, which the trace must catch.
+// Divergent: reports a different message (a non-null format string instead of
+// a null one), which the trace compares by content and must catch.
 const PERR_BAD: &str = r#"
 pub unsafe fn warn(p: *const i32) -> i32 {
     if p.is_null() { return -1; }
     let v = *p;
-    xmlParserError(core::ptr::null_mut(), core::ptr::null::<core::ffi::c_char>());
+    xmlParserError(core::ptr::null_mut(), b"divergent\0".as_ptr() as *const core::ffi::c_char);
     v
 }
 "#;

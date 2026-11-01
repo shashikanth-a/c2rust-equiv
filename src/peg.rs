@@ -1,4 +1,4 @@
-//! Subsystem B -- equality saturation over Program Expression Graphs (Tate et
+//! Equality saturation over Program Expression Graphs (Tate et
 //! al.'s PEG / Peggy), a second backend independent of Kani and of any
 //! environment model. Two functions are equivalent when their translated
 //! expressions land in the same e-class after saturating a set of

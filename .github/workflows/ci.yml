@@ -31,7 +31,54 @@ jobs:
       # The output parser is tested against this version.
       - run: cargo install --locked kani-verifier --version 0.68.0
       - run: cargo kani setup
+      # Non-ignored tests (fast; the heap Kani tests self-skip without Kani but
+      # are #[ignore]d regardless, so they don't run here).
       - run: cargo test
+      # The heap/algebraic Kani tests are #[ignore]d because each runs a real
+      # Kani proof and is slow; running all ~118 on every push is impractical
+      # (~7 min). Instead run a representative proves-equivalent +
+      # catches-divergence pair for each distinct model, so a regression in any
+      # model is caught. Keep this list in sync when adding a model.
+      #
+      # NOTE: a few prove-direction cases are deliberately omitted because the
+      # model soundly *skips* rather than proves them today (a modelled external
+      # that returns a pointer later passed to another external — alloc/free,
+      # strdup, the variadic SAX callback). They never return a wrong answer,
+      # only "not proved"; their catch-direction partners are kept here.
+      - name: Representative heap/algebraic Kani proofs
+        run: |
+          cargo test --test heap_check -- --include-ignored --exact \
+            heap_path_proves_equivalent_rewrite \
+            heap_path_does_not_prove_a_wrong_rewrite \
+            c_string_path_proves_equivalent_rewrite \
+            c_string_path_does_not_prove_a_wrong_rewrite \
+            tagged_union_path_proves_equivalent_rewrite \
+            tagged_union_path_does_not_prove_a_wrong_rewrite \
+            variadic_printf_proves_equivalent_rewrite \
+            variadic_printf_catches_different_argument \
+            external_trace_proves_equivalent_rewrite \
+            external_trace_catches_reordered_side_effects \
+            scalar_global_side_effect_proves_equivalent_rewrite \
+            scalar_global_side_effect_catches_divergence \
+            opaque_foreign_type_proves_equivalent_rewrite \
+            opaque_foreign_type_catches_divergence \
+            goto_dispatch_local_enum_proves_equivalent_rewrite \
+            goto_dispatch_local_enum_catches_divergence \
+            indirect_call_proves_equivalent_rewrite \
+            indirect_call_catches_different_argument \
+            mutex_noop_proves_equivalent_rewrite \
+            mutex_noop_catches_divergence \
+            alloc_hook_catches_divergence \
+            raise_error_proves_equivalent_rewrite \
+            raise_error_catches_divergent_error_report \
+            accessor_global_proves_equivalent_rewrite \
+            accessor_global_catches_divergent_write \
+            fn_ptr_arg_proves_equivalent_rewrite \
+            fn_ptr_arg_catches_different_argument \
+            fn_ptr_passed_to_external_proves_equivalent_rewrite \
+            fn_ptr_passed_to_external_catches_a_dropped_callback \
+            ctx_printer_proves_equivalent_rewrite \
+            ctx_printer_catches_divergent_message
 
   specs:
     runs-on: ubuntu-latest

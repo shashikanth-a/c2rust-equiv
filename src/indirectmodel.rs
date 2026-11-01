@@ -1,4 +1,4 @@
-//! Modelling indirect (function-pointer) calls on the heap path (wall 3).
+//! Modelling indirect (function-pointer) calls on the heap path.
 //!
 //! c2rust emits a call through a nullable callback as
 //! `(<receiver>).<field>.expect("non-null function pointer")(args)` (or

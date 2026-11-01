@@ -11,6 +11,12 @@ use quote::ToTokens;
 
 /// Check that functions in a rewritten crate behave the same as in the original.
 ///
+/// The scalar path (integer/float/bool functions) is stable. The heap path (for
+/// functions with pointers, structs, globals, foreign calls or I/O) and the
+/// algebraic equality-saturation backend are EXPERIMENTAL: they are sound by
+/// construction but cover a growing fragment, and their verdicts should be
+/// treated accordingly.
+///
 /// Exit codes: 0 if every checked function was proved or tested (or skipped),
 /// 1 if any function has a counterexample, 2 on a tool error.
 #[derive(Parser)]
@@ -129,7 +135,7 @@ fn run(cli: &Cli) -> Result<u8, Box<dyn std::error::Error>> {
 
     // Unchanged, summarisable callees within `old` may be replaced by a shim
     // instead of inlined, which lifts functions blocked only by an out-of-scope
-    // callee into heap scope (Subsystem A). Eligibility uses old-vs-old: a
+    // callee into heap scope. Eligibility uses old-vs-old: a
     // callee identical to itself is trivially equivalent, so its shim is sound.
     let elig_summaries = c2rust_equiv::compose::summary_catalog(&old, &old);
     let total_functions = old.functions().count();
@@ -177,7 +183,7 @@ fn run(cli: &Cli) -> Result<u8, Box<dyn std::error::Error>> {
 
     // For the real checks, a callee may be summarised when it is unchanged
     // between old and new (token-identical, in the base catalog) or has itself
-    // been proven equivalent. Subsystem A phase A4 realises the latter with a
+    // been proven equivalent. The driver realises the latter with a
     // bottom-up fixpoint: after each pass, every function newly proved
     // equivalent is added to the catalog as a summary shim, so a caller blocked
     // only by that (changed) callee can be re-checked with it summarised

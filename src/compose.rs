@@ -1,4 +1,4 @@
-//! Compositional driver (Subsystem A, phase A3): decide which callees can be
+//! Compositional driver: decide which callees can be
 //! replaced by a summary when checking a function pair, so the caller needn't
 //! inline them.
 //!
@@ -7,7 +7,7 @@
 //! **token-identical** (an unchanged helper): equivalence is immediate, no
 //! proof needed. The bottom-up extension -- summarise a changed callee once it
 //! has itself been proven equivalent -- layers on top via a proof cache
-//! (phase A4); this builds the catalog of the always-safe unchanged ones.
+//! on top via that cache; this builds the catalog of the always-safe unchanged ones.
 //!
 //! A callee is summarised only if it is also *summarisable* (its write set is
 //! fully havocable -- see [`crate::summary`]); otherwise it is inlined.
@@ -82,7 +82,7 @@ pub fn summary_catalog_with(
 }
 
 /// The summary shim for one callee `name` defined in `old`, if it is
-/// summarisable. Used by the check driver (phase A4) to add a callee that has
+/// summarisable. Used by the check driver to add a callee that has
 /// just been proven equivalent to the summary catalog, so its callers can
 /// replace it with the shim instead of inlining it.
 pub fn proven_shim(old: &CrateIndex, name: &str) -> Option<syn::ItemFn> {

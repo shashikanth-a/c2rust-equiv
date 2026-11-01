@@ -114,7 +114,7 @@ impl Status {
     /// A one-line summary, e.g. `proved(bounded, unwind=8)`.
     pub fn label(&self) -> String {
         match self {
-            // An algebraic equality-saturation proof (Subsystem B) is unbounded
+            // An algebraic equality-saturation proof is unbounded
             // and holds for all inputs; a Kani proof is bounded by the unwind.
             Status::Proved {
                 bounded: false,
@@ -183,7 +183,7 @@ pub fn check(old: &FnUnit, new: &FnUnit, opts: &Options) -> Outcome {
     let start = Instant::now();
     let mut kani_ms = None;
     let mut test_ms = None;
-    // Subsystem B: try an environment-independent algebraic proof by equality
+    // Try an environment-independent algebraic proof by equality
     // saturation first (no Kani, no environment model, and unbounded -- it holds
     // for all inputs, not only within an unwinding bound). It is sound: a
     // `Some(true)` is a real proof; anything else falls through to the Kani /

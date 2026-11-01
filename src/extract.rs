@@ -88,9 +88,9 @@ pub fn extract_heap(index: &CrateIndex, entry: usize) -> Result<FnUnit, Skip> {
 }
 
 /// Like [`extract_heap`], but replacing each callee named in `summaries` with
-/// its summary shim instead of inlining the callee's body (Subsystem A, phase
-/// A3b). A summarised callee's call sites are kept as bare calls, and the
-/// referenced shims are appended to the unit's callees. The catalog comes from
+/// its summary shim instead of inlining the callee's body. A summarised
+/// callee's call sites are kept as bare calls, and the referenced shims are
+/// appended to the unit's callees. The catalog comes from
 /// [`crate::compose::summary_catalog`], which only admits callees whose two
 /// versions are equivalent and whose write set is fully havocable, so the
 /// substitution is sound.
@@ -105,9 +105,9 @@ pub fn extract_heap_composed(
 /// Research (not used by the tool): the full set of heap-path extraction
 /// blockers a function hits across its whole reachable closure, as `(category,
 /// detail)` pairs -- every skip, not just the first, exploring every reachable
-/// item without short-circuiting. Drives blocker-set / wall-combination
-/// analysis so levers can target the walls whose *joint* removal flips the most
-/// functions, rather than one-at-a-time first-blocker guessing.
+/// item without short-circuiting. Drives blocker-set analysis so fixes can
+/// target the blockers whose *joint* removal unblocks the most functions,
+/// rather than one-at-a-time first-blocker guessing.
 pub fn all_blockers(
     index: &CrateIndex,
     entry: usize,
@@ -543,7 +543,7 @@ struct Resolver<'a> {
     /// unit (so the generator can build them) instead of rejecting them, and
     /// the analyzer allows raw pointers. The scalar path leaves this off.
     heap: bool,
-    /// Callees to replace by a summary shim rather than inline (phase A3b).
+    /// Callees to replace by a summary shim rather than inline .
     /// A `Kind::Fn` whose name is here resolves to a bare `External` call; the
     /// shim definition is appended to the unit afterwards.
     summaries: &'a BTreeSet<String>,

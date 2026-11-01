@@ -71,7 +71,7 @@ For every input, both versions return the same value, or both panic.
    then random inputs from a recorded seed. A pass is reported as
    `tested(n_cases, seed)`: no difference was found, which is not a proof.
 
-### The heap path
+### The heap path — experimental
 
 Functions with pointer or struct arguments, or that touch globals, foreign
 calls or I/O, go through a second path. Instead of only scalar inputs, the
@@ -118,6 +118,40 @@ catches a divergent one.
 Each function gets one status: `proved(bounded, unwind=N)`,
 `counterexample(inputs, old_out, new_out)`, `tested(n_cases, seed)`,
 `skipped(reason)` or `error(reason)`.
+
+### The algebraic path (equality saturation) — experimental
+
+Before Kani runs, a function pair is tried with a second, independent backend:
+equality saturation over Program Expression Graphs (Tate et al.'s PEG / Peggy),
+using the [`egg`](https://github.com/egraphs-good/egg) e-graph library. Both
+bodies are translated to expression nodes and placed in one e-graph, a set of
+**semantics-preserving** rewrite rules is saturated, and the two are equivalent
+if they land in the same e-class. Unlike Kani this is **unbounded**: a proof
+holds for all inputs, not only within an unwinding bound, and it needs no
+environment model.
+
+It is sound but deliberately incomplete:
+
+- A proof is reported only as `proved(unbounded)`. Anything the backend cannot
+  decide falls through to the Kani / testing path; it never reports a
+  difference, so a "no" only means "not proved here".
+- **Signature gate.** It is attempted only when both functions take and return
+  exactly the same types. Equal bodies imply equal behaviour only then — an
+  identity on `i32` and one on `i64` have equal expression graphs but different
+  behaviour — so a signature change is left to the checks below. Argument
+  *renames* are fine; the gate compares types, not names.
+- **Overflow is a panic** here too, so for the checked operators (`+`, `-`,
+  `*`, unary `-`) only rules that preserve both value *and* where an overflow
+  can occur are kept: commutativity of `+`/`*`, `x+0`, `x*1`, `x*0`, `x-x`, and
+  `x*2 = x+x`. Associativity, distributivity and `a-b = a+(-b)` are **excluded**
+  for them, because they can move an overflow. c2rust's `wrapping_*` operators
+  never panic (two's-complement modular arithmetic, a commutative ring), so for
+  those the **full ring axioms** are kept — associativity, distributivity,
+  negation — as a distinct node kind that never equates with a checked operator.
+- **Fragment.** Straight-line integer functions: `let` bindings and a final or
+  `return` expression over those operators, integer literals and parameters.
+  Loops, pointers, calls and control flow are out of the fragment and return
+  "not decided" rather than a guess.
 
 ## Design specs
 
@@ -176,28 +210,30 @@ Everything else is `skipped`, with the reason. Still out of scope:
 
 On C2Rust output, on an M-series Mac with Kani 0.68.
 
-**How many functions are in scope (eligibility).** With the heap path, "in
-scope" means the equivalence harness builds and the function is modelled
-soundly; whether Kani then proves it (versus timing out or falling back to
-testing) is separate. Measured per crate:
+**Catching real changes — the headline result.** To check that the tool catches
+behavioural changes, and that bounded model checking earns its keep over testing
+alone, one small mutation was applied to each SQLite function that had an obvious
+place for one (`<` to `<=`, a constant plus one, `wrapping_add` to `+`, `&` to
+`|`, and so on):
 
-| Crate | Functions | In scope | Coverage |
-|---|---|---|---|
-| lil | 162 | 159 | 98.1% |
-| genann | 25 | 24 | 96.0% |
-| libxml2 | 4,867 | 3,890 | 79.9% |
-| json-c | 265 | 217 | 81.9% |
-| tmux | 1,389 | 651 | 46.9% |
+| Mutants | Method | Counterexamples | Tested only | Proved |
+|---|---|---|---|---|
+| 25 | Kani, then testing | **24** (all by Kani) | 0 | 1 |
+| 25 | Testing only (`--no-kani`) | **21** | 4 | 0 |
 
-Small, algorithmic crates approach their ceiling. The large systems crates sit
-lower because their remaining functions are tightly co-blocked (a foreign call,
-a global and an indirect dispatch at once) or depend on effects that can't be
-soundly modelled (filesystem syscalls, FILE-buffer internals); tmux is lowest
-because most of it is built on libevent's opaque event-loop machinery and its
-observable behaviour is largely the external interaction itself.
+Kani finds 24 of the 25; testing alone finds only 21, missing three real bugs
+that each change the result for a single boundary input, such as `allowedOp(58)`
+when `>` becomes `>=`. The one "proved" mutant doesn't change behaviour (it turns
+`n.wrapping_add(8)` into `n + 8` in a branch where `n` is at most 9). Some
+counterexamples:
 
-**LLM rewrites.** The next two experiments check that the verdicts are sound —
-that `proved` means equivalent and a real change is caught. They were run on
+- `walHash(0)` returns 0, but the mutant returns 8191.
+- `sqlite3RealToI64(-9.223372036854775e18)` returns -9223372036854774784, but
+  the mutant returns `i64::MIN`.
+- `sqlite3HexToInt(i32::MIN)` returns 0, but the mutant panics on overflow.
+
+**LLM rewrites.** The next two experiments check the other direction — that
+`proved` means equivalent on real, idiomatic rewrites. They were run on
 the scalar path over C2Rust's C unit tests and a transpiled SQLite 3.53.4
 (timings for runs without cache hits). An LLM was asked to rewrite every
 in-scope function into more idiomatic Rust, keeping its signature and
@@ -219,27 +255,54 @@ With a 300-second timeout and an unwinding bound of 12, the loop is proved in
 The skip uses an unstable intrinsic. A second run with `--cache` hit the cache
 for every checked function, and took 5 seconds instead of 2 minutes 16.
 
-**Planted bugs.** To check that the tool catches real changes, one small
-mutation was applied to each SQLite function that had an obvious place for one
-(`<` to `<=`, a constant plus one, `wrapping_add` to `+`, `&` to `|`, and so on):
-
-| Mutants | Method | Counterexamples | Tested only | Proved |
-|---|---|---|---|---|
-| 25 | Kani, then testing | 24 (all by Kani) | 0 | 1 |
-| 25 | Testing only (`--no-kani`) | 21 | 4 | 0 |
-
-Testing alone misses three real bugs, each of which changes the result for a
-single boundary input, such as `allowedOp(58)` when `>` becomes `>=`.
-
-The proved one doesn't change behaviour: it turns `n.wrapping_add(8)` into
-`n + 8` in a branch where `n` is at most 9. Some counterexamples:
-
-- `walHash(0)` returns 0, but the mutant returns 8191.
-- `sqlite3RealToI64(-9.223372036854775e18)` returns -9223372036854774784, but
-  the mutant returns `i64::MIN`.
-- `sqlite3HexToInt(i32::MIN)` returns 0, but the mutant panics on overflow.
-
 The SQLite crate was only transpiled for this evaluation, not built.
+
+**Heap-path proof rate (experimental, one crate).** Building the harness is not
+the same as proving the function. To measure the gap, the checker was run on
+genann against an identical copy of each eligible function — the simplest
+equivalent rewrite — with a 30-second Kani timeout and an unwinding bound of 8.
+Of the 12 `genann.rs` library functions (the `build.rs` script and the `#[test]`
+harnesses are excluded):
+
+| Verdict | Count | Median check time |
+|---|---|---|
+| proved (algebraic or bounded) | 2 | — |
+| timed out (unproved, would fall back to testing) | 9 | — |
+| skipped (sound, undecided) | 1 | — |
+| counterexample | 0 | — |
+| **all 12** | | **~20 s** (timeout-dominated) |
+
+Only the small scalar activation functions (`genann_act_linear`,
+`genann_act_threshold`) prove, one of them by the algebraic backend in 0.2 s.
+The loop- and float-heavy network functions (`genann_run`, `genann_train`,
+`genann_init`, `genann_read`, …) all exhaust the 30-second bound; they would
+need a larger timeout and unwinding to prove, as the SQLite loop above did at
+300 s. So on this crate the 12 functions the harness builds for reduce to 2
+actually proved. Eligibility is the reach of the method, not a verification
+count — read the next table accordingly.
+
+**How far the heap path reaches (experimental).** The table below counts, per
+crate, the functions the equivalence **harness builds** for — the function is in
+the supported fragment and every effect it reaches is modelled soundly. This is
+**not** a count of functions proved equivalent: whether Kani then proves a built
+function (versus timing out or falling back to testing) is a separate question,
+measured above only for the scalar path. Read it as reachability of the method,
+not a verification result.
+
+| Crate | Functions | Harness builds | % of functions |
+|---|---|---|---|
+| lil | 162 | 159 | 98.1% |
+| genann | 25 | 24 | 96.0% |
+| libxml2 | 4,867 | 3,890 | 79.9% |
+| json-c | 265 | 217 | 81.9% |
+| tmux | 1,389 | 651 | 46.9% |
+
+Small, algorithmic crates approach their ceiling. The large systems crates sit
+lower because their remaining functions are tightly co-blocked (a foreign call,
+a global and an indirect dispatch at once) or depend on effects that can't be
+soundly modelled (filesystem syscalls, FILE-buffer internals); tmux is lowest
+because most of it is built on libevent's opaque event-loop machinery and its
+observable behaviour is largely the external interaction itself.
 
 ## License
 

@@ -1,7 +1,7 @@
 //! Mod/ref (frame) analysis: a conservative set of locations a function may
 //! write that are visible to its caller -- its `assigns` set. This is the
-//! soundness crux of compositional summaries (Subsystem A) and the memory
-//! model of the graph backend (Subsystem B): a callee can only be replaced by
+//! soundness crux of compositional summaries and the memory
+//! model of the algebraic backend: a callee can only be replaced by
 //! a havoc of this set if the set covers *every* caller-visible write it makes
 //! (CBMC/Kani function-contract `assigns` semantics). So the analysis
 //! over-approximates: anything it can't classify makes the whole set `Top`

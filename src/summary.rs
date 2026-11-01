@@ -1,4 +1,4 @@
-//! Callee summaries (Subsystem A, phase A2): turn a callee that has been shown
+//! Callee summaries: turn a callee that has been shown
 //! equivalent (or is unchanged) into a shim that stands in for it at call
 //! sites, so the caller needn't inline its body. A summary realises the
 //! sound "replace a call with a havoc of its `assigns` set" rule (CBMC/Kani
@@ -53,7 +53,7 @@ pub fn summarize(name: &str, sig: &syn::Signature, ws: &WriteSet) -> Option<syn:
     let WriteSet::Known { params, globals } = ws else {
         return None;
     };
-    // Globals in the write set need type-aware havoc; deferred (phase A2b), so
+    // Globals in the write set need type-aware havoc; deferred, so
     // a global-writing callee isn't summarised yet.
     if !globals.is_empty() {
         return None;
