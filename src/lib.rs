@@ -17,6 +17,7 @@ mod globalaccessmodel;
 pub mod heapgen;
 mod indirectmodel;
 pub mod kani;
+mod looprel;
 mod modref;
 mod mutexmodel;
 pub mod peg;
