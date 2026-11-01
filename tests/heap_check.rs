@@ -59,7 +59,12 @@ fn opts_unwind(unwind: u32) -> Options {
     let dir = tempfile::tempdir().unwrap().keep();
     let mut o = Options::new(dir);
     o.unwind = unwind;
-    o.kani_timeout = Duration::from_secs(120);
+    // Generous cap: these proofs run comfortably in well under a minute on a
+    // fast uncontended core, but a slow CI runner is several times slower, and
+    // the cap must be headroom over that -- not a bound a correct proof can
+    // brush against -- so a heavy-but-valid proof is never reported as a
+    // spurious timeout. (CI also runs them single-threaded; see ci.yml.)
+    o.kani_timeout = Duration::from_secs(240);
     o
 }
 

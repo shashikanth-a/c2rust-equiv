@@ -48,9 +48,13 @@ jobs:
       # comparison is discharged. The variadic-SAX *prove* case is omitted here
       # only for runtime (~2 min); it proves in the full `--include-ignored`
       # suite, and its catch-direction partner runs below.
+      # Run single-threaded: each Kani proof is CPU-bound, and running several
+      # at once on a small CI runner starves them, so a heavy-but-valid proof
+      # can blow its timeout and spuriously "fail". One at a time each gets a
+      # full core and finishes well inside the (generous) per-proof cap.
       - name: Representative heap/algebraic Kani proofs
         run: |
-          cargo test --test heap_check -- --include-ignored --exact \
+          cargo test --test heap_check -- --test-threads=1 --include-ignored --exact \
             heap_path_proves_equivalent_rewrite \
             heap_path_does_not_prove_a_wrong_rewrite \
             c_string_path_proves_equivalent_rewrite \
