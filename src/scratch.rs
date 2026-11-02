@@ -340,6 +340,15 @@ fn looprel_lib_source(
             }
         }
     }
+    // Assume non-null for each pointer argument both versions unconditionally
+    // dereference before any null guard (see `looprel::nonnull_args`): the two
+    // share these statements verbatim, so both are undefined on a null argument
+    // and null is outside the equivalence domain. Without this a function that
+    // dereferences its pointer argument without a null check (e.g. a bound of
+    // `(*p).len`) would report a null dereference and decline.
+    for i in crate::looprel::nonnull_args(&old.function, plan) {
+        build += &format!("        kani::assume(!(a{i}).is_null());\n");
+    }
     let counter_ty = qualify(&plan.counter_ty, "old");
     let old_arglist = old_args.join(", ");
     let new_arglist = new_args.join(", ");

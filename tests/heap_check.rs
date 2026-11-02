@@ -4220,9 +4220,8 @@ const VEC1: &str = "pub struct Vec1 { pub data: *mut f64, pub len: i32 }";
 
 const RTBUF_OLD: &str = r#"
 pub unsafe fn fill(v: *mut Vec1) {
-    let n: i32 = if v.is_null() { 0 } else { (*v).len };
     let mut i: i32 = 0;
-    while i < n {
+    while i < (*v).len {
         *(*v).data.offset(i as isize) = i as f64 * 0.5f64;
         i += 1;
     }
@@ -4233,9 +4232,8 @@ pub unsafe fn fill(v: *mut Vec1) {
 // uninterpreted but keyed on operand bits, and the operands match).
 const RTBUF_OK: &str = r#"
 pub unsafe fn fill(v: *mut Vec1) {
-    let n: i32 = if v.is_null() { 0 } else { (*v).len };
     let mut i: i32 = 0;
-    while i < n {
+    while i < (*v).len {
         *(*v).data.offset(i as isize) = 0.5f64 * i as f64;
         i += 1;
     }
@@ -4245,9 +4243,8 @@ pub unsafe fn fill(v: *mut Vec1) {
 // Wrong value: scales by 0.6 instead of 0.5.
 const RTBUF_BAD: &str = r#"
 pub unsafe fn fill(v: *mut Vec1) {
-    let n: i32 = if v.is_null() { 0 } else { (*v).len };
     let mut i: i32 = 0;
-    while i < n {
+    while i < (*v).len {
         *(*v).data.offset(i as isize) = i as f64 * 0.6f64;
         i += 1;
     }

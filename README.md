@@ -185,13 +185,16 @@ the per-iteration check), a nested loop, a compound or non-`offset`/`add` write,
 a C-string/newtype/opaque argument, or pre-loop code that is not token-identical
 between the two versions. The detector fails closed — see `src/looprel.rs`.
 
-What it still does not clear is a function that **dereferences a pointer
-argument without a null guard** (e.g. genann's `randomize`, whose bound is
-`(*ann).total_weights`): the symbolic argument can be null, so the relational
-harness reports a null dereference and declines — the same precondition limit
-the rest of the heap path has. Discharging it needs a separate analysis that a
-pointer is unconditionally dereferenced by both versions (so assuming it
-non-null is sound), which is future work.
+A function that **dereferences a pointer argument without a null guard** (e.g.
+genann's `randomize`, whose bound is `(*ann).total_weights`) would otherwise
+report a null dereference on the symbolic argument and decline. Route B clears
+this soundly: when the bound unconditionally dereferences a pointer argument and
+neither version null-tests it, the two versions share that statement verbatim
+(the preamble and bound are token-identical), so both are undefined on a null
+argument — null is outside the equivalence domain — and the harness may assume
+the argument non-null (`looprel::nonnull_args`). A function that *does* null-test
+the pointer (handling null itself) is excluded, so a real difference on null is
+never assumed away.
 
 ## Design specs
 
@@ -319,29 +322,38 @@ the `#[test]` harnesses are excluded):
 
 | Verdict | Count |
 |---|---|
-| proved (algebraic or bounded) | 3 |
+| proved (algebraic, bounded, or relational) | 4 |
 | exceeded the unwinding bound (a loop needs more than 8 iterations) | 1 |
-| timed out at 120 s | 7 |
+| timed out at 120 s | 6 |
 | an undecidable construct, skipped | 1 |
 | counterexample | 0 |
 | **total** | **12** |
 
-Three functions prove: `genann_act_linear` by the algebraic backend in 0.2 s,
-`genann_act_threshold` bounded in ~3 s, and `genann_act_sigmoid`
-(`1.0 / (1.0 + exp(-a))`) bounded in ~37 s. The sigmoid is straight-line with no
-loop, yet it proved only once floating-point division was modelled as an
-uninterpreted operation: CBMC bit-blasts IEEE-754 division, and a single
-symbolic-`f64` divide makes even proving the function equal to an identical copy
-time out past 120 s. Modelling the divide as a deterministic function of its
-operand bits (sound for equivalence; see the floating-point limitation above)
-brings it inside the budget while still catching a rewrite that changes the
-operands.
+Four functions prove. Three are straight-line or short: `genann_act_linear` by
+the algebraic backend in 0.2 s, `genann_act_threshold` bounded in ~3 s, and
+`genann_act_sigmoid` (`1.0 / (1.0 + exp(-a))`) bounded in ~37 s. The sigmoid is
+straight-line with no loop, yet it proved only once floating-point division was
+modelled as an uninterpreted operation: CBMC bit-blasts IEEE-754 division, and a
+single symbolic-`f64` divide makes even proving the function equal to an
+identical copy time out past 120 s. Modelling the divide as a deterministic
+function of its operand bits (sound for equivalence; see the floating-point
+limitation above) brings it inside the budget while still catching a rewrite
+that changes the operands.
+
+The fourth, `genann_randomize`, is a loop over the runtime-sized `weight` buffer
+(`while i < (*ann).total_weights { *weight.offset(i) = rand()/RAND_MAX - 0.5 }`)
+— a loop bounded model checking cannot unroll. It proves in ~2.5 s by the
+relational loop path (route B), which reasons about one symbolic iteration
+without materialising the buffer. It is the one genann loop that is a flat
+map with no loop-carried state; the others below are not.
 The loop- and float-heavy network functions (`genann_run`, `genann_train`,
 `genann_init`, `genann_read`, …) loop over a runtime-sized network, which
-bounded model checking cannot discharge: seven exhaust the 120-second solver
+bounded model checking cannot discharge: six exhaust the 120-second solver
 budget, one (`genann_act_sigmoid_cached`, a 4096-entry lookup table) exceeds the
 unwinding bound, and one (`genann_free`) hits a pointer-alignment construct Kani
-can't decide. A larger timeout and unwinding would prove a few more, as the
+can't decide. These are not flat map loops — they accumulate across iterations
+or read back what they wrote — so the relational loop path does not apply. A
+larger timeout and unwinding would prove a few more, as the
 SQLite loop above did at 300 s, but the genuinely unbounded loops would still not
 close. So on this crate the 12 functions the harness builds for reduce to 3
 actually proved. Eligibility is the reach of the method, not a verification

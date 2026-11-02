@@ -528,6 +528,126 @@ pub fn plan(old: &syn::ItemFn, new: &syn::ItemFn) -> Option<Plan> {
     })
 }
 
+/// Parameter positions (into the function's argument list) that are pointers
+/// both versions **unconditionally dereference before any null guard**, so
+/// assuming them non-null is sound: `plan` requires the preamble and bound to be
+/// token-identical between the two versions, so if one is undefined on a null
+/// argument the other is too, and a null input is therefore outside the
+/// equivalence domain (nothing defined is lost by excluding it). The relational
+/// harness emits `kani::assume(!p.is_null())` for each. Analysing one version
+/// suffices because the two share these statements verbatim.
+pub fn nonnull_args(func: &syn::ItemFn, plan: &Plan) -> Vec<usize> {
+    let mut out = Vec::new();
+    for (idx, input) in func.sig.inputs.iter().enumerate() {
+        let syn::FnArg::Typed(pt) = input else {
+            continue;
+        };
+        if !matches!(&*pt.ty, syn::Type::Ptr(_)) {
+            continue;
+        }
+        if let Some(p) = pat_binding(&pt.pat) {
+            if param_requires_non_null(p, plan) {
+                out.push(idx);
+            }
+        }
+    }
+    out
+}
+
+fn param_requires_non_null(p: &syn::Ident, plan: &Plan) -> bool {
+    // If the code tests `p` against null (or even just compares it), it may
+    // handle null itself, so never assume non-null -- excluding it is the safe
+    // choice (route B simply keeps declining such a function on its null case).
+    if expr_tests_ptr(&plan.bound, p) || plan.preamble.iter().any(|s| stmt_tests_ptr(s, p)) {
+        return false;
+    }
+    // The bound is evaluated unconditionally when the loop is entered; a direct
+    // dereference of `p` there (with no branch in the bound expression) is
+    // undefined on a null `p`, so null is out of domain.
+    bound_has_direct_deref(&plan.bound, p)
+}
+
+/// Whether an expression tests a pointer `p` (an `is_null()` call on it, or any
+/// `==`/`!=` comparison mentioning it). Conservative: a false positive only
+/// *excludes* `p` from the non-null assumption, which is always safe.
+fn expr_tests_ptr(e: &syn::Expr, p: &syn::Ident) -> bool {
+    struct T<'a> {
+        p: &'a syn::Ident,
+        found: bool,
+    }
+    impl<'a, 'ast> Visit<'ast> for T<'a> {
+        fn visit_expr_method_call(&mut self, m: &'ast syn::ExprMethodCall) {
+            if m.method == "is_null" && expr_as_ident(&m.receiver).as_ref() == Some(self.p) {
+                self.found = true;
+            }
+            syn::visit::visit_expr_method_call(self, m);
+        }
+        fn visit_expr_binary(&mut self, b: &'ast syn::ExprBinary) {
+            if matches!(b.op, syn::BinOp::Eq(_) | syn::BinOp::Ne(_))
+                && (mentions_ident(&b.left, self.p) || mentions_ident(&b.right, self.p))
+            {
+                self.found = true;
+            }
+            syn::visit::visit_expr_binary(self, b);
+        }
+    }
+    let mut t = T { p, found: false };
+    t.visit_expr(e);
+    t.found
+}
+
+fn stmt_tests_ptr(s: &syn::Stmt, p: &syn::Ident) -> bool {
+    struct T<'a> {
+        p: &'a syn::Ident,
+        found: bool,
+    }
+    impl<'a, 'ast> Visit<'ast> for T<'a> {
+        fn visit_expr(&mut self, e: &'ast syn::Expr) {
+            if expr_tests_ptr(e, self.p) {
+                self.found = true;
+            }
+            syn::visit::visit_expr(self, e);
+        }
+    }
+    let mut t = T { p, found: false };
+    t.visit_stmt(s);
+    t.found
+}
+
+/// Whether the bound directly dereferences `p` with no conditional in the way:
+/// no `if`/`match` anywhere in the bound (so the dereference is unconditional
+/// whenever the bound is evaluated), and a `*p` / `(*p)...` somewhere in it.
+fn bound_has_direct_deref(bound: &syn::Expr, p: &syn::Ident) -> bool {
+    struct D<'a> {
+        p: &'a syn::Ident,
+        deref: bool,
+        conditional: bool,
+    }
+    impl<'a, 'ast> Visit<'ast> for D<'a> {
+        fn visit_expr_if(&mut self, _: &'ast syn::ExprIf) {
+            self.conditional = true;
+        }
+        fn visit_expr_match(&mut self, _: &'ast syn::ExprMatch) {
+            self.conditional = true;
+        }
+        fn visit_expr_unary(&mut self, u: &'ast syn::ExprUnary) {
+            if matches!(u.op, syn::UnOp::Deref(_))
+                && bound_root_ident(&u.expr).as_ref() == Some(self.p)
+            {
+                self.deref = true;
+            }
+            syn::visit::visit_expr_unary(self, u);
+        }
+    }
+    let mut d = D {
+        p,
+        deref: false,
+        conditional: false,
+    };
+    d.visit_expr(bound);
+    d.deref && !d.conditional
+}
+
 /// One version's pieces for a relational plan.
 struct WholeFn {
     counter: syn::Ident,
@@ -863,6 +983,43 @@ mod tests {
             plan(&f(src), &f(src)).is_none(),
             "post-loop code must decline"
         );
+    }
+
+    #[test]
+    fn nonnull_args_flags_unguarded_pointer_deref_in_bound() {
+        // A bound of `(*ann).total_weights` dereferences `ann` unconditionally
+        // and with no null guard, so `ann` (parameter 0) is required non-null.
+        let src = r#"
+            pub unsafe fn randomize(ann: *mut genann) {
+                let mut i: i32 = 0;
+                while i < (*ann).total_weights {
+                    *(*ann).weight.offset(i as isize) = 0.5f64;
+                    i += 1;
+                }
+            }
+        "#;
+        let func = f(src);
+        let p = plan(&func, &func).expect("plans");
+        assert_eq!(nonnull_args(&func, &p), vec![0]);
+    }
+
+    #[test]
+    fn nonnull_args_excludes_null_guarded_pointer() {
+        // The function tests `v` for null and computes a zero bound for it, so
+        // it is defined on null: never assume non-null.
+        let src = r#"
+            pub unsafe fn fill(v: *mut Vec1) {
+                let n: i32 = if v.is_null() { 0 } else { (*v).len };
+                let mut i: i32 = 0;
+                while i < n {
+                    *(*v).data.offset(i as isize) = 0.5f64;
+                    i += 1;
+                }
+            }
+        "#;
+        let func = f(src);
+        let p = plan(&func, &func).expect("plans");
+        assert!(nonnull_args(&func, &p).is_empty());
     }
 
     #[test]
