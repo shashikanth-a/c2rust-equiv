@@ -108,8 +108,209 @@ pub fn write_heap(
     Ok(())
 }
 
+/// Write a scratch crate for route B (relational, single-iteration loop
+/// equivalence). Like the heap crate, but each version's module also carries a
+/// generated `__looprel_iter` helper (one loop-body iteration, the counter a
+/// parameter), and old's module a `__looprel_bound` helper; the harness draws a
+/// symbolic counter in `[0, bound)`, runs one iteration of each version on
+/// corresponding heaps, and compares the heaps and modelled globals. No loop
+/// runs, so nothing unrolls and there is no unwinding wall. See `looprel`.
+#[allow(clippy::too_many_arguments)]
+pub fn write_looprel(
+    dir: &Path,
+    old: &FnUnit,
+    new: &FnUnit,
+    edition: &str,
+    unwind: u32,
+    shapes: &SigShapes,
+    generated: &str,
+    plan: &crate::looprel::Plan,
+) -> io::Result<()> {
+    fs::create_dir_all(dir.join("src"))?;
+    fs::write(dir.join("Cargo.toml"), cargo_toml(edition))?;
+    let old_extra = looprel_helper_items(&old.function, plan, &plan.old_iter_body, true);
+    let new_extra = looprel_helper_items(&new.function, plan, &plan.new_iter_body, false);
+    fs::write(dir.join(OLD_FILE), module_source_with(old, true, old_extra))?;
+    fs::write(dir.join(NEW_FILE), module_source_with(new, true, new_extra))?;
+    let mut support = HEAP_SUPPORT.to_owned();
+    if crate::allocmodel::needs_shims(&old.items()) || crate::allocmodel::needs_shims(&new.items())
+    {
+        support.push('\n');
+        support.push_str(crate::allocmodel::shims_source());
+    }
+    fs::write(dir.join("src/support.rs"), support)?;
+    fs::write(
+        dir.join("src/lib.rs"),
+        looprel_lib_source(old, shapes, generated, plan, unwind),
+    )?;
+    fs::write(dir.join("src/main.rs"), "fn main() {}\n")?;
+    Ok(())
+}
+
+/// Build the per-module route-B helpers for one version: `__looprel_iter` (the
+/// loop's preamble then one body iteration, with the counter as a parameter)
+/// and, when `with_bound`, `__looprel_bound` (the preamble then the bound
+/// expression). They reuse the original function's signature so every parameter
+/// the body reads is in scope, and live in the version's own module so its
+/// local names and types resolve.
+fn looprel_helper_items(
+    func: &syn::ItemFn,
+    plan: &crate::looprel::Plan,
+    iter_body: &[syn::Stmt],
+    with_bound: bool,
+) -> Vec<syn::Item> {
+    let counter = &plan.counter;
+    let counter_ty = &plan.counter_ty;
+
+    let mut iter_sig = func.sig.clone();
+    iter_sig.ident = syn::Ident::new("__looprel_iter", proc_macro2::Span::call_site());
+    iter_sig.output = syn::ReturnType::Default;
+    iter_sig.unsafety = Some(Default::default());
+    let counter_param: syn::FnArg = syn::parse_quote!(#counter: #counter_ty);
+    iter_sig.inputs.push(counter_param);
+    let mut iter_stmts = plan.preamble.clone();
+    iter_stmts.extend(iter_body.iter().cloned());
+    let iter_fn = syn::ItemFn {
+        attrs: vec![],
+        vis: syn::parse_quote!(pub),
+        sig: iter_sig,
+        block: Box::new(syn::Block {
+            brace_token: Default::default(),
+            stmts: iter_stmts,
+        }),
+    };
+    let mut items = vec![syn::Item::Fn(iter_fn)];
+
+    if with_bound {
+        let mut bound_sig = func.sig.clone();
+        bound_sig.ident = syn::Ident::new("__looprel_bound", proc_macro2::Span::call_site());
+        bound_sig.output = syn::parse_quote!(-> #counter_ty);
+        bound_sig.unsafety = Some(Default::default());
+        let bound_expr = plan.bound.clone();
+        let mut bound_stmts = plan.preamble.clone();
+        bound_stmts.push(syn::Stmt::Expr(bound_expr, None));
+        let bound_fn = syn::ItemFn {
+            attrs: vec![],
+            vis: syn::parse_quote!(pub),
+            sig: bound_sig,
+            block: Box::new(syn::Block {
+                brace_token: Default::default(),
+                stmts: bound_stmts,
+            }),
+        };
+        items.push(syn::Item::Fn(bound_fn));
+    }
+    items
+}
+
+/// The crate root for route B: the generated heap code, and two harnesses that
+/// build a symbolic heap, clone it, draw a symbolic counter `__c` in
+/// `[0, __bound)`, run one loop iteration of each version, and compare the
+/// heaps and modelled globals (no return value -- the function returns `()`).
+fn looprel_lib_source(
+    old: &FnUnit,
+    shapes: &SigShapes,
+    generated: &str,
+    plan: &crate::looprel::Plan,
+    unwind: u32,
+) -> String {
+    let depth = HEAP_DEPTH;
+    let ArgPlan {
+        build,
+        clone,
+        old_args,
+        new_args,
+        arg_cmp,
+        corr_decl,
+        map_decl,
+    } = arg_plan(old, shapes);
+    let counter_ty = qualify(&plan.counter_ty, "old");
+    let old_arglist = old_args.join(", ");
+    let new_arglist = new_args.join(", ");
+    let old_iter = if old_args.is_empty() {
+        "old::__looprel_iter(__c)".to_owned()
+    } else {
+        format!("old::__looprel_iter({old_arglist}, __c)")
+    };
+    let new_iter = if new_args.is_empty() {
+        "new::__looprel_iter(__c)".to_owned()
+    } else {
+        format!("new::__looprel_iter({new_arglist}, __c)")
+    };
+    let bound_call = if old_args.is_empty() {
+        "old::__looprel_bound()".to_owned()
+    } else {
+        format!("old::__looprel_bound({old_arglist})")
+    };
+    // Draw a symbolic counter in the loop's real index range. Using the actual
+    // heap-derived bound (not an unconstrained symbol) keeps counter-indexed
+    // reads/writes in bounds, so an in-range iteration is exercised exactly.
+    let counter_setup = format!(
+        "        let __bound: {counter_ty} = {bound_call};\n\
+         \x20       let __c: {counter_ty} = kani::any();\n\
+         \x20       kani::assume(__c >= 0 as {counter_ty} && __c < __bound);\n"
+    );
+
+    let rec = "        let __tr = core::ptr::addr_of_mut!(TRACE);\n        (*__tr).record();\n";
+    let replay = "        (*__tr).replay();\n";
+    let finish = "        (*__tr).finish();\n";
+    let harness = |name: &str, first_new: bool| {
+        let calls = if first_new {
+            format!("{rec}        {new_iter};\n{replay}        {old_iter};\n{finish}")
+        } else {
+            format!("{rec}        {old_iter};\n{replay}        {new_iter};\n{finish}")
+        };
+        format!(
+            "    #[kani::proof]\n\
+             \x20   #[kani::unwind({unwind})]\n\
+             \x20   fn {name}() {{ unsafe {{\n\
+             {build}\
+             {map_decl}\
+             {clone}\
+             {counter_setup}\
+             {calls}\
+             {corr_decl}\
+             {arg_cmp}\
+             \x20   }} }}\n"
+        )
+    };
+
+    format!(
+        r#"#![allow(warnings)]
+
+pub mod new;
+pub mod old;
+mod support;
+
+pub use support::*;
+
+{generated}
+
+#[cfg(kani)]
+mod proofs {{
+    use super::*;
+    const DEPTH: usize = {depth};
+
+{old_then_new}
+{new_then_old}}}
+"#,
+        old_then_new = harness("old_then_new", false),
+        new_then_old = harness("new_then_old", true),
+    )
+}
+
 fn module_source(unit: &FnUnit, inject_str_models: bool) -> String {
+    module_source_with(unit, inject_str_models, Vec::new())
+}
+
+/// Like [`module_source`], but appends `extra` items (made standalone and
+/// run through the same model rewrites) after the unit's own. Route B uses it
+/// to emit per-module `__looprel_iter` / `__looprel_bound` helpers that must
+/// resolve the unit's own names, so they live inside the module, not the crate
+/// root.
+fn module_source_with(unit: &FnUnit, inject_str_models: bool, extra: Vec<syn::Item>) -> String {
     let mut items = unit.items();
+    items.extend(extra);
     items.iter_mut().for_each(make_standalone);
     // A fn-ptr `static mut` global is modelled by a symbolic word the harness
     // injects into both versions, so its concrete default is irrelevant;
@@ -230,11 +431,119 @@ fn heap_lib_source(
     generated: &str,
     unwind: u32,
 ) -> String {
-    let sig = &old.function.sig;
     let old_name = old.name();
     let new_name = new.name();
     let depth = HEAP_DEPTH;
 
+    let ArgPlan {
+        build,
+        clone,
+        old_args,
+        new_args,
+        arg_cmp,
+        corr_decl,
+        map_decl,
+    } = arg_plan(old, shapes);
+    let old_call = format!("old::{old_name}({})", old_args.join(", "));
+    let new_call = format!("new::{new_name}({})", new_args.join(", "));
+
+    // Compare the return value (the per-argument/global comparisons are in
+    // `arg_cmp`, built by `arg_plan`).
+    let ret_cmp = match &shapes.ret {
+        Shape::Scalar => {
+            "        assert!(Bits::bits(&o) == Bits::bits(&n), \"results differ\");\n".to_owned()
+        }
+        Shape::Heap(name) => {
+            format!("        assert!(same_{name}(o, n, &mut corr), \"results differ\");\n")
+        }
+        // A returned C string / scalar pointer: compare the pointed-to content.
+        // `o`/`n` are the functions' own return types; cast to the comparer's.
+        Shape::CStr => "        assert!(same_cstr(o as *const core::ffi::c_char, n as *const core::ffi::c_char), \"results differ\");\n".to_owned(),
+        Shape::ScalarCell => {
+            "        assert!(same_cell(o, n), \"results differ\");\n".to_owned()
+        }
+        // A returned function pointer: compared by identity (its word value).
+        Shape::OpaqueArg(_) => "        assert!(unsafe { core::mem::transmute::<_, usize>(o) } \
+             == unsafe { core::mem::transmute::<_, usize>(n) }, \"results differ\");\n"
+            .to_owned(),
+        // A returned C-enum newtype: compare the inner scalar (distinct types).
+        Shape::ScalarNewtype(_) => {
+            "        assert!(o.0 == n.0, \"results differ\");\n".to_owned()
+        }
+    };
+
+    // The first version called records its external-call trace; the second
+    // must replay it exactly (same calls, same order, same arguments), so both
+    // have identical observable behaviour (VOC/CoVaC observable equivalence).
+    let rec = "        let __tr = core::ptr::addr_of_mut!(TRACE);\n        (*__tr).record();\n";
+    let replay = "        (*__tr).replay();\n";
+    let finish = "        (*__tr).finish();\n";
+    let harness = |name: &str, first_new: bool| {
+        let calls = if first_new {
+            format!(
+                "{rec}        let n = {new_call};\n{replay}        let o = {old_call};\n{finish}"
+            )
+        } else {
+            format!(
+                "{rec}        let o = {old_call};\n{replay}        let n = {new_call};\n{finish}"
+            )
+        };
+        format!(
+            "    #[kani::proof]\n\
+             \x20   #[kani::unwind({unwind})]\n\
+             \x20   fn {name}() {{ unsafe {{\n\
+             {build}\
+             {map_decl}\
+             {clone}\
+             {calls}\
+             {corr_decl}\
+             {ret_cmp}{arg_cmp}\
+             \x20   }} }}\n"
+        )
+    };
+
+    format!(
+        r#"#![allow(warnings)]
+
+pub mod new;
+pub mod old;
+mod support;
+
+pub use support::*;
+
+{generated}
+
+#[cfg(kani)]
+mod proofs {{
+    use super::*;
+    const DEPTH: usize = {depth};
+
+{old_then_new}
+{new_then_old}}}
+"#,
+        old_then_new = harness("old_then_new", false),
+        new_then_old = harness("new_then_old", true),
+    )
+}
+
+/// The argument-building, cloning and post-state comparison shared by the heap
+/// harness and the route-B relational harness: both build one symbolic set of
+/// arguments (old's), clone the heap ones into new's isomorphic copies, and
+/// compare the two versions' heaps, cells, strings and modelled globals
+/// afterwards. The heap harness wraps this around whole-function calls; route B
+/// wraps it around a single symbolic loop iteration.
+struct ArgPlan {
+    build: String,
+    clone: String,
+    old_args: Vec<String>,
+    new_args: Vec<String>,
+    arg_cmp: String,
+    corr_decl: String,
+    map_decl: String,
+}
+
+fn arg_plan(old: &FnUnit, shapes: &SigShapes) -> ArgPlan {
+    let sig = &old.function.sig;
     let arg_types: Vec<&syn::Type> = sig
         .inputs
         .iter()
@@ -311,33 +620,9 @@ fn heap_lib_source(
             }
         }
     }
-    let old_call = format!("old::{old_name}({})", old_args.join(", "));
-    let new_call = format!("new::{new_name}({})", new_args.join(", "));
 
-    // Compare the return value, then every heap argument's post-state, all
-    // under one correspondence so aliasing between them is checked too.
-    let ret_cmp = match &shapes.ret {
-        Shape::Scalar => {
-            "        assert!(Bits::bits(&o) == Bits::bits(&n), \"results differ\");\n".to_owned()
-        }
-        Shape::Heap(name) => {
-            format!("        assert!(same_{name}(o, n, &mut corr), \"results differ\");\n")
-        }
-        // A returned C string / scalar pointer: compare the pointed-to content.
-        // `o`/`n` are the functions' own return types; cast to the comparer's.
-        Shape::CStr => "        assert!(same_cstr(o as *const core::ffi::c_char, n as *const core::ffi::c_char), \"results differ\");\n".to_owned(),
-        Shape::ScalarCell => {
-            "        assert!(same_cell(o, n), \"results differ\");\n".to_owned()
-        }
-        // A returned function pointer: compared by identity (its word value).
-        Shape::OpaqueArg(_) => "        assert!(unsafe { core::mem::transmute::<_, usize>(o) } \
-             == unsafe { core::mem::transmute::<_, usize>(n) }, \"results differ\");\n"
-            .to_owned(),
-        // A returned C-enum newtype: compare the inner scalar (distinct types).
-        Shape::ScalarNewtype(_) => {
-            "        assert!(o.0 == n.0, \"results differ\");\n".to_owned()
-        }
-    };
+    // Every heap argument's post-state, all under one correspondence so
+    // aliasing between them is checked too.
     let mut arg_cmp = String::new();
     for (i, name) in &heap_args {
         arg_cmp +=
@@ -447,58 +732,15 @@ fn heap_lib_source(
         "        let mut map = CloneMap::default();\n"
     };
 
-    // The first version called records its external-call trace; the second
-    // must replay it exactly (same calls, same order, same arguments), so both
-    // have identical observable behaviour (VOC/CoVaC observable equivalence).
-    let rec = "        let __tr = core::ptr::addr_of_mut!(TRACE);\n        (*__tr).record();\n";
-    let replay = "        (*__tr).replay();\n";
-    let finish = "        (*__tr).finish();\n";
-    let harness = |name: &str, first_new: bool| {
-        let calls = if first_new {
-            format!(
-                "{rec}        let n = {new_call};\n{replay}        let o = {old_call};\n{finish}"
-            )
-        } else {
-            format!(
-                "{rec}        let o = {old_call};\n{replay}        let n = {new_call};\n{finish}"
-            )
-        };
-        format!(
-            "    #[kani::proof]\n\
-             \x20   #[kani::unwind({unwind})]\n\
-             \x20   fn {name}() {{ unsafe {{\n\
-             {build}\
-             {map_decl}\
-             {clone}\
-             {calls}\
-             {corr_decl}\
-             {ret_cmp}{arg_cmp}\
-             \x20   }} }}\n"
-        )
-    };
-
-    format!(
-        r#"#![allow(warnings)]
-
-pub mod new;
-pub mod old;
-mod support;
-
-pub use support::*;
-
-{generated}
-
-#[cfg(kani)]
-mod proofs {{
-    use super::*;
-    const DEPTH: usize = {depth};
-
-{old_then_new}
-{new_then_old}}}
-"#,
-        old_then_new = harness("old_then_new", false),
-        new_then_old = harness("new_then_old", true),
-    )
+    ArgPlan {
+        build,
+        clone,
+        old_args,
+        new_args,
+        arg_cmp,
+        corr_decl: corr_decl.to_owned(),
+        map_decl: map_decl.to_owned(),
+    }
 }
 
 /// Make a type from inside `module` usable from the crate root.

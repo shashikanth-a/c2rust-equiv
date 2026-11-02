@@ -120,6 +120,9 @@ impl Status {
                 bounded: false,
                 unwind: 0,
             } => "proved(algebraic)".to_owned(),
+            // Route B: a single flat map-style loop proved relationally over one
+            // symbolic iteration, so the proof holds for any array size.
+            Status::Proved { bounded: false, .. } => "proved(relational)".to_owned(),
             Status::Proved { unwind, .. } => format!("proved(bounded, unwind={unwind})"),
             Status::Counterexample {
                 inputs,
@@ -224,6 +227,16 @@ fn run_check(
     kani_ms: &mut Option<u64>,
     test_ms: &mut Option<u64>,
 ) -> io::Result<Status> {
+    // Route B (relational loop equivalence): when both versions are a single
+    // flat map-style loop, prove it over one symbolic iteration -- unbounded in
+    // the array size, so it clears the unwinding wall that would otherwise make
+    // such a loop time out. Tried first; a non-proof falls through to the
+    // ordinary heap/scalar paths below (its harness has no loop, so a non-proof
+    // is quick, not a timeout).
+    if let Some(status) = try_loop_relational(old, new, opts, kani_ms)? {
+        return Ok(status);
+    }
+
     // Functions that pass pointers to structs the generator supports take the
     // heap path; everything else takes the scalar path below.
     if let Some((shapes, code)) = heap_plan(old, new) {
@@ -404,6 +417,69 @@ fn heap_plan(old: &FnUnit, new: &FnUnit) -> Option<(SigShapes, String)> {
     roots.extend(struct_global_roots(old));
     let code = heapgen::generate_all(&index, &roots, &old.union_tags, "old", "new").ok()?;
     Some((shapes, code))
+}
+
+/// Try route B: prove a single flat map-style loop equivalent by one symbolic
+/// iteration (see [`crate::looprel`]). `Ok(Some(_))` only on a proof; anything
+/// else is `Ok(None)` so the caller falls through to the ordinary paths. Like
+/// the heap path it has no native runner, so it never confirms a
+/// counterexample -- a Kani failure just declines, never a false proof.
+fn try_loop_relational(
+    old: &FnUnit,
+    new: &FnUnit,
+    opts: &Options,
+    kani_ms: &mut Option<u64>,
+) -> io::Result<Option<Status>> {
+    if !opts.kani || !kani::available() {
+        return Ok(None);
+    }
+    // Both versions must be exactly a flat map-style loop and aligned.
+    let Some(plan) = crate::looprel::plan(&old.function, &new.function) else {
+        return Ok(None);
+    };
+    // And take the heap path (so the symbolic struct/clone/compare code exists).
+    let Some((shapes, code)) = heap_plan(old, new) else {
+        return Ok(None);
+    };
+
+    let opts = &Options {
+        work_dir: std::env::current_dir()?.join(&opts.work_dir),
+        ..opts.clone()
+    };
+    let dir = opts
+        .work_dir
+        .join("scratch")
+        .join(format!("{}-looprel", old.name()));
+    if dir.exists() {
+        fs::remove_dir_all(&dir)?;
+    }
+    scratch::write_looprel(
+        &dir,
+        old,
+        new,
+        &opts.edition,
+        opts.unwind,
+        &shapes,
+        &code,
+        &plan,
+    )?;
+    let timeout = if old.uses_floats() || new.uses_floats() {
+        opts.float_kani_timeout
+    } else {
+        opts.kani_timeout
+    };
+    let start = Instant::now();
+    let status = heap_decision(&dir, opts, timeout)?;
+    *kani_ms = Some(start.elapsed().as_millis() as u64);
+    // A relational proof holds for any array size (unbounded): report it as
+    // such. Anything else declines, so the caller tries the ordinary paths.
+    match status {
+        Status::Proved { .. } => Ok(Some(Status::Proved {
+            bounded: false,
+            unwind: 1,
+        })),
+        _ => Ok(None),
+    }
 }
 
 fn run_heap_check(

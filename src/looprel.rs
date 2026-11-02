@@ -27,13 +27,6 @@
 //! Until the codegen lands, a recognised + aligned pair is reported as an honest
 //! `Skip`, never a proof.
 
-// Stage 1 of route B: detection + alignment only. The relational harness
-// codegen (stage 2) will consume these; until it lands they are intentionally
-// unused, so the module opts out of the dead-code lint rather than littering
-// each entry point with an attribute.
-#![allow(dead_code)]
-
-use syn::spanned::Spanned;
 use syn::visit::Visit;
 
 /// A recognised single flat map-style loop, with the pieces a relational harness
@@ -73,11 +66,9 @@ pub fn analyze(func: &syn::ItemFn) -> Option<FlatLoop<'_>> {
         return None;
     }
 
-    // The bound must not mention the counter and must not be assigned anywhere
-    // in the function (loop-invariant across the loop). A bound with no clear
-    // root ident is treated as unsafe and rejected by `ident_is_assigned`.
-    let bound_root = bound_root_ident(bound);
-    if mentions_ident(bound, &counter) || ident_is_assigned(&func.block, &bound_root) {
+    // The bound must not mention the counter and must be loop-invariant: it may
+    // mention no identifier the function directly reassigns.
+    if mentions_ident(bound, &counter) || !bound_is_invariant(&func.block, bound, &counter) {
         return None;
     }
 
@@ -93,23 +84,6 @@ pub fn analyze(func: &syn::ItemFn) -> Option<FlatLoop<'_>> {
         bound,
         body: &while_expr.body,
     })
-}
-
-/// Whether old and new are both flat map-style loops that are aligned enough to
-/// attempt a relational proof: same bound expression and same counter. (Richer
-/// alignment -- renamed locals, reordered independent statements -- is future
-/// work; a mismatch here just declines route B.)
-pub fn aligned<'a>(
-    old: &'a syn::ItemFn,
-    new: &'a syn::ItemFn,
-) -> Option<(FlatLoop<'a>, FlatLoop<'a>)> {
-    let o = analyze(old)?;
-    let n = analyze(new)?;
-    if expr_eq(o.bound, n.bound) && o.counter == n.counter {
-        Some((o, n))
-    } else {
-        None
-    }
 }
 
 // ----- guard parsing -------------------------------------------------------
@@ -462,19 +436,27 @@ fn mentions_ident(e: &syn::Expr, id: &syn::Ident) -> bool {
     found
 }
 
-/// Whether the bound's root is *directly reassigned* (`id = ...`) anywhere in
-/// the function, which would make the bound non-invariant. Writes *through* the
-/// root (`*id.field.offset(..) = ..`, a deref target) do not count: they mutate
+/// Whether the bound is loop-invariant: it mentions no identifier the function
+/// *directly* reassigns (`id = ...`). Writes *through* an identifier
+/// (`*id.field.offset(..) = ..`, a deref target) do not count -- they mutate
 /// pointed-to array cells, not the pointer or the (distinct) bound field, under
 /// the memory-safety assumption the whole heap path already relies on. A bound
-/// with no clear root is treated as unsafe.
-fn ident_is_assigned(block: &syn::Block, id: &Option<syn::Ident>) -> bool {
-    let Some(id) = id else { return true };
+/// built only from literals, parameters and never-reassigned locals/fields
+/// (e.g. `16` or `(*ann).total_weights`) is invariant; one mentioning a
+/// variable the body writes is not. The counter is excluded here because a
+/// bound mentioning the counter is rejected separately by the caller.
+fn bound_is_invariant(block: &syn::Block, bound: &syn::Expr, counter: &syn::Ident) -> bool {
     let mut asg = AssignTargets::default();
     asg.visit_block(block);
-    asg.targets
-        .iter()
-        .any(|(t, is_deref)| t == id && !*is_deref)
+    for (id, is_deref) in &asg.targets {
+        if *is_deref || id == counter {
+            continue;
+        }
+        if mentions_ident(bound, id) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Syntactic expression equality via token comparison (after pretty-printing).
@@ -483,11 +465,186 @@ fn expr_eq(a: &syn::Expr, b: &syn::Expr) -> bool {
     a.to_token_stream().to_string() == b.to_token_stream().to_string()
 }
 
-// A tiny helper so `Spanned` is used (keeps spans available for future
-// diagnostics without a dead-import warning).
-#[allow(dead_code)]
-fn span_of(e: &syn::Expr) -> proc_macro2::Span {
-    e.span()
+/// Syntactic equality of two statement sequences, by token comparison.
+fn stmts_eq(a: &[syn::Stmt], b: &[syn::Stmt]) -> bool {
+    use quote::ToTokens;
+    let tok = |s: &[syn::Stmt]| {
+        s.iter()
+            .map(|st| st.to_token_stream().to_string())
+            .collect::<Vec<_>>()
+    };
+    tok(a) == tok(b)
+}
+
+// ----- route B plan (stage 2 input) ----------------------------------------
+
+/// Everything the relational codegen needs for one aligned pair. The counter,
+/// its type and the bound are shared (the alignment check requires them equal);
+/// only the per-iteration body differs between the two versions.
+#[derive(Debug)]
+pub struct Plan {
+    /// The loop counter, a parameter of each generated `__looprel_iter`.
+    pub counter: syn::Ident,
+    /// The counter's declared integer type (from its `let` annotation).
+    pub counter_ty: syn::Type,
+    /// The loop bound (from old; equal to new's by token comparison).
+    pub bound: syn::Expr,
+    /// Pre-loop statements with the counter's own init removed, run once at the
+    /// start of each generated helper so a bound or body that reads a pre-loop
+    /// local still resolves. Token-equal between the two versions (checked), so
+    /// running them is sound: identical code has identical behaviour.
+    pub preamble: Vec<syn::Stmt>,
+    /// Old's loop body with the trailing `counter += 1` removed.
+    pub old_iter_body: Vec<syn::Stmt>,
+    /// New's loop body with the trailing `counter += 1` removed.
+    pub new_iter_body: Vec<syn::Stmt>,
+}
+
+/// Build a relational plan if both functions are *exactly* a flat map-style loop
+/// and are aligned. This is sound as a whole-**function** equivalence, not just
+/// a loop equivalence: the return type is `()` (no post-loop value to compare),
+/// the loop is the last statement (no post-loop code), and the pre-loop
+/// statements are token-equal between the versions (so only the loop itself is
+/// left to prove). With no loop-carried state but the counter (enforced by
+/// [`analyze`]), one symbolic iteration over an arbitrary initial heap
+/// over-approximates every reachable iteration, so proving the single iteration
+/// equivalent proves the whole loop -- and hence the whole function -- equivalent
+/// for any array size, without unrolling.
+pub fn plan(old: &syn::ItemFn, new: &syn::ItemFn) -> Option<Plan> {
+    let o = whole_fn_loop(old)?;
+    let n = whole_fn_loop(new)?;
+    // Same counter, same bound, identical pre-loop code: anything else declines.
+    if o.counter != n.counter || !expr_eq(&o.bound, &n.bound) || !stmts_eq(&o.preamble, &n.preamble)
+    {
+        return None;
+    }
+    Some(Plan {
+        counter: o.counter,
+        counter_ty: o.counter_ty,
+        bound: o.bound,
+        preamble: o.preamble,
+        old_iter_body: o.iter_body,
+        new_iter_body: n.iter_body,
+    })
+}
+
+/// One version's pieces for a relational plan.
+struct WholeFn {
+    counter: syn::Ident,
+    counter_ty: syn::Type,
+    bound: syn::Expr,
+    preamble: Vec<syn::Stmt>,
+    iter_body: Vec<syn::Stmt>,
+}
+
+/// Decompose `func` into (pre-loop preamble, the flat map loop's body) if the
+/// function body is exactly a flat map-style loop as its last statement and
+/// returns `()`. Returns `None` -- declining route B -- for anything else.
+fn whole_fn_loop(func: &syn::ItemFn) -> Option<WholeFn> {
+    // Must return `()`: route B compares per-iteration heap effects, not a
+    // return value, so a function with a meaningful return is out of scope.
+    if !matches!(func.sig.output, syn::ReturnType::Default) {
+        return None;
+    }
+    let fl = analyze(func)?;
+    let counter = fl.counter.clone();
+    let bound = fl.bound.clone();
+    let counter_ty = counter_type(&func.block, &counter)?;
+
+    // The loop must be the function's last statement: no post-loop code, whose
+    // (possibly divergent) effects route B would otherwise miss.
+    let stmts = &func.block.stmts;
+    let widx = stmts.iter().position(stmt_is_while)?;
+    if widx != stmts.len() - 1 {
+        return None;
+    }
+
+    // The iteration body is the loop body minus its trailing `counter += 1`
+    // (guaranteed last by `analyze`). An early `return`/`break`/`continue`
+    // inside it would not survive the per-iteration reduction, so decline.
+    let mut iter_body = fl.body.stmts.clone();
+    iter_body.pop();
+    if stmts_have_control_flow(&iter_body) {
+        return None;
+    }
+
+    // Pre-loop statements, minus the counter's own `let`/init assignment (the
+    // counter becomes a helper parameter). What remains runs once per helper.
+    let preamble: Vec<syn::Stmt> = stmts[..widx]
+        .iter()
+        .filter(|s| !stmt_defines_or_sets(s, &counter))
+        .cloned()
+        .collect();
+
+    Some(WholeFn {
+        counter,
+        counter_ty,
+        bound,
+        preamble,
+        iter_body,
+    })
+}
+
+/// The counter's declared type, from its `let mut counter: T = ...;` binding.
+/// `None` if the binding carries no explicit type (so the helper can't give the
+/// counter parameter a type) -- c2rust always annotates, so this just declines.
+fn counter_type(block: &syn::Block, counter: &syn::Ident) -> Option<syn::Type> {
+    for stmt in &block.stmts {
+        if let syn::Stmt::Local(local) = stmt {
+            if pat_binding(&local.pat) == Some(counter) {
+                if let syn::Pat::Type(pt) = &local.pat {
+                    return Some((*pt.ty).clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Whether a statement is a `while` loop (as a statement or a trailing expr).
+fn stmt_is_while(stmt: &syn::Stmt) -> bool {
+    matches!(stmt, syn::Stmt::Expr(syn::Expr::While(_), _))
+}
+
+/// Whether a statement defines (by `let`) or directly assigns the counter.
+fn stmt_defines_or_sets(stmt: &syn::Stmt, counter: &syn::Ident) -> bool {
+    match stmt {
+        syn::Stmt::Local(l) => pat_binding(&l.pat) == Some(counter),
+        syn::Stmt::Expr(syn::Expr::Assign(a), _) => {
+            expr_as_ident(&a.left).as_ref() == Some(counter)
+        }
+        _ => false,
+    }
+}
+
+/// Whether any statement contains a `return`, `break` or `continue` (which the
+/// per-iteration reduction cannot model). There are no nested loops in a body
+/// `analyze` accepted, so a `break`/`continue` would target this loop.
+fn stmts_have_control_flow(stmts: &[syn::Stmt]) -> bool {
+    #[derive(Default)]
+    struct CF {
+        found: bool,
+    }
+    impl<'a> Visit<'a> for CF {
+        fn visit_expr_return(&mut self, _: &'a syn::ExprReturn) {
+            self.found = true;
+        }
+        fn visit_expr_break(&mut self, _: &'a syn::ExprBreak) {
+            self.found = true;
+        }
+        fn visit_expr_continue(&mut self, _: &'a syn::ExprContinue) {
+            self.found = true;
+        }
+        // Don't descend into closures or nested items: their control flow is
+        // their own. (A body `analyze` accepted has no nested loops.)
+        fn visit_item(&mut self, _: &'a syn::Item) {}
+        fn visit_expr_closure(&mut self, _: &'a syn::ExprClosure) {}
+    }
+    let mut cf = CF::default();
+    for s in stmts {
+        cf.visit_stmt(s);
+    }
+    cf.found
 }
 
 #[cfg(test)]
@@ -577,7 +734,7 @@ mod tests {
     }
 
     #[test]
-    fn aligns_identical_randomize() {
+    fn plans_identical_randomize() {
         let src = r#"
             pub unsafe fn randomize(ann: *mut genann) {
                 let mut i: i32 = 0;
@@ -587,11 +744,14 @@ mod tests {
                 }
             }
         "#;
-        assert!(aligned(&f(src), &f(src)).is_some());
+        let p = plan(&f(src), &f(src)).expect("identical randomize should plan");
+        assert_eq!(p.counter, "i");
+        // One body statement survives after the `i += 1` is stripped.
+        assert_eq!(p.old_iter_body.len(), 1);
     }
 
     #[test]
-    fn declines_alignment_on_different_bound() {
+    fn declines_plan_on_different_bound() {
         let a = r#"
             pub unsafe fn m(ann: *mut genann) {
                 let mut i: i32 = 0;
@@ -604,9 +764,62 @@ mod tests {
                 while i < (*ann).total_neurons { *(*ann).weight.offset(i as isize) = 0.5; i += 1; }
             }
         "#;
+        assert!(plan(&f(a), &f(b)).is_none(), "different bound must decline");
+    }
+
+    #[test]
+    fn declines_plan_with_nonunit_return() {
+        // A map loop that also returns a value is out of scope: route B compares
+        // per-iteration effects, not a return.
+        let src = r#"
+            pub unsafe fn m(ann: *mut genann) -> i32 {
+                let mut i: i32 = 0;
+                while i < (*ann).total_weights { *(*ann).weight.offset(i as isize) = 0.5; i += 1; }
+                0
+            }
+        "#;
         assert!(
-            aligned(&f(a), &f(b)).is_none(),
-            "different bound must decline"
+            plan(&f(src), &f(src)).is_none(),
+            "a non-unit return must decline"
+        );
+    }
+
+    #[test]
+    fn declines_plan_with_post_loop_code() {
+        // A statement after the loop is not covered by the loop proof.
+        let src = r#"
+            pub unsafe fn m(ann: *mut genann) {
+                let mut i: i32 = 0;
+                while i < (*ann).total_weights { *(*ann).weight.offset(i as isize) = 0.5; i += 1; }
+                *(*ann).weight = 1.0;
+            }
+        "#;
+        assert!(
+            plan(&f(src), &f(src)).is_none(),
+            "post-loop code must decline"
+        );
+    }
+
+    #[test]
+    fn declines_plan_on_divergent_preamble() {
+        // Token-different pre-loop code leaves more than the loop to prove.
+        let a = r#"
+            pub unsafe fn m(ann: *mut genann) {
+                let mut i: i32 = 0;
+                let k: f64 = 0.0;
+                while i < (*ann).total_weights { *(*ann).weight.offset(i as isize) = k; i += 1; }
+            }
+        "#;
+        let b = r#"
+            pub unsafe fn m(ann: *mut genann) {
+                let mut i: i32 = 0;
+                let k: f64 = 1.0;
+                while i < (*ann).total_weights { *(*ann).weight.offset(i as isize) = k; i += 1; }
+            }
+        "#;
+        assert!(
+            plan(&f(a), &f(b)).is_none(),
+            "divergent preamble must decline"
         );
     }
 }

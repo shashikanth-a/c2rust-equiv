@@ -153,6 +153,37 @@ It is sound but deliberately incomplete:
   Loops, pointers, calls and control flow are out of the fragment and return
   "not decided" rather than a guess.
 
+### The relational loop path (route B) — experimental
+
+Before the heap path's bounded run, a function pair is tried relationally when
+both versions are **exactly a single flat map-style loop**: a counter from `0`
+to a loop-invariant bound, each iteration writing a fresh counter-indexed
+location, with no loop-carried state but the counter and a `()` return. Rather
+than unroll the loop, it proves **one symbolic iteration** equivalent — an
+arbitrary counter `c` in `[0, bound)` over an arbitrary initial heap. Because an
+arbitrary heap over-approximates every reachable one, equal-heap-in ⟹
+equal-heap-out for one iteration lifts by induction to the whole loop, for any
+trip count, without a loop in the harness at all. The check compares the full
+post-iteration heaps and the external-call trace, so a divergent write *value*,
+a divergent write *address* (the right value to the wrong cell), or a divergent
+call sequence are all caught; a proof is reported as `proved(relational)`.
+
+It is sound but narrow, and declines (falling through to the bounded path) for
+anything it is not certain of: a non-unit return, any statement after the loop,
+loop-carried state other than the counter (an accumulator would be invisible to
+the per-iteration check), a nested loop, a non-counter-indexed write, or pre-loop
+code that is not token-identical between the two versions. The detector fails
+closed — see `src/looprel.rs`.
+
+Its reach today is bounded by the heap model, which **materialises** a
+fixed-size array field (building and comparing all `N` elements), so the
+unwinding bound must still cover the array's byte length even though the logical
+loop is not unrolled. It therefore helps a fixed-size-array map loop whose body
+is too expensive to unroll `N` times, but it does **not** yet help a loop over a
+runtime-sized buffer (e.g. genann's `weight: *mut f64` with `total_weights`
+elements), which the model represents as a single cell rather than an array.
+Reaching those needs a non-materialising per-iteration abstraction (future work).
+
 ## Design specs
 
 `specs/` has a TLA+ model of the verdict logic, checked in CI with TLC. It

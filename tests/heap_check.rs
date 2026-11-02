@@ -4101,3 +4101,108 @@ fn fn_ptr_passed_to_external_catches_a_dropped_callback() {
         outcome.status
     );
 }
+
+// ---------------------------------------------------------------------------
+// Route B: relational (single-iteration) equivalence for a flat map-style loop
+// over a fixed-size array field. The bounded heap path would need to unwind the
+// loop `N` times (16 here) and times out / exceeds the unwind bound; route B
+// proves one symbolic iteration instead, so it holds for the whole array
+// regardless of `N`. See `src/looprel.rs`.
+// ---------------------------------------------------------------------------
+
+const BUF: &str = "pub struct Buf { pub a: [i32; 4], pub n: i32 }";
+
+// Fill each cell with twice its index. A plain map: one counter, counter-indexed
+// writes, no loop-carried state but the counter, unit return.
+const LOOPREL_OLD: &str = r#"
+pub unsafe fn fill(b: *mut Buf) {
+    let n: i32 = if b.is_null() { 0 } else { 4 };
+    let mut i: i32 = 0;
+    while i < n {
+        *(*b).a.as_mut_ptr().offset(i as isize) = i * 2;
+        i += 1;
+    }
+}
+"#;
+
+// Equivalent rewrite: `i + i` computes the same value as `i * 2` (identical
+// overflow behaviour too), written to the same cell.
+const LOOPREL_OK: &str = r#"
+pub unsafe fn fill(b: *mut Buf) {
+    let n: i32 = if b.is_null() { 0 } else { 4 };
+    let mut i: i32 = 0;
+    while i < n {
+        *(*b).a.as_mut_ptr().offset(i as isize) = i + i;
+        i += 1;
+    }
+}
+"#;
+
+// Wrong value: `i * 3` differs from `i * 2` at every non-zero index.
+const LOOPREL_BAD_VALUE: &str = r#"
+pub unsafe fn fill(b: *mut Buf) {
+    let n: i32 = if b.is_null() { 0 } else { 4 };
+    let mut i: i32 = 0;
+    while i < n {
+        *(*b).a.as_mut_ptr().offset(i as isize) = i * 3;
+        i += 1;
+    }
+}
+"#;
+
+// Wrong address: the same values, but written in reverse (cell `15 - i`), so the
+// array ends up reversed. This guards the address obligation -- writing the
+// right value to the wrong cell must be caught, never proved (the soundness
+// trap route B's full-heap comparison is designed to close).
+const LOOPREL_BAD_ADDR: &str = r#"
+pub unsafe fn fill(b: *mut Buf) {
+    let n: i32 = if b.is_null() { 0 } else { 4 };
+    let mut i: i32 = 0;
+    while i < n {
+        *(*b).a.as_mut_ptr().offset((3 - i) as isize) = i * 2;
+        i += 1;
+    }
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn loop_relational_proves_equivalent_map_loop() {
+    let old = FnUnit::parse(LOOPREL_OLD, &[BUF]).unwrap();
+    let new = FnUnit::parse(LOOPREL_OK, &[BUF]).unwrap();
+    // A 16-iteration loop exceeds the default unwind, so only route B can prove
+    // it. The proof is relational/unbounded: `Proved { bounded: false, .. }`.
+    let outcome = check(&old, &new, &opts_unwind(20));
+    assert!(
+        matches!(outcome.status, Status::Proved { bounded: false, .. }),
+        "expected a relational proof, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn loop_relational_catches_divergent_value() {
+    let old = FnUnit::parse(LOOPREL_OLD, &[BUF]).unwrap();
+    let new = FnUnit::parse(LOOPREL_BAD_VALUE, &[BUF]).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(20));
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent per-iteration value was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn loop_relational_catches_divergent_address() {
+    let old = FnUnit::parse(LOOPREL_OLD, &[BUF]).unwrap();
+    let new = FnUnit::parse(LOOPREL_BAD_ADDR, &[BUF]).unwrap();
+    let outcome = check(&old, &new, &opts_unwind(20));
+    // Same values, wrong cells: the full-heap comparison must catch it.
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent write address was proved equivalent: {:?}",
+        outcome.status
+    );
+}

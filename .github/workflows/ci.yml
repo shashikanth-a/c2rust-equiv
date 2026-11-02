@@ -77,6 +77,8 @@ jobs:
             mutex_noop_catches_divergence \
             fp_division_proves_equivalent_rewrite \
             fp_division_catches_swapped_operands \
+            loop_relational_proves_equivalent_map_loop \
+            loop_relational_catches_divergent_value \
             alloc_hook_proves_equivalent_rewrite \
             alloc_hook_catches_divergence \
             allocator_global_model_proves_equivalent_rewrite \
