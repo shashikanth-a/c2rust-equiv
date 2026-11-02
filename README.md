@@ -355,7 +355,7 @@ can't decide. These are not flat map loops — they accumulate across iterations
 or read back what they wrote — so the relational loop path does not apply. A
 larger timeout and unwinding would prove a few more, as the
 SQLite loop above did at 300 s, but the genuinely unbounded loops would still not
-close. So on this crate the 12 functions the harness builds for reduce to 3
+close. So on this crate the 12 functions the harness builds for reduce to 4
 actually proved. Eligibility is the reach of the method, not a verification
 count — read the next table accordingly.
 
