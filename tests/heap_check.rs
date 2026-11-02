@@ -4172,7 +4172,7 @@ fn loop_relational_proves_equivalent_map_loop() {
     let new = FnUnit::parse(LOOPREL_OK, &[BUF]).unwrap();
     // A 16-iteration loop exceeds the default unwind, so only route B can prove
     // it. The proof is relational/unbounded: `Proved { bounded: false, .. }`.
-    let outcome = check(&old, &new, &opts_unwind(20));
+    let outcome = check(&old, &new, &opts());
     assert!(
         matches!(outcome.status, Status::Proved { bounded: false, .. }),
         "expected a relational proof, got {:?}",
@@ -4185,7 +4185,7 @@ fn loop_relational_proves_equivalent_map_loop() {
 fn loop_relational_catches_divergent_value() {
     let old = FnUnit::parse(LOOPREL_OLD, &[BUF]).unwrap();
     let new = FnUnit::parse(LOOPREL_BAD_VALUE, &[BUF]).unwrap();
-    let outcome = check(&old, &new, &opts_unwind(20));
+    let outcome = check(&old, &new, &opts());
     assert!(
         !matches!(outcome.status, Status::Proved { .. }),
         "a divergent per-iteration value was proved equivalent: {:?}",
@@ -4198,11 +4198,90 @@ fn loop_relational_catches_divergent_value() {
 fn loop_relational_catches_divergent_address() {
     let old = FnUnit::parse(LOOPREL_OLD, &[BUF]).unwrap();
     let new = FnUnit::parse(LOOPREL_BAD_ADDR, &[BUF]).unwrap();
-    let outcome = check(&old, &new, &opts_unwind(20));
+    let outcome = check(&old, &new, &opts());
     // Same values, wrong cells: the full-heap comparison must catch it.
     assert!(
         !matches!(outcome.status, Status::Proved { .. }),
         "a divergent write address was proved equivalent: {:?}",
+        outcome.status
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Route B on a RUNTIME-LENGTH buffer (`data: *mut f64` with a `len` field) --
+// the genann `weight`/`total_weights` shape. The heap model represents the
+// buffer as a single cell, so the bounded path can't index past element 0; the
+// non-materialising relational harness computes the write address with
+// `wrapping_offset` and never dereferences the buffer, proving the loop for any
+// length at a low unwind.
+// ---------------------------------------------------------------------------
+
+const VEC1: &str = "pub struct Vec1 { pub data: *mut f64, pub len: i32 }";
+
+const RTBUF_OLD: &str = r#"
+pub unsafe fn fill(v: *mut Vec1) {
+    let n: i32 = if v.is_null() { 0 } else { (*v).len };
+    let mut i: i32 = 0;
+    while i < n {
+        *(*v).data.offset(i as isize) = i as f64 * 0.5f64;
+        i += 1;
+    }
+}
+"#;
+
+// Equivalent: `0.5 * i` computes the same product (multiplication is modelled
+// uninterpreted but keyed on operand bits, and the operands match).
+const RTBUF_OK: &str = r#"
+pub unsafe fn fill(v: *mut Vec1) {
+    let n: i32 = if v.is_null() { 0 } else { (*v).len };
+    let mut i: i32 = 0;
+    while i < n {
+        *(*v).data.offset(i as isize) = 0.5f64 * i as f64;
+        i += 1;
+    }
+}
+"#;
+
+// Wrong value: scales by 0.6 instead of 0.5.
+const RTBUF_BAD: &str = r#"
+pub unsafe fn fill(v: *mut Vec1) {
+    let n: i32 = if v.is_null() { 0 } else { (*v).len };
+    let mut i: i32 = 0;
+    while i < n {
+        *(*v).data.offset(i as isize) = i as f64 * 0.6f64;
+        i += 1;
+    }
+}
+"#;
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn loop_relational_proves_runtime_length_buffer() {
+    let old = FnUnit::parse(RTBUF_OLD, &[VEC1]).unwrap();
+    let new = FnUnit::parse(RTBUF_OK, &[VEC1]).unwrap();
+    // A runtime-sized buffer the bounded path cannot index past element 0;
+    // route B proves it unbounded without materialising the buffer.
+    let mut o = opts();
+    o.float_kani_timeout = o.kani_timeout;
+    let outcome = check(&old, &new, &o);
+    assert!(
+        matches!(outcome.status, Status::Proved { bounded: false, .. }),
+        "expected a relational proof, got {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+#[ignore = "requires `cargo kani` on PATH; slow"]
+fn loop_relational_catches_divergent_runtime_length_value() {
+    let old = FnUnit::parse(RTBUF_OLD, &[VEC1]).unwrap();
+    let new = FnUnit::parse(RTBUF_BAD, &[VEC1]).unwrap();
+    let mut o = opts();
+    o.float_kani_timeout = o.kani_timeout;
+    let outcome = check(&old, &new, &o);
+    assert!(
+        !matches!(outcome.status, Status::Proved { .. }),
+        "a divergent runtime-length write value was proved equivalent: {:?}",
         outcome.status
     );
 }

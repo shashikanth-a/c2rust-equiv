@@ -161,28 +161,37 @@ to a loop-invariant bound, each iteration writing a fresh counter-indexed
 location, with no loop-carried state but the counter and a `()` return. Rather
 than unroll the loop, it proves **one symbolic iteration** equivalent — an
 arbitrary counter `c` in `[0, bound)` over an arbitrary initial heap. Because an
-arbitrary heap over-approximates every reachable one, equal-heap-in ⟹
-equal-heap-out for one iteration lifts by induction to the whole loop, for any
-trip count, without a loop in the harness at all. The check compares the full
-post-iteration heaps and the external-call trace, so a divergent write *value*,
-a divergent write *address* (the right value to the wrong cell), or a divergent
-call sequence are all caught; a proof is reported as `proved(relational)`.
+arbitrary heap over-approximates every reachable one, equal-effect-for-one-`c`
+lifts by induction to the whole loop, for any trip count, without a loop in the
+harness at all, so it holds for a **runtime-sized** buffer the bounded path
+cannot unroll.
+
+It does not materialise the buffer. Both versions share one symbolic heap and
+**nothing is written**: each counter-indexed write `*base.offset(c) = v` is
+abstracted into a trace obligation carrying the *address*
+(`base.wrapping_offset(c)` as a word — pure pointer arithmetic, no dereference,
+no out-of-bounds) and the *value*, rather than performed. The two runs record
+and replay that trace (writes interleaved with any external calls), so a
+divergent write *value*, a divergent write *address* (the right value to the
+wrong cell or index), a reordered or dropped write, or a divergent call sequence
+are all caught; a proof is reported as `proved(relational)`. Nothing is mutated,
+so sharing the heap is sound and the buffer's length never enters the unwinding
+bound.
 
 It is sound but narrow, and declines (falling through to the bounded path) for
 anything it is not certain of: a non-unit return, any statement after the loop,
 loop-carried state other than the counter (an accumulator would be invisible to
-the per-iteration check), a nested loop, a non-counter-indexed write, or pre-loop
-code that is not token-identical between the two versions. The detector fails
-closed — see `src/looprel.rs`.
+the per-iteration check), a nested loop, a compound or non-`offset`/`add` write,
+a C-string/newtype/opaque argument, or pre-loop code that is not token-identical
+between the two versions. The detector fails closed — see `src/looprel.rs`.
 
-Its reach today is bounded by the heap model, which **materialises** a
-fixed-size array field (building and comparing all `N` elements), so the
-unwinding bound must still cover the array's byte length even though the logical
-loop is not unrolled. It therefore helps a fixed-size-array map loop whose body
-is too expensive to unroll `N` times, but it does **not** yet help a loop over a
-runtime-sized buffer (e.g. genann's `weight: *mut f64` with `total_weights`
-elements), which the model represents as a single cell rather than an array.
-Reaching those needs a non-materialising per-iteration abstraction (future work).
+What it still does not clear is a function that **dereferences a pointer
+argument without a null guard** (e.g. genann's `randomize`, whose bound is
+`(*ann).total_weights`): the symbolic argument can be null, so the relational
+harness reports a null dereference and declines — the same precondition limit
+the rest of the heap path has. Discharging it needs a separate analysis that a
+pointer is unconditionally dereferenced by both versions (so assuming it
+non-null is sound), which is future work.
 
 ## Design specs
 

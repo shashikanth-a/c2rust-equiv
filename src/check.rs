@@ -437,10 +437,20 @@ fn try_loop_relational(
     let Some(plan) = crate::looprel::plan(&old.function, &new.function) else {
         return Ok(None);
     };
-    // And take the heap path (so the symbolic struct/clone/compare code exists).
+    // And take the heap path (so the symbolic struct/compare code exists).
     let Some((shapes, code)) = heap_plan(old, new) else {
         return Ok(None);
     };
+    // Route B shares one symbolic heap between the two versions and casts each
+    // pointer argument to the other module's type; only plain scalars, struct
+    // pointers and scalar-cell pointers are safe to share that way. A C string,
+    // enum newtype or opaque-word argument declines (the bounded path handles
+    // it).
+    use crate::heapgen::Shape;
+    let shareable = |s: &Shape| matches!(s, Shape::Scalar | Shape::Heap(_) | Shape::ScalarCell);
+    if !shapes.args.iter().all(shareable) {
+        return Ok(None);
+    }
 
     let opts = &Options {
         work_dir: std::env::current_dir()?.join(&opts.work_dir),

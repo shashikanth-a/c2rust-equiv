@@ -147,12 +147,80 @@ pub fn write_looprel(
     Ok(())
 }
 
+/// The oracle/trace id used for a counter-indexed write, modelled as a trace
+/// event. The angle brackets keep it out of the C-identifier namespace, so it
+/// never collides with a modelled external call's id.
+fn write_event_id() -> u64 {
+    crate::strmodel::oracle_id("<looprel-write>")
+}
+
+/// Rewrite each counter-indexed write `*<base>.offset(<idx>) = <val>` (or
+/// `.add`) into a trace event carrying the *address* and the *value*, without
+/// performing the write. The address is computed with `wrapping_offset` /
+/// `wrapping_add` -- pure pointer arithmetic with no in-bounds requirement and
+/// no dereference -- so the buffer is never materialised and an out-of-range
+/// index is not undefined behaviour. The two versions share one symbolic heap
+/// (nothing is mutated), so a write to a different field yields a different
+/// base address and a write to a different index a different offset; both show
+/// up as a divergent event. The value is recorded by its bits, so a divergent
+/// value diverges too. Ordering and count are checked by the trace's
+/// record/replay, so a reordered or dropped write is caught as well.
+struct WriteInstrumenter {
+    id: u64,
+}
+impl VisitMut for WriteInstrumenter {
+    fn visit_expr_mut(&mut self, e: &mut syn::Expr) {
+        if let syn::Expr::Assign(a) = e {
+            if let syn::Expr::Unary(u) = &*a.left {
+                if matches!(u.op, syn::UnOp::Deref(_)) {
+                    if let Some((base, method, idx)) = offset_place_parts(&u.expr) {
+                        let wrapping = if method == "add" {
+                            syn::Ident::new("wrapping_add", proc_macro2::Span::call_site())
+                        } else {
+                            syn::Ident::new("wrapping_offset", proc_macro2::Span::call_site())
+                        };
+                        let val = (*a.right).clone();
+                        let id = self.id;
+                        *e = syn::parse_quote!({
+                            let __addr =
+                                (#base).#wrapping(#idx) as *const u8 as usize;
+                            let __v = crate::Bits::bits(&(#val));
+                            let __tr = core::ptr::addr_of_mut!(crate::TRACE);
+                            (*__tr).step(#id, [__addr as u128, __v, 0u128], [0u8, 0u8, 3u8]);
+                        });
+                        return;
+                    }
+                }
+            }
+        }
+        syn::visit_mut::visit_expr_mut(self, e);
+    }
+}
+
+/// Split an `.offset`/`.add` place into (receiver, method-name, index arg).
+fn offset_place_parts(place: &syn::Expr) -> Option<(syn::Expr, String, syn::Expr)> {
+    match place {
+        syn::Expr::Paren(p) => offset_place_parts(&p.expr),
+        syn::Expr::MethodCall(m)
+            if (m.method == "offset" || m.method == "add") && m.args.len() == 1 =>
+        {
+            Some((
+                (*m.receiver).clone(),
+                m.method.to_string(),
+                m.args[0].clone(),
+            ))
+        }
+        _ => None,
+    }
+}
+
 /// Build the per-module route-B helpers for one version: `__looprel_iter` (the
-/// loop's preamble then one body iteration, with the counter as a parameter)
-/// and, when `with_bound`, `__looprel_bound` (the preamble then the bound
-/// expression). They reuse the original function's signature so every parameter
-/// the body reads is in scope, and live in the version's own module so its
-/// local names and types resolve.
+/// loop's preamble then one body iteration, with the counter as a parameter and
+/// every counter-indexed write rewritten into a trace obligation) and, when
+/// `with_bound`, `__looprel_bound` (the preamble then the bound expression).
+/// They reuse the original function's signature so every parameter the body
+/// reads is in scope, and live in the version's own module so its local names
+/// and types resolve.
 fn looprel_helper_items(
     func: &syn::ItemFn,
     plan: &crate::looprel::Plan,
@@ -170,6 +238,13 @@ fn looprel_helper_items(
     iter_sig.inputs.push(counter_param);
     let mut iter_stmts = plan.preamble.clone();
     iter_stmts.extend(iter_body.iter().cloned());
+    // Abstract the counter-indexed writes into trace obligations.
+    let mut instr = WriteInstrumenter {
+        id: write_event_id(),
+    };
+    for s in &mut iter_stmts {
+        instr.visit_stmt_mut(s);
+    }
     let iter_fn = syn::ItemFn {
         attrs: vec![],
         vis: syn::parse_quote!(pub),
@@ -203,10 +278,15 @@ fn looprel_helper_items(
     items
 }
 
-/// The crate root for route B: the generated heap code, and two harnesses that
-/// build a symbolic heap, clone it, draw a symbolic counter `__c` in
-/// `[0, __bound)`, run one loop iteration of each version, and compare the
-/// heaps and modelled globals (no return value -- the function returns `()`).
+/// The crate root for route B (stage 3, non-materialising): the generated heap
+/// code, and two harnesses that build **one** symbolic heap, draw a symbolic
+/// counter `__c` in `[0, __bound)`, and run one loop iteration of each version
+/// on that **shared** heap. Nothing is mutated -- every counter-indexed write is
+/// abstracted into an (address, value) trace obligation (see
+/// [`WriteInstrumenter`]) rather than performed -- so sharing is sound and the
+/// buffer is never materialised. All obligations (writes and external calls, in
+/// order and count) are discharged by the trace's record/replay; there is no
+/// post-state to compare (the function returns `()`).
 fn looprel_lib_source(
     old: &FnUnit,
     shapes: &SigShapes,
@@ -215,36 +295,69 @@ fn looprel_lib_source(
     unwind: u32,
 ) -> String {
     let depth = HEAP_DEPTH;
-    let ArgPlan {
-        build,
-        clone,
-        old_args,
-        new_args,
-        arg_cmp,
-        corr_decl,
-        map_decl,
-    } = arg_plan(old, shapes);
+    let sig = &old.function.sig;
+    let arg_types: Vec<&syn::Type> = sig
+        .inputs
+        .iter()
+        .filter_map(|a| match a {
+            syn::FnArg::Typed(pt) => Some(&*pt.ty),
+            syn::FnArg::Receiver(_) => None,
+        })
+        .collect();
+
+    // Build one symbolic value per argument, shared by both versions. A heap or
+    // cell pointer is cast to the new module's (layout-identical) type for new's
+    // call; a scalar is passed by value to both. Pointer arguments are only read
+    // and address-computed (never written), so sharing cannot let one version
+    // observe the other's effects.
+    let mut build = String::new();
+    let mut old_args = Vec::new();
+    let mut new_args = Vec::new();
+    for (i, shape) in shapes.args.iter().enumerate() {
+        match shape {
+            Shape::Scalar => {
+                let ty = qualify(arg_types[i], "old");
+                build += &format!("        let a{i}: {ty} = kani::any();\n");
+                old_args.push(format!("a{i}"));
+                new_args.push(format!("a{i}"));
+            }
+            Shape::Heap(name) => {
+                build += &format!("        let a{i} = gen_{name}(DEPTH);\n");
+                old_args.push(format!("a{i}"));
+                new_args.push(format!("a{i} as {}", qualify(arg_types[i], "new")));
+            }
+            Shape::ScalarCell => {
+                let ty = qualify(arg_types[i], "old");
+                build += &format!("        let a{i}: {ty} = gen_cell();\n");
+                old_args.push(format!("a{i}"));
+                new_args.push(format!("a{i} as {}", qualify(arg_types[i], "new")));
+            }
+            // Other shapes are rejected before reaching here (see
+            // `try_loop_relational`); guard anyway so a future shape can't be
+            // silently mis-shared.
+            _ => {
+                build += "        compile_error!(\"unsupported route-B argument shape\");\n";
+            }
+        }
+    }
     let counter_ty = qualify(&plan.counter_ty, "old");
     let old_arglist = old_args.join(", ");
     let new_arglist = new_args.join(", ");
-    let old_iter = if old_args.is_empty() {
-        "old::__looprel_iter(__c)".to_owned()
-    } else {
-        format!("old::__looprel_iter({old_arglist}, __c)")
+    let iter = |module: &str, args: &str| {
+        if args.is_empty() {
+            format!("{module}::__looprel_iter(__c)")
+        } else {
+            format!("{module}::__looprel_iter({args}, __c)")
+        }
     };
-    let new_iter = if new_args.is_empty() {
-        "new::__looprel_iter(__c)".to_owned()
-    } else {
-        format!("new::__looprel_iter({new_arglist}, __c)")
-    };
-    let bound_call = if old_args.is_empty() {
+    let old_iter = iter("old", &old_arglist);
+    let new_iter = iter("new", &new_arglist);
+    let bound_call = if old_arglist.is_empty() {
         "old::__looprel_bound()".to_owned()
     } else {
         format!("old::__looprel_bound({old_arglist})")
     };
-    // Draw a symbolic counter in the loop's real index range. Using the actual
-    // heap-derived bound (not an unconstrained symbol) keeps counter-indexed
-    // reads/writes in bounds, so an in-range iteration is exercised exactly.
+    // Draw a symbolic counter in the loop's real index range.
     let counter_setup = format!(
         "        let __bound: {counter_ty} = {bound_call};\n\
          \x20       let __c: {counter_ty} = kani::any();\n\
@@ -265,12 +378,8 @@ fn looprel_lib_source(
              \x20   #[kani::unwind({unwind})]\n\
              \x20   fn {name}() {{ unsafe {{\n\
              {build}\
-             {map_decl}\
-             {clone}\
              {counter_setup}\
              {calls}\
-             {corr_decl}\
-             {arg_cmp}\
              \x20   }} }}\n"
         )
     };

@@ -567,6 +567,14 @@ fn whole_fn_loop(func: &syn::ItemFn) -> Option<WholeFn> {
     if stmts_have_control_flow(&iter_body) {
         return None;
     }
+    // Every pointer write must be a plain `*<base>.offset(<idx>) = <val>` (or
+    // `.add`), so the relational codegen can abstract it into an (address,
+    // value) obligation without performing it. A compound assignment
+    // (`*p.offset(c) += v`) reads the cell back, which the no-materialisation
+    // abstraction cannot model, so decline.
+    if !writes_are_simple(&iter_body) {
+        return None;
+    }
 
     // Pre-loop statements, minus the counter's own `let`/init assignment (the
     // counter becomes a helper parameter). What remains runs once per helper.
@@ -612,6 +620,63 @@ fn stmt_defines_or_sets(stmt: &syn::Stmt, counter: &syn::Ident) -> bool {
         syn::Stmt::Local(l) => pat_binding(&l.pat) == Some(counter),
         syn::Stmt::Expr(syn::Expr::Assign(a), _) => {
             expr_as_ident(&a.left).as_ref() == Some(counter)
+        }
+        _ => false,
+    }
+}
+
+/// Whether every pointer write in the body is a plain
+/// `*<base>.offset(<idx>) = <val>` or `*<base>.add(<idx>) = <val>` -- the only
+/// shape the relational codegen can abstract into an (address, value) trace
+/// obligation. A compound assignment through a dereference (`*p.offset(c) += v`)
+/// reads the cell back and so cannot be abstracted without materialising it; a
+/// write whose place is not an `.offset`/`.add` method call likewise can't be
+/// turned into an address without performing it. Either declines route B.
+fn writes_are_simple(stmts: &[syn::Stmt]) -> bool {
+    #[derive(Default)]
+    struct W {
+        ok: bool,
+    }
+    impl<'a> Visit<'a> for W {
+        fn visit_expr(&mut self, e: &'a syn::Expr) {
+            match e {
+                // A compound assignment through a dereference: unsupported.
+                syn::Expr::Binary(b)
+                    if is_compound_assign(&b.op)
+                        && matches!(&*b.left, syn::Expr::Unary(u)
+                            if matches!(u.op, syn::UnOp::Deref(_))) =>
+                {
+                    self.ok = false;
+                }
+                // A plain assignment through a dereference: the place must be an
+                // `.offset`/`.add` method call.
+                syn::Expr::Assign(a) => {
+                    if let syn::Expr::Unary(u) = &*a.left {
+                        if matches!(u.op, syn::UnOp::Deref(_)) && !is_offset_place(&u.expr) {
+                            self.ok = false;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            syn::visit::visit_expr(self, e);
+        }
+    }
+    let mut w = W { ok: true };
+    for s in stmts {
+        w.visit_stmt(s);
+    }
+    w.ok
+}
+
+/// Whether `place` is a `<base>.offset(<idx>)` or `<base>.add(<idx>)` call,
+/// possibly wrapped in parentheses -- the dereferenceable place the relational
+/// codegen knows how to turn into an address.
+fn is_offset_place(place: &syn::Expr) -> bool {
+    match place {
+        syn::Expr::Paren(p) => is_offset_place(&p.expr),
+        syn::Expr::MethodCall(m) => {
+            (m.method == "offset" || m.method == "add") && m.args.len() == 1
         }
         _ => false,
     }
